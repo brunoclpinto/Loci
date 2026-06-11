@@ -51,9 +51,27 @@ class TestReadFile:
         assert "Holmes" in text
 
     def test_rejects_unsupported(self, tmp_path):
-        p = tmp_path / "doc.pdf"
-        p.write_bytes(b"%PDF")
+        p = tmp_path / "doc.xyz"
+        p.write_text("data")
         with pytest.raises(ValueError, match="Unsupported"):
+            read_file(p)
+
+    def test_pdf_raises_import_error_without_pypdf(self, tmp_path, monkeypatch):
+        """Without pypdf installed, reading a PDF raises ImportError with install hint."""
+        import sys
+        monkeypatch.setitem(sys.modules, "pypdf", None)
+        p = tmp_path / "doc.pdf"
+        p.write_bytes(b"%PDF-1.4")
+        with pytest.raises(ImportError, match="pypdf"):
+            read_file(p)
+
+    def test_epub_raises_import_error_without_ebooklib(self, tmp_path, monkeypatch):
+        """Without ebooklib installed, reading an EPUB raises ImportError."""
+        import sys
+        monkeypatch.setitem(sys.modules, "ebooklib", None)
+        p = tmp_path / "book.epub"
+        p.write_bytes(b"PK")
+        with pytest.raises(ImportError, match="ebooklib"):
             read_file(p)
 
 

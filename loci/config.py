@@ -40,6 +40,7 @@ class IngestConfig:
     chunk_overlap_sentences: int = 1
     embed_batch: int = 16
     spacy_model: str = "en_core_web_sm"
+    resolve_coref: bool = True  # cheap within-chunk pronoun coreference
 
 
 @dataclass

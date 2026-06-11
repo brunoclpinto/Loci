@@ -10,22 +10,75 @@ from loci.extract import extract_facts_from_sent
 from loci.resolve import resolve_entity
 from loci.store import insert_chunk, insert_fact, insert_source, upsert_vec_chunk
 
-_SUPPORTED_EXTENSIONS = {".txt", ".md"}
+_SUPPORTED_EXTENSIONS = {".txt", ".md", ".pdf", ".epub"}
 _CHARS_PER_TOKEN = 4  # heuristic: 1 token ≈ 4 characters
 
 
 # ---------------------------------------------------------------------------
-# File reading (plugin interface for future PDF/EPUB)
+# File reading (plugin dispatch for txt / md / pdf / epub)
 # ---------------------------------------------------------------------------
 
 def read_file(path: Path) -> str:
     ext = path.suffix.lower()
-    if ext not in _SUPPORTED_EXTENSIONS:
-        raise ValueError(
-            f"Unsupported file type '{path.suffix}'. "
-            f"Supported: {', '.join(sorted(_SUPPORTED_EXTENSIONS))}"
-        )
-    return path.read_text(encoding="utf-8", errors="replace")
+    if ext == ".pdf":
+        return _read_pdf(path)
+    if ext == ".epub":
+        return _read_epub(path)
+    if ext in (".txt", ".md"):
+        return path.read_text(encoding="utf-8", errors="replace")
+    raise ValueError(
+        f"Unsupported file type '{path.suffix}'. "
+        f"Supported: {', '.join(sorted(_SUPPORTED_EXTENSIONS))}"
+    )
+
+
+def _read_pdf(path: Path) -> str:
+    try:
+        from pypdf import PdfReader
+    except ImportError as exc:
+        raise ImportError(
+            "PDF support requires pypdf: uv add pypdf"
+        ) from exc
+    reader = PdfReader(str(path))
+    pages = []
+    for page in reader.pages:
+        text = page.extract_text()
+        if text:
+            pages.append(text.strip())
+    return "\n\n".join(pages)
+
+
+def _read_epub(path: Path) -> str:
+    try:
+        import ebooklib
+        from ebooklib import epub
+    except ImportError as exc:
+        raise ImportError(
+            "EPUB support requires ebooklib: uv add ebooklib"
+        ) from exc
+    book = epub.read_epub(str(path), options={"ignore_ncx": True})
+    parts = []
+    for item in book.get_items_of_type(ebooklib.ITEM_DOCUMENT):
+        raw = item.get_content().decode("utf-8", errors="replace")
+        parts.append(_strip_html(raw))
+    return "\n\n".join(p for p in parts if p.strip())
+
+
+def _strip_html(html: str) -> str:
+    """Remove HTML tags, keeping text content."""
+    from html.parser import HTMLParser
+
+    class _Stripper(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self._parts: list[str] = []
+
+        def handle_data(self, data: str) -> None:
+            self._parts.append(data)
+
+    s = _Stripper()
+    s.feed(html)
+    return " ".join(s._parts).strip()
 
 
 def hash_file(path: Path) -> str:
@@ -167,12 +220,17 @@ def _run_pipeline(
                 upsert_vec_chunk(conn, chunk_id=chunk_id, embedding=emb)
 
     # 7. Extract facts and resolve entities
+    from loci.extract import extract_coref_facts
+
     n_facts = 0
     entities_before = conn.execute("SELECT COUNT(*) FROM entities").fetchone()[0]
     linked_before = conn.execute("SELECT COUNT(*) FROM aliases").fetchone()[0]
 
     for chunk_id, _, sents in chunk_records:
+        last_entity_text: str | None = None  # tracks last resolved subject for coref
+
         for sent in sents:
+            # Standard SVO extraction (confidence=1.0)
             for rf in extract_facts_from_sent(sent):
                 subj_id = resolve_entity(
                     conn, rf.subject_text,
@@ -182,6 +240,8 @@ def _run_pipeline(
                 if subj_id is None:
                     continue
 
+                last_entity_text = rf.subject_text
+
                 obj_id = None
                 obj_text = rf.object_text
                 if rf.is_obj_entity and rf.object_text:
@@ -190,7 +250,7 @@ def _run_pipeline(
                         embedder=embedder,
                         entity_sim_threshold=cfg.retrieval.entity_sim_threshold,
                     )
-                    obj_text = None  # stored by entity_id, not repeated as text
+                    obj_text = None
 
                 fact_id = insert_fact(
                     conn,
@@ -205,6 +265,42 @@ def _run_pipeline(
                 )
                 if fact_id is not None:
                     n_facts += 1
+
+            # Cheap coreference: pronoun-subject sentences (confidence=0.6)
+            if cfg.ingest.resolve_coref:
+                for rf in extract_coref_facts(sent, last_entity_text=last_entity_text):
+                    subj_id = resolve_entity(
+                        conn, rf.subject_text,
+                        embedder=embedder,
+                        entity_sim_threshold=cfg.retrieval.entity_sim_threshold,
+                    )
+                    if subj_id is None:
+                        continue
+
+                    obj_id = None
+                    obj_text = rf.object_text
+                    if rf.is_obj_entity and rf.object_text:
+                        obj_id = resolve_entity(
+                            conn, rf.object_text,
+                            embedder=embedder,
+                            entity_sim_threshold=cfg.retrieval.entity_sim_threshold,
+                        )
+                        obj_text = None
+
+                    fact_id = insert_fact(
+                        conn,
+                        chunk_id=chunk_id,
+                        sentence=rf.sentence,
+                        subject_id=subj_id,
+                        predicate=rf.predicate,
+                        object_id=obj_id,
+                        object_text=obj_text,
+                        qualifiers=rf.qualifiers,
+                        negated=rf.negated,
+                        confidence=0.6,
+                    )
+                    if fact_id is not None:
+                        n_facts += 1
 
     entities_after = conn.execute("SELECT COUNT(*) FROM entities").fetchone()[0]
     linked_after = conn.execute("SELECT COUNT(*) FROM aliases").fetchone()[0]

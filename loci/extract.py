@@ -1,7 +1,12 @@
-"""Fact extraction from a spaCy dependency parse: SVO + qualifiers + negation."""
+"""Fact extraction from a spaCy dependency parse: SVO + qualifiers + negation + coref."""
 from __future__ import annotations
 
 from dataclasses import dataclass
+
+_PRONOUN_SUBJECTS = frozenset({
+    "he", "she", "it", "him", "her", "his", "its",
+    "they", "them", "their",
+})
 
 
 @dataclass
@@ -91,6 +96,57 @@ def _collect_objects(root) -> list:
         result.append(obj)
         result.extend(obj.conjuncts)
     return result
+
+
+def extract_coref_facts(sent, *, last_entity_text: str | None) -> list[RawFact]:
+    """Extract facts whose subject is a pronoun, resolved to last_entity_text.
+
+    Called when extract_facts_from_sent returns [] due to a pronoun subject.
+    Caller marks resulting facts with confidence=0.6.
+    """
+    if not last_entity_text:
+        return []
+
+    root = next((t for t in sent if t.dep_ == "ROOT"), None)
+    if root is None or root.pos_ not in ("VERB", "AUX"):
+        return []
+
+    subj = next(
+        (t for t in root.children if t.dep_ in ("nsubj", "nsubjpass")), None
+    )
+    if subj is None or subj.pos_ != "PRON" or subj.lower_ not in _PRONOUN_SUBJECTS:
+        return []
+
+    predicate = root.lemma_.lower()
+    negated = any(t.dep_ == "neg" for t in root.children)
+    qualifiers = _extract_qualifiers(root)
+
+    obj_tokens = _collect_objects(root)
+    if not obj_tokens:
+        return [RawFact(
+            subject_text=last_entity_text,
+            predicate=predicate,
+            object_text=None,
+            is_obj_entity=False,
+            qualifiers=qualifiers,
+            negated=negated,
+            sentence=sent.text,
+        )]
+
+    facts = []
+    for obj_tok in obj_tokens:
+        is_entity = obj_tok.pos_ == "PROPN"
+        obj_text = _span_text(obj_tok) if is_entity else obj_tok.lemma_.lower()
+        facts.append(RawFact(
+            subject_text=last_entity_text,
+            predicate=predicate,
+            object_text=obj_text,
+            is_obj_entity=is_entity,
+            qualifiers=qualifiers,
+            negated=negated,
+            sentence=sent.text,
+        ))
+    return facts
 
 
 def _extract_qualifiers(root) -> dict | None:
