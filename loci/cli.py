@@ -15,9 +15,11 @@ app = typer.Typer(name="loci", help="Local knowledge assistant.", no_args_is_hel
 config_app = typer.Typer(help="Manage configuration.")
 entities_app = typer.Typer(help="Entity management.")
 pack_app = typer.Typer(help="Knowledge-pack management.")
+synonyms_app = typer.Typer(help="Predicate synonym management.")
 app.add_typer(config_app, name="config")
 app.add_typer(entities_app, name="entities")
 app.add_typer(pack_app, name="pack")
+app.add_typer(synonyms_app, name="synonyms")
 
 console = Console()
 
@@ -695,6 +697,172 @@ def pack_remove_cmd(
         raise typer.Exit(1)
 
     console.print(f"[green]Removed[/green] pack '{name}' from registry.")
+
+
+# ---------------------------------------------------------------------------
+# loci enhance
+# ---------------------------------------------------------------------------
+
+@app.command("enhance")
+def enhance_cmd(
+    limit: Optional[int] = typer.Option(None, "--limit", help="Max chunks to process."),
+    config_path: Optional[Path] = typer.Option(None, "--config", "-c"),
+    low_mem: bool = typer.Option(False, "--low-mem"),
+) -> None:
+    """LLM-assisted extraction pass: finds passives, copulas, and possessives."""
+    try:
+        cfg = cfg_module.load(config_path)
+    except ValueError as exc:
+        console.print(f"[red]Config error:[/red] {exc}")
+        raise typer.Exit(1)
+
+    from loci.config import expanded
+    from loci.store import open_db, get_unextracted_chunks
+    from loci.enhance import run_enhance
+
+    cfg_exp = expanded(cfg)
+
+    if not _chat_model_exists(cfg_exp):
+        console.print(
+            f"[red]Chat model not found:[/red] {cfg_exp.paths.models_dir / cfg_exp.models.chat}\n"
+            "Run: loci models pull"
+        )
+        raise typer.Exit(1)
+
+    try:
+        from loci.models import load_chat
+    except ImportError:
+        console.print("[red]llama-cpp-python not installed.[/red]")
+        raise typer.Exit(1)
+
+    try:
+        conn = open_db(cfg_exp.paths.knowledge_db)
+    except Exception as exc:
+        console.print(f"[red]Cannot open DB:[/red] {exc}")
+        raise typer.Exit(1)
+
+    pending = len(get_unextracted_chunks(conn, limit=limit))
+    console.print(f"[bold]Enhancing[/bold] {pending} chunks with LLM extraction…")
+
+    embedder = None
+    _emb_ctx = None
+    if _embedder_model_exists(cfg_exp):
+        try:
+            from loci.models import load_embedder
+            _emb_ctx = load_embedder(cfg_exp)
+            embedder = _emb_ctx.__enter__()
+        except Exception:
+            pass
+
+    try:
+        with load_chat(cfg_exp, low_mem=low_mem) as llm:
+            with measure("enhance", log_dir=cfg_exp.paths.runtime_logs_dir) as counters:
+                stats = run_enhance(conn, llm=llm, cfg=cfg, embedder=embedder, limit=limit)
+                counters.update(stats)
+    finally:
+        if _emb_ctx is not None:
+            try:
+                _emb_ctx.__exit__(None, None, None)
+            except Exception:
+                pass
+        conn.close()
+
+    console.print(
+        f"[green]Done.[/green]  chunks processed: {stats['chunks_processed']}"
+        f"  new facts: {stats['facts_added']}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# loci synonyms learn
+# ---------------------------------------------------------------------------
+
+@synonyms_app.command("learn")
+def synonyms_learn_cmd(
+    auto: bool = typer.Option(False, "--auto", help="Auto-write pairs to DB."),
+    threshold: float = typer.Option(0.85, "--threshold", help="Min cosine similarity."),
+    config_path: Optional[Path] = typer.Option(None, "--config", "-c"),
+) -> None:
+    """Cluster predicate embeddings and suggest (or write) synonym pairs."""
+    try:
+        cfg = cfg_module.load(config_path)
+    except ValueError as exc:
+        console.print(f"[red]Config error:[/red] {exc}")
+        raise typer.Exit(1)
+
+    from loci.config import expanded
+    from loci.store import open_db
+
+    cfg_exp = expanded(cfg)
+
+    if not _embedder_model_exists(cfg_exp):
+        console.print("[red]Embedder model not found — run: loci models pull[/red]")
+        raise typer.Exit(1)
+
+    try:
+        from loci.models import load_embedder, embed_batch, cosine_dist_threshold
+    except ImportError:
+        console.print("[red]llama-cpp-python not installed.[/red]")
+        raise typer.Exit(1)
+
+    try:
+        conn = open_db(cfg_exp.paths.knowledge_db)
+    except Exception as exc:
+        console.print(f"[red]Cannot open DB:[/red] {exc}")
+        raise typer.Exit(1)
+
+    try:
+        predicates = [
+            r[0] for r in conn.execute(
+                "SELECT DISTINCT predicate FROM facts ORDER BY predicate"
+            ).fetchall()
+        ]
+        if len(predicates) < 2:
+            console.print("[yellow]Need at least 2 distinct predicates to find synonyms.[/yellow]")
+            return
+
+        console.print(f"Embedding {len(predicates)} predicates…")
+        with load_embedder(cfg_exp) as embedder:
+            embeddings = embed_batch(embedder, predicates, normalize=True)
+
+        dist_threshold = cosine_dist_threshold(threshold)
+        import math
+        suggestions: list[tuple[str, str, float]] = []
+        for i, (p1, e1) in enumerate(zip(predicates, embeddings)):
+            for p2, e2 in zip(predicates[i + 1:], embeddings[i + 1:]):
+                dist = math.sqrt(sum((a - b) ** 2 for a, b in zip(e1, e2)))
+                if dist < dist_threshold:
+                    sim = 1.0 - dist ** 2 / 2.0
+                    suggestions.append((p1, p2, sim))
+
+        suggestions.sort(key=lambda x: -x[2])
+
+        if not suggestions:
+            console.print(f"[yellow]No synonym pairs found at threshold {threshold}.[/yellow]")
+            return
+
+        t = Table(title=f"Synonym Pairs (sim ≥ {threshold})", header_style="bold")
+        t.add_column("Predicate A", style="cyan")
+        t.add_column("Predicate B", style="cyan")
+        t.add_column("Similarity", justify="right")
+        for p1, p2, sim in suggestions:
+            t.add_row(p1, p2, f"{sim:.3f}")
+        console.print(t)
+
+        if auto:
+            for p1, p2, _ in suggestions:
+                conn.execute(
+                    "INSERT OR IGNORE INTO predicate_synonyms (predicate, synonym) VALUES (?,?)",
+                    [p1, p2],
+                )
+            conn.commit()
+            console.print(f"[green]Wrote {len(suggestions)} synonym pairs to DB.[/green]")
+        else:
+            console.print(
+                f"\nRun with [bold]--auto[/bold] to write these {len(suggestions)} pairs."
+            )
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------------
