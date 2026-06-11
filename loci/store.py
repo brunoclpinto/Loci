@@ -131,7 +131,15 @@ _DDL: list[str] = [
 def _migrate(conn: sqlite3.Connection) -> None:
     for stmt in _DDL:
         conn.execute(stmt)
+    # Schema evolution — add columns that were not in the original DDL
+    _ensure_column(conn, "chunks", "extracted_v", "INTEGER DEFAULT 0")
     conn.commit()
+
+
+def _ensure_column(conn: sqlite3.Connection, table: str, col: str, col_def: str) -> None:
+    existing = {r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    if col not in existing:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_def}")
 
 
 # ---------------------------------------------------------------------------
@@ -419,3 +427,23 @@ def db_vacuum(conn: sqlite3.Connection) -> None:
 def db_analyze(conn: sqlite3.Connection) -> None:
     """Update query-planner statistics (runs ANALYZE)."""
     conn.execute("ANALYZE")
+
+
+def get_unextracted_chunks(
+    conn: sqlite3.Connection, limit: int | None = None
+) -> list[dict]:
+    """Return chunks whose extracted_v = 0 (never processed by LLM extraction)."""
+    q = "SELECT id, text FROM chunks WHERE extracted_v = 0 ORDER BY id"
+    if limit is not None:
+        q += f" LIMIT {limit}"
+    return [dict(r) for r in conn.execute(q).fetchall()]
+
+
+def mark_chunk_extracted(
+    conn: sqlite3.Connection, chunk_id: int, version: int = 1
+) -> None:
+    """Set extracted_v on a chunk to record that LLM extraction has run."""
+    conn.execute(
+        "UPDATE chunks SET extracted_v=? WHERE id=?", [version, chunk_id]
+    )
+    conn.commit()
