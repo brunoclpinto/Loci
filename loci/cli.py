@@ -1,9 +1,12 @@
 """Loci CLI — main typer application."""
 from __future__ import annotations
 
+import threading
+import time
 from pathlib import Path
 from typing import Optional
 
+import psutil
 import typer
 from rich.console import Console
 from rich.table import Table
@@ -16,10 +19,12 @@ config_app = typer.Typer(help="Manage configuration.")
 entities_app = typer.Typer(help="Entity management.")
 pack_app = typer.Typer(help="Knowledge-pack management.")
 synonyms_app = typer.Typer(help="Predicate synonym management.")
+bench_app = typer.Typer(help="Benchmark and evaluation suite.")
 app.add_typer(config_app, name="config")
 app.add_typer(entities_app, name="entities")
 app.add_typer(pack_app, name="pack")
 app.add_typer(synonyms_app, name="synonyms")
+app.add_typer(bench_app, name="bench")
 
 console = Console()
 
@@ -697,6 +702,429 @@ def pack_remove_cmd(
         raise typer.Exit(1)
 
     console.print(f"[green]Removed[/green] pack '{name}' from registry.")
+
+
+# ---------------------------------------------------------------------------
+# loci bench ingest / query / report / compare / qna-skeleton
+# ---------------------------------------------------------------------------
+
+@bench_app.command("ingest")
+def bench_ingest_cmd(
+    path: Path = typer.Argument(..., help="File to benchmark."),
+    db: Optional[Path] = typer.Option(None, "--db", help="DB path (default: temp)."),
+    config_path: Optional[Path] = typer.Option(None, "--config", "-c"),
+    low_mem: bool = typer.Option(False, "--low-mem"),
+) -> None:
+    """Benchmark ingestion throughput: chunks/s, facts/s, peak RSS, db growth."""
+    import tempfile
+    try:
+        cfg = cfg_module.load(config_path)
+    except ValueError as exc:
+        console.print(f"[red]Config error:[/red] {exc}")
+        raise typer.Exit(1)
+
+    from loci.config import expanded
+    from loci.store import open_db
+    from loci.ingest import ingest_file
+
+    cfg_exp = expanded(cfg)
+
+    cleanup = db is None
+    if db is None:
+        tmpdir = tempfile.mkdtemp(prefix="loci_bench_")
+        db_path = Path(tmpdir) / "bench.db"
+    else:
+        db_path = db
+
+    initial_size = db_path.stat().st_size if db_path.exists() else 0
+
+    try:
+        conn = open_db(db_path)
+    except Exception as exc:
+        console.print(f"[red]Cannot open DB:[/red] {exc}")
+        raise typer.Exit(1)
+
+    embedder = None
+    _emb_ctx = None
+    if _embedder_model_exists(cfg_exp):
+        try:
+            from loci.models import load_embedder
+            _emb_ctx = load_embedder(cfg_exp)
+            embedder = _emb_ctx.__enter__()
+        except Exception:
+            pass
+
+    try:
+        import spacy
+        nlp = spacy.load(cfg.ingest.spacy_model, disable=["ner", "senter"])
+    except Exception:
+        nlp = None
+
+    with measure("bench_ingest", log_dir=cfg_exp.paths.bench_logs_dir) as counters:
+        stats = ingest_file(path, cfg=cfg, conn=conn,
+                            embedder=embedder, spacy_nlp=nlp)
+        counters.update(stats)
+        wall = counters.get("_peak_rss_mb", 0)  # placeholder until we read wall time
+
+    if _emb_ctx is not None:
+        try:
+            _emb_ctx.__exit__(None, None, None)
+        except Exception:
+            pass
+    conn.close()
+
+    final_size = db_path.stat().st_size if db_path.exists() else 0
+    db_growth = final_size - initial_size
+
+    if cleanup:
+        import shutil
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+    if stats.get("skipped"):
+        console.print(f"[yellow]Skipped[/yellow] {path} — already ingested.")
+        return
+
+    t = Table(title=f"Bench Ingest: {path.name}", header_style="bold")
+    t.add_column("Metric", style="cyan")
+    t.add_column("Value")
+    t.add_row("chunks", str(stats["chunks"]))
+    t.add_row("facts", str(stats["facts"]))
+    t.add_row("sentences_total", str(stats.get("sentences_total", "?")))
+    t.add_row("sentences_skipped", str(stats.get("sentences_skipped", "?")))
+    t.add_row("entities_new", str(stats["entities_new"]))
+    t.add_row("db size growth", f"{db_growth/1024:.1f} KB")
+    t.add_row("peak RSS", f"{counters.get('_peak_rss_mb', 0):.0f} MB")
+    t.add_row("swap Δ", f"{counters.get('_swap_delta_mb', 0):+.1f} MB")
+    console.print(t)
+
+
+@bench_app.command("query")
+def bench_query_cmd(
+    qna_path: Path = typer.Option(Path("bench/qna.json"), "--qna", help="QnA JSON file."),
+    runs: int = typer.Option(3, "--runs", help="Runs per question."),
+    judge: str = typer.Option("claude", "--judge", help="Judge: 'claude' or 'none'."),
+    label: str = typer.Option("", "--label", help="Run label for the log file."),
+    config_path: Optional[Path] = typer.Option(None, "--config", "-c"),
+    low_mem: bool = typer.Option(False, "--low-mem"),
+) -> None:
+    """Full eval: retrieve + generate for every QnA item; mechanical + judge scoring."""
+    try:
+        cfg = cfg_module.load(config_path)
+    except ValueError as exc:
+        console.print(f"[red]Config error:[/red] {exc}")
+        raise typer.Exit(1)
+
+    from loci.config import expanded
+    from loci.store import open_db
+    from loci.retrieve import retrieve
+    from loci.generate import (build_messages, stream_response,
+                               extract_cited_tags, is_refusal)
+    from loci.bench import (load_qna, score_mechanical, QuestionResult,
+                            write_run_log, render_report, run_judging)
+    from loci.pack import attach_registered_packs
+
+    cfg_exp = expanded(cfg)
+
+    if not qna_path.exists():
+        console.print(f"[red]QnA file not found:[/red] {qna_path}")
+        raise typer.Exit(1)
+
+    qna_items = load_qna(qna_path)
+    console.print(f"Loaded {len(qna_items)} QnA items from {qna_path}")
+
+    try:
+        conn = open_db(cfg_exp.paths.knowledge_db)
+    except Exception as exc:
+        console.print(f"[red]Cannot open DB:[/red] {exc}")
+        raise typer.Exit(1)
+
+    p_schemas = attach_registered_packs(conn, cfg_exp.paths.packs_dir)
+
+    try:
+        import spacy
+        nlp = spacy.load(cfg.ingest.spacy_model, disable=["ner", "senter"])
+    except Exception:
+        nlp = None
+
+    embedder = None
+    _emb_ctx = None
+    if _embedder_model_exists(cfg_exp):
+        try:
+            from loci.models import load_embedder
+            _emb_ctx = load_embedder(cfg_exp)
+            embedder = _emb_ctx.__enter__()
+        except Exception:
+            pass
+
+    if not _chat_model_exists(cfg_exp):
+        console.print("[red]Chat model not found — run: loci models pull[/red]")
+        raise typer.Exit(1)
+
+    try:
+        from loci.models import load_chat
+    except ImportError:
+        console.print("[red]llama-cpp-python not installed.[/red]")
+        raise typer.Exit(1)
+
+    all_results: list[QuestionResult] = []
+
+    try:
+        t_model_load = time.perf_counter()
+        with load_chat(cfg_exp, low_mem=low_mem) as llm:
+            model_load_ms = (time.perf_counter() - t_model_load) * 1000
+
+            for item in qna_items:
+                console.print(f"  [{item.id}/{item.type}] {item.question[:55]}…")
+                for run_idx in range(runs):
+                    timings: dict = {
+                        "model_load_ms": model_load_ms if run_idx == 0 else 0.0
+                    }
+
+                    # RSS sampling
+                    rss_samples: list[float] = []
+                    swap_before = psutil.swap_memory().used / 1024 / 1024
+                    stop_ev = threading.Event()
+
+                    def _sample(ev=stop_ev, samples=rss_samples):
+                        while not ev.is_set():
+                            try:
+                                samples.append(
+                                    psutil.Process().memory_info().rss / 1024 / 1024
+                                )
+                            except Exception:
+                                pass
+                            ev.wait(0.1)
+
+                    sampler = threading.Thread(target=_sample, daemon=True)
+                    sampler.start()
+
+                    result = retrieve(
+                        item.question,
+                        conn=conn, cfg=cfg,
+                        embedder=embedder, nlp=nlp,
+                        pack_schemas=p_schemas, timings=timings,
+                    )
+                    messages = build_messages(item.question, result.context_text, [])
+
+                    full_text = ""
+                    first_tok_t: list[float] = []
+                    gen_start = time.perf_counter()
+                    for tok in stream_response(
+                        llm, messages,
+                        max_tokens=cfg.models.max_tokens,
+                        temperature=cfg.models.temperature,
+                    ):
+                        if not first_tok_t:
+                            first_tok_t.append(time.perf_counter())
+                        full_text += tok
+                    gen_end = time.perf_counter()
+
+                    stop_ev.set()
+                    sampler.join(timeout=0.5)
+
+                    timings["gen_ms"] = (gen_end - gen_start) * 1000
+                    timings["ttft_ms"] = (
+                        (first_tok_t[0] - gen_start) * 1000 if first_tok_t else 0.0
+                    )
+                    timings["tokens"] = len(full_text.split())
+
+                    peak_rss = max(rss_samples, default=psutil.Process().memory_info().rss / 1024 / 1024)
+                    swap_delta = psutil.swap_memory().used / 1024 / 1024 - swap_before
+
+                    citations = extract_cited_tags(full_text)
+                    mechanical = score_mechanical(
+                        item, full_text, result.fact_hits, result.chunk_hits
+                    )
+                    all_results.append(QuestionResult(
+                        q_id=item.id, q_type=item.type,
+                        question=item.question, answerable=item.answerable,
+                        answer=full_text, citations=citations,
+                        mechanical=mechanical,
+                        judge_score=None, judge_reason=None,
+                        timings=timings,
+                        peak_rss_mb=peak_rss, swap_delta_mb=swap_delta,
+                        run_index=run_idx,
+                    ))
+    finally:
+        if _emb_ctx is not None:
+            try:
+                _emb_ctx.__exit__(None, None, None)
+            except Exception:
+                pass
+        conn.close()
+
+    # Judging
+    judge_scores = run_judging(
+        all_results,
+        judge=judge if judge != "claude" or cfg.bench.judge != "none" else cfg.bench.judge,
+        judge_cmd=cfg.bench.judge_cmd,
+        judge_max_chars=cfg.bench.judge_max_chars,
+        log_dir=cfg_exp.paths.bench_logs_dir,
+        run_label=label or "query",
+    )
+    score_map = {s["id"]: s for s in judge_scores}
+    for r in all_results:
+        if r.q_id in score_map and r.run_index == 0:
+            r.judge_score = score_map[r.q_id]["score"]
+            r.judge_reason = score_map[r.q_id]["reason"]
+
+    # Write run log
+    import dataclasses as _dc
+    cfg_snap = {
+        s: {k: str(v) for k, v in vars(getattr(cfg, s)).items()}
+        for s in ("models", "ingest", "retrieval", "bench")
+    }
+    run_label = label or f"qna_{len(qna_items)}q"
+    log_path = write_run_log(
+        all_results, cfg_snap, run_label, cfg_exp.paths.bench_logs_dir
+    )
+    console.print(f"\n[dim]Log: {log_path}[/dim]\n")
+    console.print(render_report({"config": {"label": run_label, "ts": 0},
+                                  "results": [r.to_dict() for r in all_results],
+                                  "aggregate": {}}))
+
+
+@bench_app.command("report")
+def bench_report_cmd(
+    run_path: Optional[Path] = typer.Argument(None, help="Run JSONL path. Default: latest."),
+    config_path: Optional[Path] = typer.Option(None, "--config", "-c"),
+) -> None:
+    """Render a benchmark run report."""
+    from loci.bench import read_run_log, render_report
+
+    if run_path is None:
+        try:
+            cfg = cfg_module.load(config_path)
+            from loci.config import expanded
+            cfg_exp = expanded(cfg)
+            logs = sorted(cfg_exp.paths.bench_logs_dir.glob("*.jsonl"))
+            if not logs:
+                console.print("[yellow]No run logs found.[/yellow]")
+                raise typer.Exit(0)
+            run_path = logs[-1]
+        except Exception as exc:
+            console.print(f"[red]{exc}[/red]")
+            raise typer.Exit(1)
+
+    try:
+        run_data = read_run_log(run_path)
+    except Exception as exc:
+        console.print(f"[red]Cannot read log:[/red] {exc}")
+        raise typer.Exit(1)
+
+    console.print(render_report(run_data))
+
+
+@bench_app.command("compare")
+def bench_compare_cmd(
+    run_a: Path = typer.Argument(..., help="First run JSONL."),
+    run_b: Path = typer.Argument(..., help="Second run JSONL."),
+) -> None:
+    """Compare two bench runs metric-by-metric with regression highlighting."""
+    from loci.bench import read_run_log, compare_runs
+
+    try:
+        da = read_run_log(run_a)
+        db_ = read_run_log(run_b)
+    except Exception as exc:
+        console.print(f"[red]Cannot read logs:[/red] {exc}")
+        raise typer.Exit(1)
+
+    console.print(compare_runs(da, db_))
+
+
+@bench_app.command("qna-skeleton")
+def bench_qna_skeleton_cmd(
+    source: str = typer.Argument(..., help="Source title or path substring to filter facts."),
+    limit: int = typer.Option(20, "--limit", help="Max QnA items to generate."),
+    out: Optional[Path] = typer.Option(None, "--out", help="Output JSON path."),
+    config_path: Optional[Path] = typer.Option(None, "--config", "-c"),
+) -> None:
+    """Draft candidate QnA items from ingested facts for a source (review before use)."""
+    try:
+        cfg = cfg_module.load(config_path)
+    except ValueError as exc:
+        console.print(f"[red]Config error:[/red] {exc}")
+        raise typer.Exit(1)
+
+    from loci.config import expanded
+    from loci.store import open_db
+
+    cfg_exp = expanded(cfg)
+    try:
+        conn = open_db(cfg_exp.paths.knowledge_db)
+    except Exception as exc:
+        console.print(f"[red]Cannot open DB:[/red] {exc}")
+        raise typer.Exit(1)
+
+    try:
+        rows = conn.execute(
+            """
+            SELECT f.id, e.canonical_name AS subject, f.predicate,
+                   f.object_text, f.qualifiers, f.sentence,
+                   s.title, s.path
+            FROM facts f
+            JOIN entities e ON f.subject_id = e.id
+            LEFT JOIN chunks c ON f.chunk_id = c.id
+            LEFT JOIN sources s ON c.source_id = s.id
+            WHERE (s.title LIKE ? OR s.path LIKE ?)
+              AND f.confidence >= 0.8
+            ORDER BY RANDOM()
+            LIMIT ?
+            """,
+            [f"%{source}%", f"%{source}%", limit],
+        ).fetchall()
+    finally:
+        conn.close()
+
+    if not rows:
+        console.print(f"[yellow]No facts found for source matching '{source}'.[/yellow]")
+        return
+
+    import json as _json
+    items = []
+    for i, r in enumerate(rows, 1):
+        subj = r["subject"]
+        pred = r["predicate"]
+        obj = r["object_text"] or ""
+        src_title = r["title"] or (Path(r["path"]).name if r["path"] else "")
+
+        question = _question_template(subj, pred, obj)
+        keywords = [obj] if obj else []
+        items.append({
+            "id": f"q{i:03d}",
+            "type": "fact",
+            "question": question,
+            "expected_keywords": keywords,
+            "expected_facts": [{"subject": subj.lower(), "predicate": pred}],
+            "expected_sources": [src_title] if src_title else [],
+            "answerable": True,
+        })
+
+    output = _json.dumps(items, indent=2)
+    if out:
+        out.write_text(output)
+        console.print(f"[green]Wrote {len(items)} items to {out}[/green]")
+    else:
+        console.print(output)
+
+
+def _question_template(subject: str, predicate: str, obj: str) -> str:
+    templates = {
+        "take":    f"What did {subject} take?",
+        "observe": f"What did {subject} observe?",
+        "enter":   f"Where did {subject} enter?",
+        "be":      f"What was {subject}?",
+        "possess": f"What did {subject} possess?",
+        "say":     f"What did {subject} say?",
+        "find":    f"What did {subject} find?",
+        "give":    f"What did {subject} give?",
+        "see":     f"What did {subject} see?",
+        "know":    f"What did {subject} know?",
+    }
+    if predicate in templates:
+        return templates[predicate]
+    return f"What did {subject} {predicate}?"
 
 
 # ---------------------------------------------------------------------------
