@@ -1,0 +1,50 @@
+# Loci configuration — copy to ~/.loci/config.toml and adjust as needed.
+#
+# Precedence (highest wins): CLI flag → env var (LOCI_SECTION__KEY) → this file → built-in default
+# Example env override: LOCI_RETRIEVAL__VEC_TOP_K=20
+
+[paths]
+models_dir        = "~/.loci/models"             # GGUF model files
+raw_knowledge_dir = "~/loci/raw"                 # source docs before ingest
+knowledge_db      = "~/.loci/knowledge/main.db"  # SQLite knowledge database
+packs_dir         = "~/.loci/packs"              # downloaded .locipack.db files
+context_dir       = "~/.loci/context"            # chat sessions / rolling history
+bench_logs_dir    = "~/.loci/logs/bench"         # benchmark run JSONL + reports
+runtime_logs_dir  = "~/.loci/logs/runtime"       # runtime event logs
+
+[models]
+chat          = "qwen2.5-3b-instruct-q4_k_m.gguf"
+chat_low_mem  = "llama-3.2-1b-instruct-q4_k_m.gguf"
+embedder      = "bge-small-en-v1.5-q8_0.gguf"
+n_ctx         = 4096        # 2048 when using --low-mem
+n_gpu_layers  = -1          # -1 = all layers on Metal
+temperature   = 0.2
+max_tokens    = 512
+use_mmap      = true
+
+[ingest]
+chunk_tokens             = 512
+chunk_overlap_sentences  = 1
+embed_batch              = 16
+spacy_model              = "en_core_web_sm"
+
+[retrieval]
+vec_top_k             = 12
+fts_top_k             = 12
+context_token_budget  = 1800
+entity_sim_threshold  = 0.92
+rrf_k                 = 60
+
+[logging]
+level         = "INFO"   # DEBUG dumps retrieval explanations to runtime log
+log_peak_rss  = true
+jsonl         = true     # structured JSONL events, one per line
+
+[bench]
+qna_file            = "bench/qna.json"  # relative to cwd, or set an absolute path
+runs_per_question   = 3
+rss_sample_hz       = 10
+judge               = "claude"       # "claude" | "none" (fully offline)
+judge_cmd           = "claude -p"
+judge_single_prompt = true
+judge_max_chars     = 150000

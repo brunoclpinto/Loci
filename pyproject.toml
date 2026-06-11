@@ -1,0 +1,34 @@
+[project]
+name = "loci"
+version = "0.1.0"
+description = "Low-RAM Local RAG with Structured Knowledge on SSD"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "typer[all]>=0.12",
+    "rich>=13",
+    "sqlite-vec>=0.1",
+    "psutil>=5.9",
+    "spacy>=3.7",
+    # llama-cpp-python requires cmake and compiles from source on macOS.
+    # Install separately once cmake is available:
+    #   brew install cmake
+    #   CMAKE_ARGS="-DGGML_METAL=on" uv add llama-cpp-python
+    # Kept out of the standard dependency list to avoid blocking uv sync.
+    "click>=8.4.1",
+]
+
+[project.scripts]
+loci = "loci.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+]
