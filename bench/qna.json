@@ -2,73 +2,133 @@
   {
     "id": "q001",
     "type": "fact",
-    "question": "What did Sherlock Holmes take from the mantel-piece?",
-    "expected_keywords": ["bottle"],
-    "expected_facts": [{"subject": "sherlock holmes", "predicate": "take"}],
+    "question": "Who introduced Sherlock Holmes to Dr. John Watson?",
+    "expected_keywords": ["Stamford"],
+    "expected_facts": [{"subject": "stamford", "predicate": "introduce"}],
     "expected_sources": [],
     "answerable": true
   },
   {
     "id": "q002",
     "type": "fact",
-    "question": "What did Holmes take from the morocco case?",
-    "expected_keywords": ["syringe"],
-    "expected_facts": [{"subject": "sherlock holmes", "predicate": "take"}],
+    "question": "What is the exact street address of Sherlock Holmes and Dr. Watson?",
+    "expected_keywords": ["221B", "Baker Street"],
+    "expected_facts": [{"subject": "holmes", "predicate": "live"}],
     "expected_sources": [],
     "answerable": true
   },
   {
     "id": "q003",
-    "type": "paraphrase",
-    "question": "What items did the detective pick up or grab?",
-    "expected_keywords": ["bottle"],
-    "expected_facts": [],
-    "expected_sources": [],
-    "answerable": true
-  },
-  {
-    "id": "q004",
-    "type": "fact",
-    "question": "Who entered the room and observed Holmes?",
-    "expected_keywords": ["Watson"],
-    "expected_facts": [{"subject": "watson", "predicate": "enter"}],
-    "expected_sources": [],
-    "answerable": true
-  },
-  {
-    "id": "q005",
-    "type": "fact",
-    "question": "Where was the bottle taken from?",
-    "expected_keywords": ["mantel-piece", "corner"],
-    "expected_facts": [{"subject": "sherlock holmes", "predicate": "take"}],
-    "expected_sources": [],
-    "answerable": true
-  },
-  {
-    "id": "q006",
-    "type": "multi_hop",
-    "question": "What did Watson observe Holmes doing when he entered the room?",
-    "expected_keywords": ["observed", "Holmes"],
-    "expected_facts": [
-      {"subject": "watson", "predicate": "enter"},
-      {"subject": "watson", "predicate": "observe"}
-    ],
-    "expected_sources": [],
-    "answerable": true
-  },
-  {
-    "id": "q007",
     "type": "negative",
-    "question": "What did Sherlock Holmes eat for breakfast on the moon?",
+    "question": "What is the name of the dog Sherlock Holmes used in The Sign of Four to sniff out clues?",
     "expected_keywords": [],
     "expected_facts": [],
     "expected_sources": [],
     "answerable": false
   },
   {
+    "id": "q004",
+    "type": "negative",
+    "question": "What is the name of Sherlock Holmes' older and reportedly smarter brother?",
+    "expected_keywords": [],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": false
+  },
+  {
+    "id": "q005",
+    "type": "negative",
+    "question": "Who does Sherlock Holmes refer to historically as 'THE woman'?",
+    "expected_keywords": [],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": false
+  },
+  {
+    "id": "q006",
+    "type": "negative",
+    "question": "Where did Holmes traditionally keep his active pipe tobacco?",
+    "expected_keywords": [],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": false
+  },
+  {
+    "id": "q007",
+    "type": "fact",
+    "question": "What did Holmes call his strategic band of local child informants?",
+    "expected_keywords": ["Baker Street Irregulars", "Irregulars"],
+    "expected_facts": [{"subject": "holmes", "predicate": "call"}],
+    "expected_sources": [],
+    "answerable": true
+  },
+  {
     "id": "q008",
     "type": "negative",
-    "question": "Who is Professor Moriarty's best childhood friend?",
+    "question": "What illegal substance did Holmes historically take to stimulate his mind when bored?",
+    "expected_keywords": [],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": false
+  },
+  {
+    "id": "q009",
+    "type": "negative",
+    "question": "Who is referred in the stories as the Napoleon of Crime?",
+    "expected_keywords": [],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": false
+  },
+  {
+    "id": "q010",
+    "type": "negative",
+    "question": "In The Final Problem, what is the name of the waterfall where Holmes fought Moriarty?",
+    "expected_keywords": [],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": false
+  },
+  {
+    "id": "q011",
+    "type": "fact",
+    "question": "What was the first Sherlock Holmes story to ever be published?",
+    "expected_keywords": ["A Study in Scarlet"],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": true
+  },
+  {
+    "id": "q012",
+    "type": "negative",
+    "question": "What was the work given to Jabez Wilson in order to keep him away from his office in The Red-headed League?",
+    "expected_keywords": [],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": false
+  },
+  {
+    "id": "q013",
+    "type": "negative",
+    "question": "What did Dr Roylott use to lure the snake back through the vent in The Adventure of the Speckled Band?",
+    "expected_keywords": [],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": false
+  },
+  {
+    "id": "q014",
+    "type": "fact",
+    "question": "Which bumbling Scotland Yard Official considers himself Holmes's professional rival?",
+    "expected_keywords": ["Lestrade"],
+    "expected_facts": [{"subject": "lestrade", "predicate": "consider"}],
+    "expected_sources": [],
+    "answerable": true
+  },
+  {
+    "id": "q015",
+    "type": "negative",
+    "question": "In which story did Dr. Watson meet his future wife, Miss Morstan?",
     "expected_keywords": [],
     "expected_facts": [],
     "expected_sources": [],

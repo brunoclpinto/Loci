@@ -16,6 +16,7 @@ dependencies = [
     #   CMAKE_ARGS="-DGGML_METAL=on" uv add llama-cpp-python
     # Kept out of the standard dependency list to avoid blocking uv sync.
     "click>=8.4.1",
+    "llama-cpp-python>=0.3.28",
 ]
 
 [project.scripts]

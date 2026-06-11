@@ -310,11 +310,11 @@ def build_judge_prompt(payload: list[dict]) -> str:
     )
 
 
-def call_judge(prompt: str, judge_cmd: str, timeout: int = 120) -> str:
-    """Invoke judge_cmd with prompt as a CLI argument. Returns stdout."""
+def call_judge(prompt: str, judge_cmd: str, timeout: int = 300) -> str:
+    """Invoke judge_cmd, passing prompt via stdin for robustness with large payloads."""
     parts = judge_cmd.split()
     result = subprocess.run(
-        [*parts, prompt], capture_output=True, text=True, timeout=timeout,
+        parts, input=prompt, capture_output=True, text=True, timeout=timeout,
     )
     return result.stdout
 
@@ -504,7 +504,8 @@ def render_report(run_data: dict) -> str:
         fact = f"{m.get('fact_hit_rate', 0) * 100:.0f}%"
         cite = "Y" if m.get("citation_present") else "N"
         hall = "!" if m.get("hallucination") else "-"
-        score = str(r.get("judge_score") or "-")
+        js = r.get("judge_score")
+        score = "-" if js is None else str(js)
         q_short = r.get("question", "")[:50]
         lines.append(
             f"{r['q_id']:<8} {r.get('q_type',''):<12} {kw:>5} {fact:>6}"
