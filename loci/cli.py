@@ -13,7 +13,11 @@ from loci.bench import measure
 
 app = typer.Typer(name="loci", help="Local knowledge assistant.", no_args_is_help=True)
 config_app = typer.Typer(help="Manage configuration.")
+entities_app = typer.Typer(help="Entity management.")
+pack_app = typer.Typer(help="Knowledge-pack management.")
 app.add_typer(config_app, name="config")
+app.add_typer(entities_app, name="entities")
+app.add_typer(pack_app, name="pack")
 
 console = Console()
 
@@ -101,6 +105,10 @@ def ask_cmd(
             raise typer.Exit(1)
 
         try:
+            # Attach registered packs
+            from loci.pack import attach_registered_packs, pack_schemas as get_pack_schemas
+            p_schemas = attach_registered_packs(conn, cfg_exp.paths.packs_dir)
+
             # --- Retrieval phase (embedder loaded then freed) ---
             embedder = None
             _emb_ctx = None
@@ -120,7 +128,7 @@ def ask_cmd(
 
             try:
                 result = retrieve(question, conn=conn, cfg=cfg, embedder=embedder,
-                                  nlp=nlp, explain=explain)
+                                  nlp=nlp, explain=explain, pack_schemas=p_schemas)
             finally:
                 if _emb_ctx is not None:
                     try:
@@ -298,6 +306,9 @@ def chat_cmd(
         console.print(f"[red]Cannot open DB:[/red] {exc}")
         raise typer.Exit(1)
 
+    from loci.pack import attach_registered_packs
+    p_schemas = attach_registered_packs(conn, cfg_exp.paths.packs_dir)
+
     try:
         import spacy
         nlp = spacy.load(cfg.ingest.spacy_model, disable=["ner", "senter"])
@@ -314,6 +325,8 @@ def chat_cmd(
             pass
 
     console.print("[bold]Loci chat[/bold] — type [dim]quit[/dim] to exit.")
+    if p_schemas:
+        console.print(f"[dim]Packs loaded: {len(p_schemas)}[/dim]")
 
     history: list[dict] = []
 
@@ -332,7 +345,8 @@ def chat_cmd(
                 with measure("chat_turn", log_dir=cfg_exp.paths.runtime_logs_dir,
                              silent=True) as counters:
                     result = retrieve(question, conn=conn, cfg=cfg,
-                                      embedder=embedder, nlp=nlp)
+                                      embedder=embedder, nlp=nlp,
+                                      pack_schemas=p_schemas)
                     counters["fact_hits"] = len(result.fact_hits)
                     counters["chunk_hits"] = len(result.chunk_hits)
 
@@ -369,6 +383,323 @@ def chat_cmd(
                 pass
         conn.close()
 
+
+# ---------------------------------------------------------------------------
+# loci stats
+# ---------------------------------------------------------------------------
+
+@app.command("stats")
+def stats_cmd(
+    config_path: Optional[Path] = typer.Option(None, "--config", "-c"),
+) -> None:
+    """Show knowledge-base statistics: counts, size, most-connected entities."""
+    try:
+        cfg = cfg_module.load(config_path)
+    except ValueError as exc:
+        console.print(f"[red]Config error:[/red] {exc}")
+        raise typer.Exit(1)
+
+    from loci.config import expanded
+    from loci.store import open_db, get_stats
+
+    cfg_exp = expanded(cfg)
+    try:
+        conn = open_db(cfg_exp.paths.knowledge_db)
+    except Exception as exc:
+        console.print(f"[red]Cannot open DB:[/red] {exc}")
+        raise typer.Exit(1)
+
+    try:
+        stats = get_stats(conn)
+    finally:
+        conn.close()
+
+    t = Table(title="Knowledge Base", show_header=True, header_style="bold")
+    t.add_column("Metric", style="cyan")
+    t.add_column("Value")
+    for key in ("sources_count", "chunks_count", "entities_count",
+                "aliases_count", "facts_count"):
+        t.add_row(key.replace("_count", "s"), str(stats[key]))
+    t.add_row("db size", f"{stats['db_size_mb']} MB")
+    console.print(t)
+
+    if stats["top_entities"]:
+        t2 = Table(title="Most-Connected Entities", show_header=True, header_style="bold")
+        t2.add_column("Entity", style="cyan")
+        t2.add_column("Kind")
+        t2.add_column("Facts", justify="right")
+        for e in stats["top_entities"]:
+            t2.add_row(e["name"], e["kind"], str(e["facts"]))
+        console.print(t2)
+
+
+# ---------------------------------------------------------------------------
+# loci maintenance
+# ---------------------------------------------------------------------------
+
+@app.command("maintenance")
+def maintenance_cmd(
+    config_path: Optional[Path] = typer.Option(None, "--config", "-c"),
+) -> None:
+    """Run VACUUM and ANALYZE to reclaim space and refresh query planner stats."""
+    try:
+        cfg = cfg_module.load(config_path)
+    except ValueError as exc:
+        console.print(f"[red]Config error:[/red] {exc}")
+        raise typer.Exit(1)
+
+    from loci.config import expanded
+    from loci.store import open_db, db_vacuum, db_analyze
+
+    cfg_exp = expanded(cfg)
+    try:
+        conn = open_db(cfg_exp.paths.knowledge_db)
+    except Exception as exc:
+        console.print(f"[red]Cannot open DB:[/red] {exc}")
+        raise typer.Exit(1)
+
+    try:
+        console.print("Running VACUUM…", end=" ")
+        db_vacuum(conn)
+        console.print("[green]done[/green]")
+        console.print("Running ANALYZE…", end=" ")
+        db_analyze(conn)
+        console.print("[green]done[/green]")
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# loci entities review / merge
+# ---------------------------------------------------------------------------
+
+@entities_app.command("review")
+def entities_review_cmd(
+    config_path: Optional[Path] = typer.Option(None, "--config", "-c"),
+) -> None:
+    """Show pending entity-resolution conflicts for manual review."""
+    try:
+        cfg = cfg_module.load(config_path)
+    except ValueError as exc:
+        console.print(f"[red]Config error:[/red] {exc}")
+        raise typer.Exit(1)
+
+    from loci.config import expanded
+    from loci.store import open_db, get_pending_links
+
+    cfg_exp = expanded(cfg)
+    try:
+        conn = open_db(cfg_exp.paths.knowledge_db)
+    except Exception as exc:
+        console.print(f"[red]Cannot open DB:[/red] {exc}")
+        raise typer.Exit(1)
+
+    try:
+        links = get_pending_links(conn)
+    finally:
+        conn.close()
+
+    if not links:
+        console.print("[green]No pending entity conflicts.[/green]")
+        return
+
+    t = Table(title=f"Pending Conflicts ({len(links)})", header_style="bold")
+    t.add_column("ID", style="dim")
+    t.add_column("Mention", style="cyan")
+    t.add_column("Candidates")
+    for link in links:
+        candidates = ", ".join(
+            f"{c['name']} (id={c['id']}, {c['kind']})"
+            for c in link["candidates"]
+        )
+        t.add_row(str(link["id"]), link["mention"], candidates)
+    console.print(t)
+    console.print(
+        "\nResolve with: [bold]loci entities merge <keep_name> <merge_name>[/bold]"
+    )
+
+
+@entities_app.command("merge")
+def entities_merge_cmd(
+    keep: str = typer.Argument(..., help="Canonical name of the entity to keep."),
+    merge: str = typer.Argument(..., help="Canonical name of the entity to merge into keep."),
+    config_path: Optional[Path] = typer.Option(None, "--config", "-c"),
+) -> None:
+    """Merge two entities: rewrite all facts/aliases from MERGE onto KEEP."""
+    try:
+        cfg = cfg_module.load(config_path)
+    except ValueError as exc:
+        console.print(f"[red]Config error:[/red] {exc}")
+        raise typer.Exit(1)
+
+    from loci.config import expanded
+    from loci.store import open_db, merge_entities
+
+    cfg_exp = expanded(cfg)
+    try:
+        conn = open_db(cfg_exp.paths.knowledge_db)
+    except Exception as exc:
+        console.print(f"[red]Cannot open DB:[/red] {exc}")
+        raise typer.Exit(1)
+
+    try:
+        keep_row = conn.execute(
+            "SELECT id FROM entities WHERE canonical_name=?", [keep]
+        ).fetchone()
+        merge_row = conn.execute(
+            "SELECT id FROM entities WHERE canonical_name=?", [merge]
+        ).fetchone()
+        if keep_row is None:
+            console.print(f"[red]Entity not found:[/red] {keep!r}")
+            raise typer.Exit(1)
+        if merge_row is None:
+            console.print(f"[red]Entity not found:[/red] {merge!r}")
+            raise typer.Exit(1)
+        n = merge_entities(conn, keep_id=keep_row["id"], merge_id=merge_row["id"])
+        console.print(
+            f"[green]Merged[/green] {merge!r} → {keep!r}  ({n} facts now on kept entity)"
+        )
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# loci pack export / add / list / remove
+# ---------------------------------------------------------------------------
+
+@pack_app.command("export")
+def pack_export_cmd(
+    name: str = typer.Option(..., "--name", help="Label for this pack."),
+    out: Path = typer.Option(..., "--out", help="Output path (e.g. sherlock.locipack.db)."),
+    config_path: Optional[Path] = typer.Option(None, "--config", "-c"),
+) -> None:
+    """Export all knowledge from the main DB into a portable .locipack.db file."""
+    try:
+        cfg = cfg_module.load(config_path)
+    except ValueError as exc:
+        console.print(f"[red]Config error:[/red] {exc}")
+        raise typer.Exit(1)
+
+    from loci.config import expanded
+    from loci.store import open_db
+    from loci.pack import export_pack
+
+    cfg_exp = expanded(cfg)
+    try:
+        conn = open_db(cfg_exp.paths.knowledge_db)
+    except Exception as exc:
+        console.print(f"[red]Cannot open DB:[/red] {exc}")
+        raise typer.Exit(1)
+
+    try:
+        with measure("pack_export", log_dir=cfg_exp.paths.runtime_logs_dir) as counters:
+            counts = export_pack(conn, out.expanduser(), name)
+            counters.update(counts)
+    finally:
+        conn.close()
+
+    console.print(
+        f"[green]Exported[/green] → {out}\n"
+        f"  sources: {counts.get('sources', 0)}  chunks: {counts.get('chunks', 0)}"
+        f"  entities: {counts.get('entities', 0)}  facts: {counts.get('facts', 0)}"
+    )
+
+
+@pack_app.command("add")
+def pack_add_cmd(
+    pack_path: Path = typer.Argument(..., help="Path to .locipack.db file."),
+    name: Optional[str] = typer.Option(None, "--name", help="Registry name (default: filename stem)."),
+    config_path: Optional[Path] = typer.Option(None, "--config", "-c"),
+) -> None:
+    """Register a .locipack.db file so queries fan out across it."""
+    try:
+        cfg = cfg_module.load(config_path)
+    except ValueError as exc:
+        console.print(f"[red]Config error:[/red] {exc}")
+        raise typer.Exit(1)
+
+    from loci.config import expanded
+    from loci.pack import validate_pack, register_pack
+
+    cfg_exp = expanded(cfg)
+    resolved = pack_path.expanduser().resolve()
+    pack_name = name or resolved.stem
+
+    try:
+        validate_pack(resolved)
+    except (FileNotFoundError, ValueError) as exc:
+        console.print(f"[red]Invalid pack:[/red] {exc}")
+        raise typer.Exit(1)
+
+    try:
+        register_pack(cfg_exp.paths.packs_dir, resolved, pack_name)
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1)
+
+    console.print(f"[green]Registered[/green] pack '{pack_name}' → {resolved}")
+
+
+@pack_app.command("list")
+def pack_list_cmd(
+    config_path: Optional[Path] = typer.Option(None, "--config", "-c"),
+) -> None:
+    """List registered knowledge packs."""
+    try:
+        cfg = cfg_module.load(config_path)
+    except ValueError as exc:
+        console.print(f"[red]Config error:[/red] {exc}")
+        raise typer.Exit(1)
+
+    from loci.config import expanded
+    from loci.pack import load_registry
+
+    cfg_exp = expanded(cfg)
+    registry = load_registry(cfg_exp.paths.packs_dir)
+
+    if not registry:
+        console.print("[dim]No packs registered.[/dim]")
+        return
+
+    t = Table(title="Registered Packs", header_style="bold")
+    t.add_column("Name", style="cyan")
+    t.add_column("Path")
+    t.add_column("Status")
+    for entry in registry:
+        p = Path(entry["path"])
+        status = "[green]ok[/green]" if p.exists() else "[red]missing[/red]"
+        t.add_row(entry["name"], entry["path"], status)
+    console.print(t)
+
+
+@pack_app.command("remove")
+def pack_remove_cmd(
+    name: str = typer.Argument(..., help="Registry name of the pack to remove."),
+    config_path: Optional[Path] = typer.Option(None, "--config", "-c"),
+) -> None:
+    """Unregister a knowledge pack (does not delete the file)."""
+    try:
+        cfg = cfg_module.load(config_path)
+    except ValueError as exc:
+        console.print(f"[red]Config error:[/red] {exc}")
+        raise typer.Exit(1)
+
+    from loci.config import expanded
+    from loci.pack import unregister_pack
+
+    cfg_exp = expanded(cfg)
+    try:
+        unregister_pack(cfg_exp.paths.packs_dir, name)
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1)
+
+    console.print(f"[green]Removed[/green] pack '{name}' from registry.")
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def _parse_meta(meta_list: list[str]) -> dict:
     result: dict[str, str] = {}
