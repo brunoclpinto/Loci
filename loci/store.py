@@ -266,11 +266,12 @@ def upsert_vec_entity(
 
 
 def vec_search_chunks(
-    conn: sqlite3.Connection, *, embedding: list[float], k: int = 12
+    conn: sqlite3.Connection, *, embedding: list[float], k: int = 12, schema: str = "main"
 ) -> list[dict]:
+    sp = f"{schema}." if schema != "main" else ""
     rows = conn.execute(
-        "SELECT chunk_id, distance FROM vec_chunks"
-        " WHERE embedding MATCH ? ORDER BY distance LIMIT ?",
+        f"SELECT chunk_id, distance FROM {sp}vec_chunks"
+        f" WHERE embedding MATCH ? ORDER BY distance LIMIT ?",
         [_ser(embedding), k],
     ).fetchall()
     return [dict(r) for r in rows]
@@ -288,11 +289,133 @@ def vec_search_entities(
 
 
 def fts_search_chunks(
-    conn: sqlite3.Connection, *, query: str, k: int = 12
+    conn: sqlite3.Connection, *, query: str, k: int = 12, schema: str = "main"
 ) -> list[dict]:
-    rows = conn.execute(
-        "SELECT rowid AS chunk_id, rank FROM fts_chunks"
-        " WHERE text MATCH ? ORDER BY rank LIMIT ?",
-        [query, k],
-    ).fetchall()
+    if schema == "main":
+        rows = conn.execute(
+            "SELECT rowid AS chunk_id, rank FROM fts_chunks"
+            " WHERE text MATCH ? ORDER BY rank LIMIT ?",
+            [query, k],
+        ).fetchall()
+    else:
+        sp = f"{schema}."
+        rows = conn.execute(
+            f"SELECT fts.rowid AS chunk_id, fts.rank"
+            f" FROM {sp}fts_chunks fts"
+            f" WHERE fts MATCH ? ORDER BY fts.rank LIMIT ?",
+            [query, k],
+        ).fetchall()
     return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Phase 5: stats, entity merge, pending links, maintenance
+# ---------------------------------------------------------------------------
+
+def get_stats(conn: sqlite3.Connection) -> dict:
+    """Return knowledge-base statistics: counts, db size, most-connected entities."""
+    stats: dict = {}
+    for table in ("sources", "chunks", "entities", "aliases", "facts"):
+        stats[f"{table}_count"] = conn.execute(
+            f"SELECT COUNT(*) FROM {table}"
+        ).fetchone()[0]
+
+    page_count = conn.execute("PRAGMA main.page_count").fetchone()[0]
+    page_size = conn.execute("PRAGMA page_size").fetchone()[0]
+    stats["db_size_bytes"] = page_count * page_size
+    stats["db_size_mb"] = round(stats["db_size_bytes"] / 1024 / 1024, 3)
+
+    rows = conn.execute(
+        """
+        SELECT e.canonical_name, e.kind, COUNT(f.id) AS fact_count
+        FROM entities e
+        LEFT JOIN facts f ON f.subject_id = e.id
+        GROUP BY e.id
+        ORDER BY fact_count DESC
+        LIMIT 10
+        """
+    ).fetchall()
+    stats["top_entities"] = [
+        {"name": r["canonical_name"], "kind": r["kind"], "facts": r["fact_count"]}
+        for r in rows
+    ]
+    return stats
+
+
+def merge_entities(
+    conn: sqlite3.Connection, keep_id: int, merge_id: int
+) -> int:
+    """Rewrite all facts and aliases from merge_id onto keep_id; delete merge_id.
+
+    Returns number of facts whose subject_id or object_id was updated.
+    """
+    conn.execute(
+        "UPDATE facts SET subject_id=? WHERE subject_id=?", [keep_id, merge_id]
+    )
+    conn.execute(
+        "UPDATE facts SET object_id=? WHERE object_id=?", [keep_id, merge_id]
+    )
+    # Move aliases, skipping ones already present on keep_id
+    for row in conn.execute(
+        "SELECT alias FROM aliases WHERE entity_id=?", [merge_id]
+    ).fetchall():
+        conn.execute(
+            "INSERT OR IGNORE INTO aliases (entity_id, alias) VALUES (?,?)",
+            [keep_id, row["alias"]],
+        )
+    conn.execute("DELETE FROM aliases WHERE entity_id=?", [merge_id])
+    conn.execute("DELETE FROM vec_entities WHERE entity_id=?", [merge_id])
+
+    # Clear pending_links that mention either entity
+    import json as _json
+    for row in conn.execute("SELECT id, candidate_entity_ids FROM pending_links").fetchall():
+        ids = _json.loads(row["candidate_entity_ids"])
+        if keep_id in ids or merge_id in ids:
+            conn.execute("DELETE FROM pending_links WHERE id=?", [row["id"]])
+
+    n_affected = conn.execute(
+        "SELECT COUNT(*) FROM facts WHERE subject_id=? OR object_id=?",
+        [keep_id, keep_id],
+    ).fetchone()[0]
+    conn.execute("DELETE FROM entities WHERE id=?", [merge_id])
+    conn.commit()
+    return n_affected
+
+
+def get_pending_links(conn: sqlite3.Connection) -> list[dict]:
+    """Return all pending entity-resolution links with candidate details."""
+    import json as _json
+    result = []
+    for row in conn.execute(
+        "SELECT id, mention, candidate_entity_ids FROM pending_links"
+    ).fetchall():
+        candidate_ids = _json.loads(row["candidate_entity_ids"])
+        candidates = []
+        for eid in candidate_ids:
+            e = conn.execute(
+                "SELECT id, canonical_name, kind FROM entities WHERE id=?", [eid]
+            ).fetchone()
+            if e:
+                candidates.append(
+                    {"id": e["id"], "name": e["canonical_name"], "kind": e["kind"]}
+                )
+        result.append(
+            {"id": row["id"], "mention": row["mention"], "candidates": candidates}
+        )
+    return result
+
+
+def dismiss_pending_link(conn: sqlite3.Connection, link_id: int) -> None:
+    """Dismiss a pending link without merging."""
+    conn.execute("DELETE FROM pending_links WHERE id=?", [link_id])
+    conn.commit()
+
+
+def db_vacuum(conn: sqlite3.Connection) -> None:
+    """Reclaim unused space (runs VACUUM on main db)."""
+    conn.execute("VACUUM")
+
+
+def db_analyze(conn: sqlite3.Connection) -> None:
+    """Update query-planner statistics (runs ANALYZE)."""
+    conn.execute("ANALYZE")

@@ -150,7 +150,9 @@ def _parse_simple(question: str) -> QuestionParse:
 # Entity scanning (DB-based, works with any capitalisation)
 # ---------------------------------------------------------------------------
 
-def find_mentioned_entity_ids(conn: sqlite3.Connection, question: str) -> list[int]:
+def find_mentioned_entity_ids(
+    conn: sqlite3.Connection, question: str, schema: str = "main"
+) -> list[int]:
     """Scan all 1-3 word spans from the question against the alias table.
 
     Tries longer spans first so 'sherlock holmes' is preferred over 'holmes'
@@ -158,6 +160,7 @@ def find_mentioned_entity_ids(conn: sqlite3.Connection, question: str) -> list[i
     """
     from loci.resolve import normalize_mention
 
+    sp = f"{schema}." if schema != "main" else ""
     words = _NONWORD.sub(" ", question.lower()).split()
     n = len(words)
     seen: set[int] = set()
@@ -170,7 +173,7 @@ def find_mentioned_entity_ids(conn: sqlite3.Connection, question: str) -> list[i
             if not normalized:
                 continue
             row = conn.execute(
-                "SELECT entity_id FROM aliases WHERE alias=?", [normalized]
+                f"SELECT entity_id FROM {sp}aliases WHERE alias=?", [normalized]
             ).fetchone()
             if row and row["entity_id"] not in seen:
                 seen.add(row["entity_id"])
@@ -183,12 +186,15 @@ def find_mentioned_entity_ids(conn: sqlite3.Connection, question: str) -> list[i
 # Predicate synonyms
 # ---------------------------------------------------------------------------
 
-def get_synonyms(conn: sqlite3.Connection, predicate: str) -> set[str]:
+def get_synonyms(
+    conn: sqlite3.Connection, predicate: str, schema: str = "main"
+) -> set[str]:
     """Return all synonyms of predicate (bidirectional)."""
+    sp = f"{schema}." if schema != "main" else ""
     rows = conn.execute(
-        "SELECT synonym FROM predicate_synonyms WHERE predicate=? "
-        "UNION "
-        "SELECT predicate FROM predicate_synonyms WHERE synonym=?",
+        f"SELECT synonym FROM {sp}predicate_synonyms WHERE predicate=? "
+        f"UNION "
+        f"SELECT predicate FROM {sp}predicate_synonyms WHERE synonym=?",
         [predicate, predicate],
     ).fetchall()
     return {r[0] for r in rows}
@@ -203,11 +209,13 @@ def fact_lookup(
     entity_ids: list[int],
     predicate: str | None,
     synonyms: set[str],
+    schema: str = "main",
 ) -> list[FactHit]:
     """Indexed SQL lookup: (subject_id IN ...) AND (predicate IN ...)."""
     if not entity_ids or not predicate:
         return []
 
+    sp = f"{schema}." if schema != "main" else ""
     all_predicates = [predicate] + sorted(synonyms)
     id_ph = ",".join("?" * len(entity_ids))
     pred_ph = ",".join("?" * len(all_predicates))
@@ -221,11 +229,11 @@ def fact_lookup(
             oe.canonical_name AS object_entity_name,
             s.title, s.path,
             CASE WHEN f.predicate=? THEN 1.0 ELSE 0.8 END AS score
-        FROM facts f
-        JOIN entities e ON f.subject_id = e.id
-        LEFT JOIN entities oe ON f.object_id = oe.id
-        JOIN chunks c ON f.chunk_id = c.id
-        LEFT JOIN sources s ON c.source_id = s.id
+        FROM {sp}facts f
+        JOIN {sp}entities e ON f.subject_id = e.id
+        LEFT JOIN {sp}entities oe ON f.object_id = oe.id
+        JOIN {sp}chunks c ON f.chunk_id = c.id
+        LEFT JOIN {sp}sources s ON c.source_id = s.id
         WHERE f.subject_id IN ({id_ph})
           AND f.predicate IN ({pred_ph})
         ORDER BY score DESC, f.id
@@ -262,6 +270,7 @@ def vec_search_question(
     embedder: Any,
     question: str,
     k: int,
+    schema: str = "main",
 ) -> list[int]:
     """Embed question and return top-k chunk_ids by vector similarity."""
     from loci.models import embed_batch
@@ -269,7 +278,7 @@ def vec_search_question(
     vecs = embed_batch(embedder, [question], normalize=True)
     if not vecs:
         return []
-    results = vec_search_chunks(conn, embedding=vecs[0], k=k)
+    results = vec_search_chunks(conn, embedding=vecs[0], k=k, schema=schema)
     return [r["chunk_id"] for r in results]
 
 
@@ -277,15 +286,16 @@ def vec_search_question(
 # FTS search
 # ---------------------------------------------------------------------------
 
-def fts_search_question(conn: sqlite3.Connection, question: str, k: int) -> list[int]:
+def fts_search_question(
+    conn: sqlite3.Connection, question: str, k: int, schema: str = "main"
+) -> list[int]:
     """BM25 full-text search on the question string."""
     from loci.store import fts_search_chunks
-    # Strip punctuation that would break FTS5 query syntax
     clean = _NONWORD.sub(" ", question).strip()
     if not clean:
         return []
     try:
-        results = fts_search_chunks(conn, query=clean, k=k)
+        results = fts_search_chunks(conn, query=clean, k=k, schema=schema)
         return [r["chunk_id"] for r in results]
     except Exception:
         return []
@@ -295,9 +305,12 @@ def fts_search_question(conn: sqlite3.Connection, question: str, k: int) -> list
 # RRF fusion
 # ---------------------------------------------------------------------------
 
-def rrf_fuse(ranked_lists: list[list[int]], k: int = 60) -> list[tuple[int, float]]:
-    """Reciprocal Rank Fusion across multiple ranked ID lists."""
-    scores: dict[int, float] = {}
+def rrf_fuse(ranked_lists: list[list], k: int = 60) -> list[tuple]:
+    """Reciprocal Rank Fusion across multiple ranked ID lists.
+
+    Keys may be any hashable type (int for single-schema, (schema, int) for packs).
+    """
+    scores: dict = {}
     for lst in ranked_lists:
         for rank, doc_id in enumerate(lst, start=1):
             scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (k + rank)
@@ -372,32 +385,40 @@ def _source_info(title: str | None, path: str | None) -> str | None:
 
 def load_chunk_hits(
     conn: sqlite3.Connection,
-    fused: list[tuple[int, float]],
+    fused: list[tuple],
     token_budget: int,
     offset: int = 1,
 ) -> list[ChunkHit]:
-    """Fetch chunk rows for fused results, return as tagged ChunkHits."""
+    """Fetch chunk rows for fused results, return as tagged ChunkHits.
+
+    fused keys may be plain int (main schema) or (schema, int) tuples (packs).
+    """
     if not fused:
         return []
     budget_chars = token_budget * _CHARS_PER_TOKEN
     hits: list[ChunkHit] = []
     used = 0
-    for i, (chunk_id, score) in enumerate(fused, start=offset):
+    for i, (key, score) in enumerate(fused, start=offset):
+        if isinstance(key, tuple):
+            schema, chunk_id = key
+            sp = f"{schema}." if schema != "main" else ""
+        else:
+            chunk_id = key
+            sp = ""
         row = conn.execute(
-            "SELECT c.text, s.title, s.path "
-            "FROM chunks c LEFT JOIN sources s ON c.source_id = s.id "
-            "WHERE c.id=?",
+            f"SELECT c.text, src.title, src.path "
+            f"FROM {sp}chunks c LEFT JOIN {sp}sources src ON c.source_id = src.id "
+            f"WHERE c.id=?",
             [chunk_id],
         ).fetchone()
         if row is None:
             continue
-        tag = f"[C{i}]"
         text = row["text"]
         if used + len(text) > budget_chars:
             break
         hits.append(ChunkHit(
             chunk_id=chunk_id,
-            tag=tag,
+            tag=f"[C{i}]",
             text=text,
             source_info=_source_info(row["title"], row["path"]),
             rrf_score=score,
@@ -417,8 +438,9 @@ def build_explain(
     fact_hits: list[FactHit],
     vec_ids: list[int],
     fts_ids: list[int],
-    fused: list[tuple[int, float]],
+    fused: list[tuple],
     conn: sqlite3.Connection,
+    schemas: list[str] | None = None,
 ) -> str:
     lines: list[str] = ["=== Question Parse ==="]
     lines.append(f"  wh-type : {parse.wh_type or '(none)'}")
@@ -426,6 +448,8 @@ def build_explain(
     if synonyms:
         lines.append(f"  synonyms : {', '.join(sorted(synonyms))}")
     lines.append(f"  entity_ids: {entity_ids}")
+    if schemas and len(schemas) > 1:
+        lines.append(f"  schemas  : {schemas}")
 
     lines.append("\n=== Fact Lookup ===")
     lines.append(f"  hits: {len(fact_hits)}")
@@ -439,7 +463,8 @@ def build_explain(
     lines.append(f"  top-{len(fts_ids)}: chunk_ids={fts_ids[:5]}")
 
     lines.append("\n=== RRF Fusion (top-5) ===")
-    for cid, score in fused[:5]:
+    for key, score in fused[:5]:
+        cid = key[1] if isinstance(key, tuple) else key
         lines.append(f"  chunk_id={cid}  rrf={score:.4f}")
 
     return "\n".join(lines)
@@ -457,58 +482,77 @@ def retrieve(
     embedder: Any = None,
     nlp: Any = None,
     explain: bool = False,
+    pack_schemas: list[str] | None = None,
 ) -> RetrievalResult:
-    """Full hybrid retrieval pipeline.
+    """Full hybrid retrieval pipeline, optionally fanning out across pack schemas.
 
-    Steps: question parse → entity scan → fact SQL → vec + FTS → RRF → context.
-    Returns a RetrievalResult ready for Phase 4 generation.
+    Steps: question parse → per-schema entity scan + fact SQL →
+    per-schema vec + FTS → RRF → context bundle.
     """
+    schemas = ["main"] + (pack_schemas or [])
+
     # 1. Parse
     parse = parse_question(question, nlp=nlp)
 
-    # 2. Resolve entities from question text (DB scan, works with any case)
-    entity_ids = find_mentioned_entity_ids(conn, question)
+    # 2–4. Per-schema: entity resolution → synonyms → fact lookup
+    all_fact_hits: list[FactHit] = []
+    main_entity_ids: list[int] = []      # for explain (main schema only)
+    main_synonyms: set[str] = set()
 
-    # 3. Predicate synonyms
-    synonyms = get_synonyms(conn, parse.verb_lemma) if parse.verb_lemma else set()
-
-    # 4. Fact SQL lookup
     t0 = time.perf_counter()
-    fact_hits = fact_lookup(conn, entity_ids, parse.verb_lemma, synonyms)
+    for schema in schemas:
+        s_eids = find_mentioned_entity_ids(conn, question, schema=schema)
+        s_syns = get_synonyms(conn, parse.verb_lemma, schema=schema) if parse.verb_lemma else set()
+        if schema == "main":
+            main_entity_ids = s_eids
+            main_synonyms = s_syns
+        all_fact_hits.extend(
+            fact_lookup(conn, s_eids, parse.verb_lemma, s_syns, schema=schema)
+        )
     fact_ms = (time.perf_counter() - t0) * 1000
 
-    # 5. Vector search
-    vec_ids = (
-        vec_search_question(conn, embedder, question, cfg.retrieval.vec_top_k)
-        if embedder is not None
-        else []
+    # Re-sort by score and renumber tags across all schemas
+    all_fact_hits.sort(key=lambda h: -h.score)
+    for i, h in enumerate(all_fact_hits, 1):
+        h.tag = f"[F{i}]"
+
+    # 5–6. Per-schema vec + FTS → (schema, chunk_id) keys for RRF
+    all_vec_keys: list[tuple] = []
+    all_fts_keys: list[tuple] = []
+
+    for schema in schemas:
+        if embedder is not None:
+            ids = vec_search_question(conn, embedder, question,
+                                      cfg.retrieval.vec_top_k, schema=schema)
+            all_vec_keys.extend((schema, cid) for cid in ids)
+        fts_ids = fts_search_question(conn, question, cfg.retrieval.fts_top_k, schema=schema)
+        all_fts_keys.extend((schema, cid) for cid in fts_ids)
+
+    # 7. RRF fusion
+    fused = rrf_fuse([all_vec_keys, all_fts_keys], k=cfg.retrieval.rrf_k)
+
+    # 8. Load chunk rows
+    chunk_hits = load_chunk_hits(
+        conn, fused, cfg.retrieval.context_token_budget, offset=len(all_fact_hits) + 1
     )
 
-    # 6. FTS search
-    fts_ids = fts_search_question(conn, question, cfg.retrieval.fts_top_k)
-
-    # 7. RRF fusion (vector + FTS; facts are surfaced separately)
-    fused = rrf_fuse([vec_ids, fts_ids], k=cfg.retrieval.rrf_k)
-
-    # 8. Load chunk rows, offset tag numbering after facts
-    n_facts = len(fact_hits)
-    chunk_hits = load_chunk_hits(conn, fused, cfg.retrieval.context_token_budget,
-                                 offset=n_facts + 1)
-
     # 9. Build context bundle
-    context = build_context(fact_hits, chunk_hits, cfg.retrieval.context_token_budget)
+    context = build_context(all_fact_hits, chunk_hits, cfg.retrieval.context_token_budget)
 
     # 10. Explain
     explain_text = None
     if explain:
+        all_vec_ids = [cid for (_, cid) in all_vec_keys]
+        all_fts_ids = [cid for (_, cid) in all_fts_keys]
         explain_text = build_explain(
-            parse, entity_ids, synonyms, fact_hits, vec_ids, fts_ids, fused, conn
+            parse, main_entity_ids, main_synonyms, all_fact_hits,
+            all_vec_ids, all_fts_ids, fused, conn, schemas=schemas,
         )
         explain_text += f"\n\n  fact_lookup_ms: {fact_ms:.1f}"
 
     return RetrievalResult(
         parse=parse,
-        fact_hits=fact_hits,
+        fact_hits=all_fact_hits,
         chunk_hits=chunk_hits,
         context_text=context,
         explain_text=explain_text,
