@@ -223,6 +223,8 @@ def _run_pipeline(
     from loci.extract import extract_coref_facts
 
     n_facts = 0
+    n_sentences = 0
+    n_skipped = 0
     entities_before = conn.execute("SELECT COUNT(*) FROM entities").fetchone()[0]
     linked_before = conn.execute("SELECT COUNT(*) FROM aliases").fetchone()[0]
 
@@ -230,8 +232,12 @@ def _run_pipeline(
         last_entity_text: str | None = None  # tracks last resolved subject for coref
 
         for sent in sents:
+            n_sentences += 1
             # Standard SVO extraction (confidence=1.0)
-            for rf in extract_facts_from_sent(sent):
+            raw_svo = extract_facts_from_sent(sent)
+            if not raw_svo:
+                n_skipped += 1
+            for rf in raw_svo:
                 subj_id = resolve_entity(
                     conn, rf.subject_text,
                     embedder=embedder,
@@ -311,4 +317,6 @@ def _run_pipeline(
         "facts": n_facts,
         "entities_new": entities_after - entities_before,
         "linked_entities": (linked_after - linked_before) - (entities_after - entities_before),
+        "sentences_total": n_sentences,
+        "sentences_skipped": n_skipped,
     }

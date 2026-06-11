@@ -483,20 +483,24 @@ def retrieve(
     nlp: Any = None,
     explain: bool = False,
     pack_schemas: list[str] | None = None,
+    timings: dict | None = None,
 ) -> RetrievalResult:
     """Full hybrid retrieval pipeline, optionally fanning out across pack schemas.
 
-    Steps: question parse → per-schema entity scan + fact SQL →
-    per-schema vec + FTS → RRF → context bundle.
+    If timings dict is provided, per-stage millisecond measurements are written
+    into it (parse_ms, fact_ms, vec_ms, fts_ms, fusion_ms).
     """
     schemas = ["main"] + (pack_schemas or [])
 
     # 1. Parse
+    t0 = time.perf_counter()
     parse = parse_question(question, nlp=nlp)
+    if timings is not None:
+        timings["parse_ms"] = (time.perf_counter() - t0) * 1000
 
     # 2–4. Per-schema: entity resolution → synonyms → fact lookup
     all_fact_hits: list[FactHit] = []
-    main_entity_ids: list[int] = []      # for explain (main schema only)
+    main_entity_ids: list[int] = []
     main_synonyms: set[str] = set()
 
     t0 = time.perf_counter()
@@ -510,36 +514,45 @@ def retrieve(
             fact_lookup(conn, s_eids, parse.verb_lemma, s_syns, schema=schema)
         )
     fact_ms = (time.perf_counter() - t0) * 1000
+    if timings is not None:
+        timings["fact_ms"] = fact_ms
 
-    # Re-sort by score and renumber tags across all schemas
+    # Re-sort and renumber tags
     all_fact_hits.sort(key=lambda h: -h.score)
     for i, h in enumerate(all_fact_hits, 1):
         h.tag = f"[F{i}]"
 
-    # 5–6. Per-schema vec + FTS → (schema, chunk_id) keys for RRF
+    # 5. Vec search (separated for granular timing)
     all_vec_keys: list[tuple] = []
-    all_fts_keys: list[tuple] = []
-
-    for schema in schemas:
-        if embedder is not None:
+    t0 = time.perf_counter()
+    if embedder is not None:
+        for schema in schemas:
             ids = vec_search_question(conn, embedder, question,
                                       cfg.retrieval.vec_top_k, schema=schema)
             all_vec_keys.extend((schema, cid) for cid in ids)
+    if timings is not None:
+        timings["vec_ms"] = (time.perf_counter() - t0) * 1000
+
+    # 6. FTS search (separated for granular timing)
+    all_fts_keys: list[tuple] = []
+    t0 = time.perf_counter()
+    for schema in schemas:
         fts_ids = fts_search_question(conn, question, cfg.retrieval.fts_top_k, schema=schema)
         all_fts_keys.extend((schema, cid) for cid in fts_ids)
+    if timings is not None:
+        timings["fts_ms"] = (time.perf_counter() - t0) * 1000
 
-    # 7. RRF fusion
+    # 7. RRF fusion + context build
+    t0 = time.perf_counter()
     fused = rrf_fuse([all_vec_keys, all_fts_keys], k=cfg.retrieval.rrf_k)
-
-    # 8. Load chunk rows
     chunk_hits = load_chunk_hits(
         conn, fused, cfg.retrieval.context_token_budget, offset=len(all_fact_hits) + 1
     )
-
-    # 9. Build context bundle
     context = build_context(all_fact_hits, chunk_hits, cfg.retrieval.context_token_budget)
+    if timings is not None:
+        timings["fusion_ms"] = (time.perf_counter() - t0) * 1000
 
-    # 10. Explain
+    # 8. Explain
     explain_text = None
     if explain:
         all_vec_ids = [cid for (_, cid) in all_vec_keys]
