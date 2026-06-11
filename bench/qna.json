@@ -1,0 +1,77 @@
+[
+  {
+    "id": "q001",
+    "type": "fact",
+    "question": "What did Sherlock Holmes take from the mantel-piece?",
+    "expected_keywords": ["bottle"],
+    "expected_facts": [{"subject": "sherlock holmes", "predicate": "take"}],
+    "expected_sources": [],
+    "answerable": true
+  },
+  {
+    "id": "q002",
+    "type": "fact",
+    "question": "What did Holmes take from the morocco case?",
+    "expected_keywords": ["syringe"],
+    "expected_facts": [{"subject": "sherlock holmes", "predicate": "take"}],
+    "expected_sources": [],
+    "answerable": true
+  },
+  {
+    "id": "q003",
+    "type": "paraphrase",
+    "question": "What items did the detective pick up or grab?",
+    "expected_keywords": ["bottle"],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": true
+  },
+  {
+    "id": "q004",
+    "type": "fact",
+    "question": "Who entered the room and observed Holmes?",
+    "expected_keywords": ["Watson"],
+    "expected_facts": [{"subject": "watson", "predicate": "enter"}],
+    "expected_sources": [],
+    "answerable": true
+  },
+  {
+    "id": "q005",
+    "type": "fact",
+    "question": "Where was the bottle taken from?",
+    "expected_keywords": ["mantel-piece", "corner"],
+    "expected_facts": [{"subject": "sherlock holmes", "predicate": "take"}],
+    "expected_sources": [],
+    "answerable": true
+  },
+  {
+    "id": "q006",
+    "type": "multi_hop",
+    "question": "What did Watson observe Holmes doing when he entered the room?",
+    "expected_keywords": ["observed", "Holmes"],
+    "expected_facts": [
+      {"subject": "watson", "predicate": "enter"},
+      {"subject": "watson", "predicate": "observe"}
+    ],
+    "expected_sources": [],
+    "answerable": true
+  },
+  {
+    "id": "q007",
+    "type": "negative",
+    "question": "What did Sherlock Holmes eat for breakfast on the moon?",
+    "expected_keywords": [],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": false
+  },
+  {
+    "id": "q008",
+    "type": "negative",
+    "question": "Who is Professor Moriarty's best childhood friend?",
+    "expected_keywords": [],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": false
+  }
+]
