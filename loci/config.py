@@ -13,13 +13,13 @@ from pathlib import Path
 
 @dataclass
 class PathsConfig:
-    models_dir: Path = field(default_factory=lambda: Path("/Volumes/SSD1TB001/loci/models"))
-    raw_knowledge_dir: Path = field(default_factory=lambda: Path("/Volumes/SSD1TB001/loci/raw"))
-    knowledge_db: Path = field(default_factory=lambda: Path("/Volumes/SSD1TB001/loci/knowledge/main.db"))
-    packs_dir: Path = field(default_factory=lambda: Path("/Volumes/SSD1TB001/loci/packs"))
-    context_dir: Path = field(default_factory=lambda: Path("/Volumes/SSD1TB001/loci/context"))
-    bench_logs_dir: Path = field(default_factory=lambda: Path("/Volumes/SSD1TB001/loci/logs/bench"))
-    runtime_logs_dir: Path = field(default_factory=lambda: Path("/Volumes/SSD1TB001/loci/logs/runtime"))
+    models_dir: Path = field(default_factory=lambda: Path("~/.loci/models"))
+    raw_knowledge_dir: Path = field(default_factory=lambda: Path("~/.loci/raw"))
+    knowledge_db: Path = field(default_factory=lambda: Path("~/.loci/knowledge/main.db"))
+    packs_dir: Path = field(default_factory=lambda: Path("~/.loci/packs"))
+    context_dir: Path = field(default_factory=lambda: Path("~/.loci/context"))
+    bench_logs_dir: Path = field(default_factory=lambda: Path("~/.loci/logs/bench"))
+    runtime_logs_dir: Path = field(default_factory=lambda: Path("~/.loci/logs/runtime"))
 
 
 @dataclass
@@ -29,7 +29,7 @@ class ModelsConfig:
     embedder: str = "bge-small-en-v1.5-q8_0.gguf"
     n_ctx: int = 4096
     n_gpu_layers: int = -1
-    temperature: float = 0.2
+    temperature: float = 0.4
     max_tokens: int = 512
     use_mmap: bool = True
 

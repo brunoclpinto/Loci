@@ -8,15 +8,19 @@ if TYPE_CHECKING:
     from loci.retrieve import ChunkHit, FactHit
 
 _SYSTEM_PROMPT = """\
-You are a precise knowledge assistant.
-Answer questions ONLY from the provided context (facts and source chunks below).
-Cite your sources using the exact tags ([F1], [C3], etc.) inline in your answer.
-If the context contains no relevant information, respond with exactly:
-  Not in my knowledge base."""
+You are a knowledge extraction assistant. Your only job is to extract answers from context.
+
+RULES:
+1. The context is the authoritative source. Extract answers directly from it.
+2. ALWAYS cite every claim with the exact tag from the context (e.g. [F1], [C3]) immediately after the claim.
+3. NEVER say "Not in my knowledge base" when context is present — this phrase is forbidden.
+4. Only if zero context is provided may you say: No context available."""
 
 _NO_CONTEXT_NOTE = (
     "\n\n[No relevant information was found in the knowledge base for this question.]"
 )
+
+_PREFILL = "Based on the provided context: "
 
 _TAG_RE = re.compile(r"\[([FC]\d+)\]")
 
@@ -39,12 +43,19 @@ def build_messages(
     if not context_text.strip():
         sys_content += _NO_CONTEXT_NOTE
         user_content = f"Question: {question}"
+        messages: list[dict] = [{"role": "system", "content": sys_content}]
+        messages.extend(history)
+        messages.append({"role": "user", "content": user_content})
     else:
-        user_content = f"Context:\n{context_text}\n\nQuestion: {question}"
-
-    messages: list[dict] = [{"role": "system", "content": sys_content}]
-    messages.extend(history)
-    messages.append({"role": "user", "content": user_content})
+        user_content = (
+            f"Context:\n{context_text}\n\n"
+            f"Question: {question}\n"
+            f"Answer with inline citations ([C#] or [F#]):"
+        )
+        messages = [{"role": "system", "content": sys_content}]
+        messages.extend(history)
+        messages.append({"role": "user", "content": user_content})
+        messages.append({"role": "assistant", "content": _PREFILL})
     return messages
 
 
@@ -59,7 +70,16 @@ def stream_response(
     max_tokens: int,
     temperature: float,
 ) -> Generator[str, None, None]:
-    """Yield token deltas from the chat model (streaming mode)."""
+    """Yield token deltas from the chat model (streaming mode).
+
+    When the last message is an assistant prefill, yields it first so callers
+    receive the complete response including the forced prefix.
+    """
+    prefill = ""
+    if messages and messages[-1]["role"] == "assistant":
+        prefill = messages[-1]["content"]
+        if prefill:
+            yield prefill
     stream = llm.create_chat_completion(
         messages=messages,
         max_tokens=max_tokens,
@@ -81,14 +101,20 @@ def generate_response(
     max_tokens: int,
     temperature: float,
 ) -> str:
-    """Non-streaming generation. Returns complete response text."""
+    """Non-streaming generation. Returns complete response text.
+
+    When the last message is an assistant prefill, prepends it to the output.
+    """
+    prefill = ""
+    if messages and messages[-1]["role"] == "assistant":
+        prefill = messages[-1]["content"]
     result = llm.create_chat_completion(
         messages=messages,
         max_tokens=max_tokens,
         temperature=temperature,
         stream=False,
     )
-    return result["choices"][0]["message"]["content"]
+    return prefill + result["choices"][0]["message"]["content"]
 
 
 # ---------------------------------------------------------------------------
@@ -139,7 +165,8 @@ def build_sources_footer(
 
 def is_refusal(text: str) -> bool:
     """Return True if the response is a knowledge-base refusal."""
-    return "not in my knowledge base" in text.strip().lower()
+    lower = text.strip().lower()
+    return "not in my knowledge base" in lower or "no context available" in lower
 
 
 # ---------------------------------------------------------------------------
