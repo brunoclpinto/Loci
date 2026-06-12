@@ -91,7 +91,12 @@ def export_pack(
     if out_path.exists():
         out_path.unlink()
 
-    pack_conn = open_db(out_path)
+    # Inherit vec_dim from the source DB so pack and main stay compatible.
+    row = main_conn.execute(
+        "SELECT value FROM db_meta WHERE key='vec_dim'"
+    ).fetchone()
+    vec_dim = int(row[0]) if row else 384
+    pack_conn = open_db(out_path, vec_dim=vec_dim)
     counts: dict[str, int] = {}
     try:
         for table in ("sources", "chunks", "entities", "aliases",

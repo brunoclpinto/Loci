@@ -12,15 +12,19 @@ import sqlite_vec
 # Connection management
 # ---------------------------------------------------------------------------
 
-def open_db(db_path: str | Path) -> sqlite3.Connection:
-    """Open (or create) a knowledge DB, load sqlite-vec, and apply schema."""
+def open_db(db_path: str | Path, vec_dim: int = 384) -> sqlite3.Connection:
+    """Open (or create) a knowledge DB, load sqlite-vec, and apply schema.
+
+    vec_dim is only used when creating vec tables for the first time.
+    Existing DBs keep whatever dimension they were created with.
+    """
     path = Path(db_path).expanduser()
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(path), check_same_thread=False)
     conn.row_factory = sqlite3.Row
     _load_extensions(conn)
     _configure(conn)
-    _migrate(conn)
+    _migrate(conn, vec_dim=vec_dim)
     return conn
 
 
@@ -102,13 +106,9 @@ _DDL: list[str] = [
       chunk_id             INTEGER REFERENCES chunks(id),
       created_at           TEXT DEFAULT CURRENT_TIMESTAMP
     )""",
-    """CREATE VIRTUAL TABLE IF NOT EXISTS vec_chunks USING vec0(
-      chunk_id  INTEGER PRIMARY KEY,
-      embedding FLOAT[384]
-    )""",
-    """CREATE VIRTUAL TABLE IF NOT EXISTS vec_entities USING vec0(
-      entity_id INTEGER PRIMARY KEY,
-      embedding FLOAT[384]
+    """CREATE TABLE IF NOT EXISTS db_meta (
+      key   TEXT PRIMARY KEY,
+      value TEXT NOT NULL
     )""",
     """CREATE VIRTUAL TABLE IF NOT EXISTS fts_chunks
        USING fts5(text, content='chunks', content_rowid='id')""",
@@ -128,9 +128,26 @@ _DDL: list[str] = [
 ]
 
 
-def _migrate(conn: sqlite3.Connection) -> None:
+def _migrate(conn: sqlite3.Connection, vec_dim: int = 384) -> None:
     for stmt in _DDL:
         conn.execute(stmt)
+    # Vec tables are dimension-specific — only create if absent, record dim in db_meta.
+    vec_exists = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='vec_chunks'"
+    ).fetchone()
+    if not vec_exists:
+        conn.execute(
+            f"CREATE VIRTUAL TABLE vec_chunks USING vec0("
+            f"chunk_id INTEGER PRIMARY KEY, embedding FLOAT[{vec_dim}])"
+        )
+        conn.execute(
+            f"CREATE VIRTUAL TABLE vec_entities USING vec0("
+            f"entity_id INTEGER PRIMARY KEY, embedding FLOAT[{vec_dim}])"
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO db_meta(key,value) VALUES ('vec_dim',?)",
+            [str(vec_dim)],
+        )
     # Schema evolution — add columns that were not in the original DDL
     _ensure_column(conn, "chunks", "extracted_v", "INTEGER DEFAULT 0")
     conn.commit()

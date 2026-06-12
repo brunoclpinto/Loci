@@ -106,7 +106,7 @@ def ask_cmd(
 
     with measure("ask", log_dir=cfg_exp.paths.runtime_logs_dir) as counters:
         try:
-            conn = open_db(cfg_exp.paths.knowledge_db)
+            conn = open_db(cfg_exp.paths.knowledge_db, vec_dim=cfg_exp.models.vec_dim)
         except Exception as exc:
             console.print(f"[red]Cannot open DB:[/red] {exc}")
             raise typer.Exit(1)
@@ -225,7 +225,7 @@ def ingest_cmd(
 
     with measure("ingest", log_dir=cfg_exp.paths.runtime_logs_dir) as counters:
         try:
-            conn = open_db(cfg_exp.paths.knowledge_db)
+            conn = open_db(cfg_exp.paths.knowledge_db, vec_dim=cfg_exp.models.vec_dim)
         except Exception as exc:
             console.print(f"[red]Cannot open DB:[/red] {exc}")
             raise typer.Exit(1)
@@ -308,7 +308,7 @@ def chat_cmd(
         raise typer.Exit(1)
 
     try:
-        conn = open_db(cfg_exp.paths.knowledge_db)
+        conn = open_db(cfg_exp.paths.knowledge_db, vec_dim=cfg_exp.models.vec_dim)
     except Exception as exc:
         console.print(f"[red]Cannot open DB:[/red] {exc}")
         raise typer.Exit(1)
@@ -411,7 +411,7 @@ def stats_cmd(
 
     cfg_exp = expanded(cfg)
     try:
-        conn = open_db(cfg_exp.paths.knowledge_db)
+        conn = open_db(cfg_exp.paths.knowledge_db, vec_dim=cfg_exp.models.vec_dim)
     except Exception as exc:
         console.print(f"[red]Cannot open DB:[/red] {exc}")
         raise typer.Exit(1)
@@ -460,7 +460,7 @@ def maintenance_cmd(
 
     cfg_exp = expanded(cfg)
     try:
-        conn = open_db(cfg_exp.paths.knowledge_db)
+        conn = open_db(cfg_exp.paths.knowledge_db, vec_dim=cfg_exp.models.vec_dim)
     except Exception as exc:
         console.print(f"[red]Cannot open DB:[/red] {exc}")
         raise typer.Exit(1)
@@ -496,7 +496,7 @@ def entities_review_cmd(
 
     cfg_exp = expanded(cfg)
     try:
-        conn = open_db(cfg_exp.paths.knowledge_db)
+        conn = open_db(cfg_exp.paths.knowledge_db, vec_dim=cfg_exp.models.vec_dim)
     except Exception as exc:
         console.print(f"[red]Cannot open DB:[/red] {exc}")
         raise typer.Exit(1)
@@ -544,7 +544,7 @@ def entities_merge_cmd(
 
     cfg_exp = expanded(cfg)
     try:
-        conn = open_db(cfg_exp.paths.knowledge_db)
+        conn = open_db(cfg_exp.paths.knowledge_db, vec_dim=cfg_exp.models.vec_dim)
     except Exception as exc:
         console.print(f"[red]Cannot open DB:[/red] {exc}")
         raise typer.Exit(1)
@@ -593,7 +593,7 @@ def pack_export_cmd(
 
     cfg_exp = expanded(cfg)
     try:
-        conn = open_db(cfg_exp.paths.knowledge_db)
+        conn = open_db(cfg_exp.paths.knowledge_db, vec_dim=cfg_exp.models.vec_dim)
     except Exception as exc:
         console.print(f"[red]Cannot open DB:[/red] {exc}")
         raise typer.Exit(1)
@@ -739,7 +739,7 @@ def bench_ingest_cmd(
     initial_size = db_path.stat().st_size if db_path.exists() else 0
 
     try:
-        conn = open_db(db_path)
+        conn = open_db(db_path, vec_dim=cfg_exp.models.vec_dim)
     except Exception as exc:
         console.print(f"[red]Cannot open DB:[/red] {exc}")
         raise typer.Exit(1)
@@ -833,7 +833,7 @@ def bench_query_cmd(
     console.print(f"Loaded {len(qna_items)} QnA items from {qna_path}")
 
     try:
-        conn = open_db(cfg_exp.paths.knowledge_db)
+        conn = open_db(cfg_exp.paths.knowledge_db, vec_dim=cfg_exp.models.vec_dim)
     except Exception as exc:
         console.print(f"[red]Cannot open DB:[/red] {exc}")
         raise typer.Exit(1)
@@ -1052,7 +1052,7 @@ def bench_qna_skeleton_cmd(
 
     cfg_exp = expanded(cfg)
     try:
-        conn = open_db(cfg_exp.paths.knowledge_db)
+        conn = open_db(cfg_exp.paths.knowledge_db, vec_dim=cfg_exp.models.vec_dim)
     except Exception as exc:
         console.print(f"[red]Cannot open DB:[/red] {exc}")
         raise typer.Exit(1)
@@ -1164,7 +1164,7 @@ def enhance_cmd(
         raise typer.Exit(1)
 
     try:
-        conn = open_db(cfg_exp.paths.knowledge_db)
+        conn = open_db(cfg_exp.paths.knowledge_db, vec_dim=cfg_exp.models.vec_dim)
     except Exception as exc:
         console.print(f"[red]Cannot open DB:[/red] {exc}")
         raise typer.Exit(1)
@@ -1234,7 +1234,7 @@ def synonyms_learn_cmd(
         raise typer.Exit(1)
 
     try:
-        conn = open_db(cfg_exp.paths.knowledge_db)
+        conn = open_db(cfg_exp.paths.knowledge_db, vec_dim=cfg_exp.models.vec_dim)
     except Exception as exc:
         console.print(f"[red]Cannot open DB:[/red] {exc}")
         raise typer.Exit(1)
