@@ -14,22 +14,14 @@ DB_DIR="/Volumes/SSD1TB001/loci/knowledge"
 LOG_DIR="/Volumes/SSD1TB001/loci/logs/bench"
 QNA="bench/qna.json"
 
-declare -A EMBEDDERS=(
-  [small]="bge-small-en-v1.5-q8_0.gguf"
-  [base]="bge-base-en-v1.5-q8_0.gguf"
-  [large]="bge-large-en-v1.5-q8_0.gguf"
-)
-declare -A DIMS=([small]=384 [base]=768 [large]=1024)
-
 SKIP_INGEST=false
 for arg in "$@"; do [[ "$arg" == "--skip-ingest" ]] && SKIP_INGEST=true; done
 
-LOGS=()
-
-for VARIANT in small base large; do
-  EMBEDDER="${EMBEDDERS[$VARIANT]}"
-  DIM="${DIMS[$VARIANT]}"
-  DB="${DB_DIR}/scarlet_${VARIANT}.db"
+run_variant() {
+  local VARIANT="$1"
+  local EMBEDDER="$2"
+  local DIM="$3"
+  local DB="${DB_DIR}/scarlet_${VARIANT}.db"
 
   echo ""
   echo "════════════════════════════════════════════════════"
@@ -55,27 +47,33 @@ for VARIANT in small base large; do
   LOCI_MODELS__VEC_DIM="$DIM" \
   LOCI_PATHS__KNOWLEDGE_DB="$DB" \
     uv run loci bench query --qna "$QNA" --runs 1 --label "emb_${VARIANT}"
+}
 
-  # Capture the log path for comparison
-  LATEST=$(ls -t "${LOG_DIR}"/*.jsonl 2>/dev/null | grep -v judge | head -1)
-  LOGS+=("$LATEST")
-done
+run_variant "small" "bge-small-en-v1.5-q8_0.gguf" "384"
+run_variant "base"  "bge-base-en-v1.5-q8_0.gguf"  "768"
+run_variant "large" "bge-large-en-v1.5-q8_0.gguf" "1024"
 
 echo ""
 echo "════════════════════════════════════════════════════"
 echo "  Pairwise comparisons"
 echo "════════════════════════════════════════════════════"
 
-if [[ ${#LOGS[@]} -ge 2 ]]; then
+LOG_SMALL=$(ls -t "${LOG_DIR}"/*emb_small*.jsonl 2>/dev/null | grep -v judge | head -1)
+LOG_BASE=$(ls  -t "${LOG_DIR}"/*emb_base*.jsonl  2>/dev/null | grep -v judge | head -1)
+LOG_LARGE=$(ls -t "${LOG_DIR}"/*emb_large*.jsonl 2>/dev/null | grep -v judge | head -1)
+
+if [[ -f "$LOG_SMALL" && -f "$LOG_BASE" ]]; then
   echo ""
   echo "── small vs base ──"
-  uv run loci bench compare "${LOGS[0]}" "${LOGS[1]}"
+  uv run loci bench compare "$LOG_SMALL" "$LOG_BASE"
 fi
-if [[ ${#LOGS[@]} -ge 3 ]]; then
+if [[ -f "$LOG_SMALL" && -f "$LOG_LARGE" ]]; then
   echo ""
   echo "── small vs large ──"
-  uv run loci bench compare "${LOGS[0]}" "${LOGS[2]}"
+  uv run loci bench compare "$LOG_SMALL" "$LOG_LARGE"
+fi
+if [[ -f "$LOG_BASE" && -f "$LOG_LARGE" ]]; then
   echo ""
   echo "── base vs large ──"
-  uv run loci bench compare "${LOGS[1]}" "${LOGS[2]}"
+  uv run loci bench compare "$LOG_BASE" "$LOG_LARGE"
 fi
