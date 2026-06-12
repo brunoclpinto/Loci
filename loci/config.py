@@ -26,8 +26,8 @@ class PathsConfig:
 class ModelsConfig:
     chat: str = "qwen2.5-3b-instruct-q4_k_m.gguf"
     chat_low_mem: str = "llama-3.2-1b-instruct-q4_k_m.gguf"
-    embedder: str = "bge-small-en-v1.5-q8_0.gguf"
-    vec_dim: int = 384  # must match embedder output: small=384, base=768, large=1024
+    embedder: str = "bge-base-en-v1.5-q8_0.gguf"
+    vec_dim: int = 768  # must match embedder output: small=384, base=768, large=1024
     n_ctx: int = 4096
     n_gpu_layers: int = -1
     temperature: float = 0.4
