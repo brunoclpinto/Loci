@@ -8,6 +8,10 @@ _PRONOUN_SUBJECTS = frozenset({
     "they", "them", "their",
 })
 
+# Titles that signal the start of a new person name after a comma —
+# used to truncate compound NPs like "Dr. Watson, Mr. Sherlock Holmes,"
+_NAME_TITLES = frozenset(["mr", "mrs", "dr", "miss", "sir", "prof", "inspector", "sergeant"])
+
 
 @dataclass
 class RawFact:
@@ -75,7 +79,12 @@ def extract_facts_from_sent(sent) -> list[RawFact]:
 # ---------------------------------------------------------------------------
 
 def _span_text(token) -> str:
-    """Span of a token's subtree, stripping leading determiners/possessives."""
+    """Span of a token's subtree, stripping leading determiners/possessives.
+
+    Truncates at a comma followed by a title token (Mr., Dr., etc.) so that
+    comma-listed person names like "Dr. Watson, Mr. Sherlock Holmes," do not
+    collapse into a single compound entity.
+    """
     doc = token.doc
     start = token.left_edge.i
     end = token.right_edge.i + 1
@@ -85,6 +94,13 @@ def _span_text(token) -> str:
             start += 1
         else:
             break
+    # Stop before ", Mr. / , Dr. / ..." — comma-separated person list
+    for i in range(start, end - 1):
+        if doc[i].text == "," and i + 1 < end:
+            next_tok = doc[i + 1].text.lower().rstrip(".")
+            if next_tok in _NAME_TITLES:
+                end = i
+                break
     return doc[start:end].text.strip()
 
 

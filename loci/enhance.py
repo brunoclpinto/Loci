@@ -10,12 +10,16 @@ You are a precise fact extractor for a knowledge graph.
 Extract factual statements from the text passage below.
 
 Focus on constructions a syntactic parser misses:
-1. Passive voice   — "The letter was signed by Holmes"   → Holmes, sign, letter
-2. Copulas (X is Y) — "Watson is a doctor"               → Watson, be, doctor
-3. Possessives     — "Holmes's pipe" / "Holmes has a pipe" → Holmes, possess, pipe
+1. Passive voice      — "The letter was signed by Holmes"       → Holmes, sign, letter
+2. Copulas (X is Y)   — "Watson is a doctor"                   → Watson, be, doctor
+3. Possessives        — "Holmes's pipe" / "Holmes has a pipe"  → Holmes, possess, pipe
+4. Location/residence — "they took rooms at No. 221B"          → they, reside, No. 221B, Baker Street
+5. Occupation/role    — "he worked as a cab driver"            → he, work_as, cab driver
+6. Meaning/equivalence — "'RACHE' means revenge"               → RACHE, mean, revenge
+7. Naming/calling     — "called the Baker Street Irregulars"   → group, call, Baker Street Irregulars
 
 Rules:
-- "predicate" must be a lowercase lemmatised English verb.
+- "predicate" must be a lowercase lemmatised English verb (or compound like "work_as", "reside_at").
 - "subject" and "object" must be noun phrases exactly as they appear in the text.
 - Only extract statements clearly supported by the text — never infer.
 - Reply with ONLY a valid JSON array, no prose, no markdown fences.
