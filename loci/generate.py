@@ -11,14 +11,12 @@ _SYSTEM_PROMPT = """\
 You are a knowledge extraction assistant. Your only job is to extract answers from context.
 
 RULES:
-1. The context is the authoritative source. Extract answers directly from it.
+1. The context is the authoritative source. Only answer if the context directly supports the answer.
 2. ALWAYS cite every claim with the exact tag from the context (e.g. [F1], [C3]) immediately after the claim.
-3. NEVER say "Not in my knowledge base" when context is present — this phrase is forbidden.
-4. Only if zero context is provided may you say: No context available."""
+3. Only use tags that actually appear in the provided context. Never invent or guess a tag.
+4. If the context does not contain the answer to the question, say exactly: "The context does not contain this information." """
 
-_NO_CONTEXT_NOTE = (
-    "\n\n[No relevant information was found in the knowledge base for this question.]"
-)
+_NO_CONTEXT_NOTE = ""  # prompt rule 4 already covers the no-context case
 
 _PREFILL = "Based on the provided context: "
 
@@ -159,14 +157,41 @@ def build_sources_footer(
     return "\n".join(lines) if len(lines) > 1 else ""
 
 
+def strip_invalid_citations(
+    text: str,
+    fact_hits: list["FactHit"],
+    chunk_hits: list["ChunkHit"],
+) -> str:
+    """Remove any [F…]/[C…] tags from text that don't appear in the context."""
+    valid = {fh.tag for fh in fact_hits} | {ch.tag for ch in chunk_hits}
+    def _replace(m: re.Match) -> str:
+        tag = f"[{m.group(1)}]"
+        return tag if tag in valid else ""
+    return _TAG_RE.sub(_replace, text)
+
+
 # ---------------------------------------------------------------------------
 # Refusal detection
 # ---------------------------------------------------------------------------
 
+_REFUSAL_PHRASES = (
+    "not in my knowledge base",
+    "no context available",
+    "none available",
+    "no relevant information",
+    "context does not contain",
+    "context does not include",
+    "does not contain this information",
+    "not mentioned in",
+    "not provided in",
+    "cannot find",
+    "not found in",
+)
+
 def is_refusal(text: str) -> bool:
     """Return True if the response is a knowledge-base refusal."""
     lower = text.strip().lower()
-    return "not in my knowledge base" in lower or "no context available" in lower
+    return any(phrase in lower for phrase in _REFUSAL_PHRASES)
 
 
 # ---------------------------------------------------------------------------

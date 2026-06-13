@@ -818,7 +818,8 @@ def bench_query_cmd(
     from loci.store import open_db
     from loci.retrieve import retrieve
     from loci.generate import (build_messages, stream_response,
-                               extract_cited_tags, is_refusal)
+                               extract_cited_tags, is_refusal,
+                               strip_invalid_citations)
     from loci.bench import (load_qna, score_mechanical, QuestionResult,
                             write_run_log, render_report, run_judging)
     from loci.pack import attach_registered_packs
@@ -931,6 +932,9 @@ def bench_query_cmd(
                     peak_rss = max(rss_samples, default=psutil.Process().memory_info().rss / 1024 / 1024)
                     swap_delta = psutil.swap_memory().used / 1024 / 1024 - swap_before
 
+                    full_text = strip_invalid_citations(
+                        full_text, result.fact_hits, result.chunk_hits
+                    )
                     citations = extract_cited_tags(full_text)
                     mechanical = score_mechanical(
                         item, full_text, result.fact_hits, result.chunk_hits

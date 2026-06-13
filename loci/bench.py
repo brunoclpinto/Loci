@@ -168,6 +168,7 @@ def load_qna(path: Path) -> list[QnAItem]:
 @dataclass
 class MechanicalScore:
     citation_present: bool
+    citation_valid: bool        # True = all cited tags actually exist in context
     keyword_recall: float       # fraction of expected_keywords found in answer
     fact_hit_rate: float        # fraction of expected_facts matched by SQL layer
     retrieval_hit_rate: float   # fraction of expected_sources found in chunks
@@ -186,7 +187,12 @@ def score_mechanical(
     """Fully offline quality scoring against ground-truth QnA item."""
     from loci.generate import extract_cited_tags, is_refusal
 
-    citation_present = bool(extract_cited_tags(answer))
+    cited_tags = extract_cited_tags(answer)
+    citation_present = bool(cited_tags)
+
+    # citation_valid: every cited tag must correspond to an actual context item
+    valid_tags = {fh.tag for fh in fact_hits} | {ch.tag for ch in chunk_hits}
+    citation_valid = all(t in valid_tags for t in cited_tags) if cited_tags else not citation_present
 
     if item.expected_keywords:
         lower = answer.lower()
@@ -225,6 +231,7 @@ def score_mechanical(
 
     return MechanicalScore(
         citation_present=citation_present,
+        citation_valid=citation_valid,
         keyword_recall=keyword_recall,
         fact_hit_rate=fact_hit_rate,
         retrieval_hit_rate=retrieval_hit_rate,
@@ -263,12 +270,15 @@ def _compute_aggregate(results: list[QuestionResult]) -> dict:
         s = list(seq)
         return statistics.mean(s) if s else 0.0
 
+    answered = [r for r in first if r.answerable]
     agg: dict[str, Any] = {
         "n_questions": len({r.q_id for r in first}),
         "mean_keyword_recall": _mean(r.mechanical.keyword_recall for r in first),
         "mean_fact_hit_rate": _mean(r.mechanical.fact_hit_rate for r in first),
         "mean_retrieval_hit_rate": _mean(r.mechanical.retrieval_hit_rate for r in first),
-        "citation_present_rate": _mean(int(r.mechanical.citation_present) for r in first),
+        # citation metrics only over answerable questions (refusals correctly have no tags)
+        "citation_present_rate": _mean(int(r.mechanical.citation_present) for r in answered) if answered else 0.0,
+        "citation_valid_rate": _mean(int(r.mechanical.citation_valid) for r in answered) if answered else 0.0,
         "hallucination_count": sum(1 for r in first if r.mechanical.hallucination),
         "mean_gen_ms": _mean(r.timings.get("gen_ms", 0) for r in first),
         "mean_fact_ms": _mean(r.timings.get("fact_ms", 0) for r in first),
@@ -513,7 +523,7 @@ def render_report(run_data: dict) -> str:
         )
     lines.append("\n## Aggregate\n")
     for k in ("n_questions", "mean_keyword_recall", "mean_fact_hit_rate",
-               "mean_retrieval_hit_rate", "citation_present_rate",
+               "mean_retrieval_hit_rate", "citation_present_rate", "citation_valid_rate",
                "hallucination_count", "mean_judge_score", "median_judge_score",
                "mean_gen_ms", "mean_fact_ms", "mean_peak_rss_mb"):
         v = agg.get(k)
@@ -573,7 +583,8 @@ def compare_runs(run_a: dict, run_b: dict) -> str:
     for metric, hb in [
         ("mean_keyword_recall", True), ("mean_fact_hit_rate", True),
         ("mean_retrieval_hit_rate", True), ("citation_present_rate", True),
-        ("hallucination_count", False), ("mean_judge_score", True),
+        ("citation_valid_rate", True), ("hallucination_count", False),
+        ("mean_judge_score", True),
         ("median_judge_score", True), ("mean_gen_ms", False),
         ("mean_fact_ms", False), ("mean_peak_rss_mb", False),
     ]:

@@ -17,6 +17,19 @@ _AUX_LEMMAS = frozenset(["be", "do", "have", "will", "would", "could", "should",
 _CHARS_PER_TOKEN = 4
 _NONWORD = re.compile(r"[^\w\s]")
 
+# Words to strip before building a FTS OR-query — question words, auxiliaries, and
+# common English stopwords that appear in every sentence and dilute BM25 signal.
+_FTS_STOPWORDS = frozenset([
+    "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
+    "have", "has", "had", "do", "does", "did", "will", "would", "could",
+    "should", "may", "might", "shall", "can", "must", "of", "in", "on",
+    "at", "by", "to", "for", "with", "from", "and", "or", "but", "not",
+    "no", "it", "its", "this", "that", "their", "there", "they", "them",
+    "he", "she", "his", "her", "we", "our", "you", "your", "i", "my",
+    "what", "who", "where", "when", "which", "how", "whom", "whose",
+    "name", "called", "used", "ever", "first", "did",
+])
+
 
 # ---------------------------------------------------------------------------
 # Data structures
@@ -236,6 +249,10 @@ def fact_lookup(
         LEFT JOIN {sp}sources s ON c.source_id = s.id
         WHERE f.subject_id IN ({id_ph})
           AND f.predicate IN ({pred_ph})
+          AND (f.object_text IS NOT NULL OR f.object_id IS NOT NULL)
+          AND length(e.canonical_name) <= 60
+          AND instr(e.canonical_name, ',') = 0
+          AND instr(e.canonical_name, char(10)) = 0
         ORDER BY score DESC, f.id
         """,
         [predicate] + entity_ids + all_predicates,
@@ -289,13 +306,16 @@ def vec_search_question(
 def fts_search_question(
     conn: sqlite3.Connection, question: str, k: int, schema: str = "main"
 ) -> list[int]:
-    """BM25 full-text search on the question string."""
+    """BM25 full-text search: strip stopwords, OR remaining content words."""
     from loci.store import fts_search_chunks
-    clean = _NONWORD.sub(" ", question).strip()
-    if not clean:
+    words = _NONWORD.sub(" ", question.lower()).split()
+    content = [w for w in words if w and w not in _FTS_STOPWORDS and len(w) > 2]
+    if not content:
         return []
+    # FTS5 OR query: any chunk matching any content word ranks above zero
+    query = " OR ".join(content)
     try:
-        results = fts_search_chunks(conn, query=clean, k=k, schema=schema)
+        results = fts_search_chunks(conn, query=query, k=k, schema=schema)
         return [r["chunk_id"] for r in results]
     except Exception:
         return []
@@ -366,9 +386,8 @@ def _format_fact(f: FactHit) -> str:
 
 
 def _format_chunk(c: ChunkHit) -> str:
-    preview = c.text[:300].replace("\n", " ")
     src = f" ({c.source_info})" if c.source_info else ""
-    return f'{c.tag} "{preview}..."{src}' if len(c.text) > 300 else f'{c.tag} "{c.text}"{src}'
+    return f'{c.tag} "{c.text}"{src}'
 
 
 def _source_info(title: str | None, path: str | None) -> str | None:
