@@ -28,6 +28,8 @@ _FTS_STOPWORDS = frozenset([
     "he", "she", "his", "her", "we", "our", "you", "your", "i", "my",
     "what", "who", "where", "when", "which", "how", "whom", "whose",
     "name", "called", "used", "ever", "first", "did",
+    # domain: ubiquitous in every chunk — dilute BM25 signal without adding discrimination
+    "holmes", "watson", "sherlock", "john", "said", "replied", "remarked", "cried",
 ])
 
 
@@ -325,15 +327,17 @@ def fts_search_question(
 # RRF fusion
 # ---------------------------------------------------------------------------
 
-def rrf_fuse(ranked_lists: list[list], k: int = 60) -> list[tuple]:
+def rrf_fuse(ranked_lists: list[list], k: int = 60, ks: list[int] | None = None) -> list[tuple]:
     """Reciprocal Rank Fusion across multiple ranked ID lists.
 
     Keys may be any hashable type (int for single-schema, (schema, int) for packs).
+    ks: per-list k values (overrides k when provided); smaller k = higher weight for that list.
     """
     scores: dict = {}
-    for lst in ranked_lists:
+    for i, lst in enumerate(ranked_lists):
+        ki = ks[i] if ks and i < len(ks) else k
         for rank, doc_id in enumerate(lst, start=1):
-            scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (k + rank)
+            scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (ki + rank)
     return sorted(scores.items(), key=lambda x: -x[1])
 
 
@@ -563,7 +567,8 @@ def retrieve(
 
     # 7. RRF fusion + context build
     t0 = time.perf_counter()
-    fused = rrf_fuse([all_vec_keys, all_fts_keys], k=cfg.retrieval.rrf_k)
+    fused = rrf_fuse([all_vec_keys, all_fts_keys],
+                     ks=[cfg.retrieval.vec_rrf_k, cfg.retrieval.rrf_k])
     chunk_hits = load_chunk_hits(
         conn, fused, cfg.retrieval.context_token_budget, offset=len(all_fact_hits) + 1
     )

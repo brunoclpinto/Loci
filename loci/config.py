@@ -51,6 +51,7 @@ class RetrievalConfig:
     context_token_budget: int = 1800
     entity_sim_threshold: float = 0.92
     rrf_k: int = 60
+    vec_rrf_k: int = 30  # lower = higher vec weight relative to FTS in RRF fusion
 
 
 @dataclass
