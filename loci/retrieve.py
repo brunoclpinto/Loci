@@ -219,6 +219,71 @@ def get_synonyms(
 # Fact lookup (SQL)
 # ---------------------------------------------------------------------------
 
+def load_fact_hits_by_ids(
+    conn: sqlite3.Connection,
+    fact_ids: list[int],
+    schema: str = "main",
+) -> list[FactHit]:
+    """Fetch FactHit objects for a ranked list of fact_ids (FTS results).
+
+    Preserves the ranking order from the input list; scores descend from 0.70
+    so SQL-exact hits (1.0/0.8) always sort above these FTS hits.
+    """
+    if not fact_ids:
+        return []
+    sp = f"{schema}." if schema != "main" else ""
+    id_ph = ",".join("?" * len(fact_ids))
+    rows = conn.execute(
+        f"""
+        SELECT
+            f.id, f.predicate, f.object_text, f.object_id, f.qualifiers,
+            f.negated, f.sentence, f.chunk_id,
+            e.canonical_name AS subject_name,
+            oe.canonical_name AS object_entity_name,
+            s.title, s.path
+        FROM {sp}facts f
+        JOIN {sp}entities e ON f.subject_id = e.id
+        LEFT JOIN {sp}entities oe ON f.object_id = oe.id
+        JOIN {sp}chunks c ON f.chunk_id = c.id
+        LEFT JOIN {sp}sources s ON c.source_id = s.id
+        WHERE f.id IN ({id_ph})
+          AND (f.object_text IS NOT NULL OR f.object_id IS NOT NULL)
+          AND length(e.canonical_name) <= 60
+          AND instr(e.canonical_name, ',') = 0
+          AND instr(e.canonical_name, char(10)) = 0
+        """,
+        fact_ids,
+    ).fetchall()
+    id_to_row = {r["id"]: r for r in rows}
+    hits = []
+    for rank, fid in enumerate(fact_ids):
+        r = id_to_row.get(fid)
+        if r is None:
+            continue
+        # Skip facts whose subject name is entirely lowercase (common noun phrases
+        # treated as entities by spaCy, e.g. "address", "young hunter", "door").
+        # Real story entities have at least one uppercase letter in their name.
+        sn = r["subject_name"] or ""
+        if sn and sn == sn.lower():
+            continue
+        quals = json.loads(r["qualifiers"]) if r["qualifiers"] else None
+        hits.append(FactHit(
+            fact_id=r["id"],
+            tag="",  # renumbered later
+            subject_name=sn,
+            predicate=r["predicate"],
+            object_text=r["object_text"],
+            object_entity_name=r["object_entity_name"],
+            qualifiers=quals,
+            negated=bool(r["negated"]),
+            sentence=r["sentence"],
+            chunk_id=r["chunk_id"],
+            source_info=_source_info(r["title"], r["path"]),
+            score=0.7 - 0.01 * rank,
+        ))
+    return hits
+
+
 def fact_lookup(
     conn: sqlite3.Connection,
     entity_ids: list[int],
@@ -323,6 +388,22 @@ def fts_search_question(
         return []
 
 
+def fact_fts_search_question(
+    conn: sqlite3.Connection, question: str, k: int, schema: str = "main"
+) -> list[int]:
+    """Stopword-stripped OR query over fts_facts → ranked fact_ids."""
+    from loci.store import fts_search_facts
+    words = _NONWORD.sub(" ", question.lower()).split()
+    content = [w for w in words if w and w not in _FTS_STOPWORDS and len(w) > 2]
+    if not content:
+        return []
+    query = " OR ".join(content)
+    try:
+        return [r["fact_id"] for r in fts_search_facts(conn, query=query, k=k, schema=schema)]
+    except Exception:
+        return []
+
+
 # ---------------------------------------------------------------------------
 # RRF fusion
 # ---------------------------------------------------------------------------
@@ -350,20 +431,24 @@ def build_context(
     chunk_hits: list[ChunkHit],
     token_budget: int,
 ) -> str:
-    """Assemble context ≤ token_budget tokens: facts first, then chunks."""
+    """Assemble context ≤ token_budget tokens: chunks first, then facts.
+
+    Chunks come first so reliable passage content always reaches the model.
+    Facts follow as supplementary citable evidence (bridging facts, named entities).
+    """
     budget_chars = token_budget * _CHARS_PER_TOKEN
     parts: list[str] = []
     used = 0
 
-    for fh in fact_hits:
-        line = _format_fact(fh)
+    for ch in chunk_hits:
+        line = _format_chunk(ch)
         if used + len(line) > budget_chars:
             break
         parts.append(line)
         used += len(line)
 
-    for ch in chunk_hits:
-        line = _format_chunk(ch)
+    for fh in fact_hits:
+        line = _format_fact(fh)
         if used + len(line) > budget_chars:
             break
         parts.append(line)
@@ -464,6 +549,7 @@ def build_explain(
     fused: list[tuple],
     conn: sqlite3.Connection,
     schemas: list[str] | None = None,
+    fact_fts_ids: list[int] | None = None,
 ) -> str:
     lines: list[str] = ["=== Question Parse ==="]
     lines.append(f"  wh-type : {parse.wh_type or '(none)'}")
@@ -478,6 +564,11 @@ def build_explain(
     lines.append(f"  hits: {len(fact_hits)}")
     for fh in fact_hits[:5]:
         lines.append(f"  {fh.tag} {fh.subject_name} — {fh.predicate} — {fh.object_text} (score={fh.score})")
+
+    lines.append("\n=== Fact FTS ===")
+    fts_fact_hits = [fh for fh in fact_hits if fh.fact_id in set(fact_fts_ids or [])]
+    lines.append(f"  new_fact_ids: {(fact_fts_ids or [])[:5]}")
+    lines.append(f"  in_context: {len(fts_fact_hits)}")
 
     lines.append("\n=== Vector Search ===")
     lines.append(f"  top-{len(vec_ids)}: chunk_ids={vec_ids[:5]}")
@@ -540,8 +631,20 @@ def retrieve(
     if timings is not None:
         timings["fact_ms"] = fact_ms
 
-    # Re-sort and renumber tags
+    # Fact FTS (additive): keyword recall over fact triples + source sentences.
+    all_fact_fts_ids: list[int] = []
+    seen_fids = {h.fact_id for h in all_fact_hits}
+    for schema in schemas:
+        fids = fact_fts_search_question(conn, question, cfg.retrieval.fact_fts_top_k, schema=schema)
+        fids = [fid for fid in fids if fid not in seen_fids]
+        if fids:
+            all_fact_hits.extend(load_fact_hits_by_ids(conn, fids, schema=schema))
+            seen_fids.update(fids)
+            all_fact_fts_ids.extend(fids)
+
+    # Re-sort, cap, and renumber tags
     all_fact_hits.sort(key=lambda h: -h.score)
+    all_fact_hits = all_fact_hits[: cfg.retrieval.max_facts_in_context]
     for i, h in enumerate(all_fact_hits, 1):
         h.tag = f"[F{i}]"
 
@@ -570,7 +673,7 @@ def retrieve(
     fused = rrf_fuse([all_vec_keys, all_fts_keys],
                      ks=[cfg.retrieval.vec_rrf_k, cfg.retrieval.rrf_k])
     chunk_hits = load_chunk_hits(
-        conn, fused, cfg.retrieval.context_token_budget, offset=len(all_fact_hits) + 1
+        conn, fused, cfg.retrieval.context_token_budget, offset=1
     )
     context = build_context(all_fact_hits, chunk_hits, cfg.retrieval.context_token_budget)
     if timings is not None:
@@ -584,6 +687,7 @@ def retrieve(
         explain_text = build_explain(
             parse, main_entity_ids, main_synonyms, all_fact_hits,
             all_vec_ids, all_fts_ids, fused, conn, schemas=schemas,
+            fact_fts_ids=all_fact_fts_ids,
         )
         explain_text += f"\n\n  fact_lookup_ms: {fact_ms:.1f}"
 

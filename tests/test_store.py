@@ -7,12 +7,14 @@ import pytest
 from loci.store import (
     attach_pack,
     fts_search_chunks,
+    fts_search_facts,
     insert_alias,
     insert_chunk,
     insert_entity,
     insert_fact,
     insert_source,
     open_db,
+    rebuild_fact_fts,
     upsert_vec_chunk,
     upsert_vec_entity,
     vec_search_chunks,
@@ -256,3 +258,63 @@ class TestAttach:
         assert total == 5
 
         main_conn.close()
+
+
+# ---------------------------------------------------------------------------
+# fts_facts: rebuild, search, idempotency, backfill
+# ---------------------------------------------------------------------------
+
+def _seed_landlady_fact(conn):
+    """Insert entity+chunk+fact for 'Mrs Hudson — role — landlady'."""
+    src_id = insert_source(conn, sha256=sha("src_landlady"), title="Test")
+    chunk_id = insert_chunk(
+        conn, source_id=src_id, ordinal=0,
+        text="Mrs. Hudson, our landlady, brought tea.",
+        sha256=sha("chunk_landlady"),
+    )
+    eid = insert_entity(conn, canonical_name="Mrs Hudson", kind="person")
+    insert_alias(conn, entity_id=eid, alias="mrs hudson")
+    fact_id = insert_fact(
+        conn, chunk_id=chunk_id,
+        sentence="Mrs. Hudson, our landlady, brought tea.",
+        subject_id=eid, predicate="role", object_text="landlady",
+    )
+    return fact_id
+
+
+class TestFtsFacts:
+    def test_rebuild_count_matches_facts(self, tmp_db):
+        _seed_landlady_fact(tmp_db)
+        n = rebuild_fact_fts(tmp_db)
+        db_n = tmp_db.execute("SELECT COUNT(*) FROM facts").fetchone()[0]
+        assert n == db_n
+        assert tmp_db.execute("SELECT COUNT(*) FROM fts_facts").fetchone()[0] == db_n
+
+    def test_search_finds_object_keyword(self, tmp_db):
+        fact_id = _seed_landlady_fact(tmp_db)
+        rebuild_fact_fts(tmp_db)
+        results = fts_search_facts(tmp_db, query="landlady", k=5)
+        ids = [r["fact_id"] for r in results]
+        assert fact_id in ids
+
+    def test_idempotent_rebuild(self, tmp_db):
+        _seed_landlady_fact(tmp_db)
+        n1 = rebuild_fact_fts(tmp_db)
+        n2 = rebuild_fact_fts(tmp_db)
+        assert n1 == n2
+        assert tmp_db.execute("SELECT COUNT(*) FROM fts_facts").fetchone()[0] == n1
+
+    def test_backfill_on_reopen(self, tmp_path):
+        db_path = tmp_path / "backfill.db"
+        conn = open_db(db_path)
+        _seed_landlady_fact(conn)
+        conn.close()
+
+        conn2 = open_db(db_path)
+        count = conn2.execute("SELECT COUNT(*) FROM fts_facts").fetchone()[0]
+        meta = conn2.execute(
+            "SELECT value FROM db_meta WHERE key='fact_fts_v'"
+        ).fetchone()
+        conn2.close()
+        assert count > 0
+        assert meta is not None and meta[0] == "1"

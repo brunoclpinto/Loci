@@ -125,6 +125,9 @@ _DDL: list[str] = [
         VALUES ('delete', old.id, old.text);
       INSERT INTO fts_chunks(rowid, text) VALUES (new.id, new.text);
     END""",
+    # Standalone (non-content) FTS5 over fact triples + source sentences.
+    # rowid == facts.id so search results map back directly.
+    """CREATE VIRTUAL TABLE IF NOT EXISTS fts_facts USING fts5(text)""",
 ]
 
 
@@ -151,6 +154,16 @@ def _migrate(conn: sqlite3.Connection, vec_dim: int = 384) -> None:
     # Schema evolution — add columns that were not in the original DDL
     _ensure_column(conn, "chunks", "extracted_v", "INTEGER DEFAULT 0")
     conn.commit()
+
+    # Backfill fact FTS for DBs created before fts_facts existed.
+    fts_v = conn.execute(
+        "SELECT value FROM db_meta WHERE key='fact_fts_v'"
+    ).fetchone()
+    fact_n = conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0]
+    if (fts_v is None) and fact_n > 0:
+        rebuild_fact_fts(conn)
+        conn.execute("INSERT OR REPLACE INTO db_meta(key,value) VALUES ('fact_fts_v','1')")
+        conn.commit()
 
 
 def _ensure_column(conn: sqlite3.Connection, table: str, col: str, col_def: str) -> None:
@@ -328,6 +341,55 @@ def fts_search_chunks(
             f"SELECT fts.rowid AS chunk_id, fts.rank"
             f" FROM {sp}fts_chunks fts"
             f" WHERE fts MATCH ? ORDER BY fts.rank LIMIT ?",
+            [query, k],
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def rebuild_fact_fts(conn: sqlite3.Connection) -> int:
+    """(Re)build the fts_facts index from the current facts table.
+
+    Indexed document per fact = subject name + predicate + object + source sentence.
+    Returns number of facts indexed.
+    """
+    conn.execute("DELETE FROM fts_facts")
+    rows = conn.execute(
+        """
+        SELECT f.id AS fid,
+               e.canonical_name AS subj,
+               f.predicate AS pred,
+               COALESCE(oe.canonical_name, f.object_text, '') AS obj,
+               f.sentence AS sent
+        FROM facts f
+        JOIN entities e  ON f.subject_id = e.id
+        LEFT JOIN entities oe ON f.object_id = oe.id
+        """
+    ).fetchall()
+    n = 0
+    for r in rows:
+        pred = (r["pred"] or "").replace("_", " ")
+        doc = f"{r['subj']} {pred} {r['obj']} {r['sent']}"
+        conn.execute("INSERT INTO fts_facts(rowid, text) VALUES (?, ?)",
+                     [r["fid"], doc])
+        n += 1
+    conn.commit()
+    return n
+
+
+def fts_search_facts(
+    conn: sqlite3.Connection, *, query: str, k: int = 10, schema: str = "main"
+) -> list[dict]:
+    if schema == "main":
+        rows = conn.execute(
+            "SELECT rowid AS fact_id, rank FROM fts_facts"
+            " WHERE text MATCH ? ORDER BY rank LIMIT ?",
+            [query, k],
+        ).fetchall()
+    else:
+        sp = f"{schema}."
+        rows = conn.execute(
+            f"SELECT fts.rowid AS fact_id, fts.rank"
+            f" FROM {sp}fts_facts fts WHERE fts MATCH ? ORDER BY fts.rank LIMIT ?",
             [query, k],
         ).fetchall()
     return [dict(r) for r in rows]

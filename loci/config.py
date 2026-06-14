@@ -52,6 +52,8 @@ class RetrievalConfig:
     entity_sim_threshold: float = 0.92
     rrf_k: int = 60
     vec_rrf_k: int = 30  # lower = higher vec weight relative to FTS in RRF fusion
+    fact_fts_top_k: int = 10     # candidate facts pulled from fts_facts per schema
+    max_facts_in_context: int = 4  # hard cap on [F#] lines placed before chunks
 
 
 @dataclass

@@ -150,4 +150,13 @@ def run_enhance(
             conn, row["id"], row["text"], llm,
             cfg=cfg, embedder=embedder,
         )
+    try:
+        from loci.store import rebuild_fact_fts
+        rebuild_fact_fts(conn)
+        conn.execute("INSERT OR REPLACE INTO db_meta(key,value) VALUES ('fact_fts_v','1')")
+        conn.commit()
+    except Exception as _fts_err:
+        import warnings
+        warnings.warn(f"fts_facts rebuild failed after enhance: {_fts_err}")
+
     return {"chunks_processed": len(chunks), "facts_added": n_facts}

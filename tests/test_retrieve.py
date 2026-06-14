@@ -264,9 +264,9 @@ class TestBuildContext:
             source_info="Book", rrf_score=0.01,
         )
 
-    def test_facts_come_first(self):
+    def test_chunks_come_first(self):
         ctx = build_context([self._make_fact(1)], [self._make_chunk(2)], token_budget=1800)
-        assert ctx.index("[F1]") < ctx.index("[C2]")
+        assert ctx.index("[C2]") < ctx.index("[F1]")
 
     def test_respects_token_budget(self):
         facts = [self._make_fact(i) for i in range(20)]
@@ -364,3 +364,105 @@ class TestRetrieve:
         # At minimum, FTS on "detective" or "grab" may surface relevant chunks;
         # if not, the test just checks the pipeline didn't crash
         assert isinstance(result.chunk_hits, list)
+
+
+# ---------------------------------------------------------------------------
+# Fact-FTS regression and new behaviour
+# ---------------------------------------------------------------------------
+
+import hashlib as _hashlib
+from loci.store import (
+    open_db as _open_db,
+    insert_source as _insert_source,
+    insert_chunk as _insert_chunk,
+    insert_entity as _insert_entity,
+    insert_alias as _insert_alias,
+    insert_fact as _insert_fact,
+    rebuild_fact_fts as _rebuild_fact_fts,
+)
+
+
+@pytest.fixture
+def landlady_db(tmp_path, nlp):
+    """Minimal DB: one fact (Mrs Hudson — role — landlady)."""
+    conn = _open_db(tmp_path / "landlady.db")
+    src_id = _insert_source(conn, sha256=_hashlib.sha256(b"s").hexdigest(), title="Test")
+    chunk_id = _insert_chunk(
+        conn, source_id=src_id, ordinal=0,
+        text="Mrs. Hudson, our landlady, brought tea.",
+        sha256=_hashlib.sha256(b"c").hexdigest(),
+    )
+    eid = _insert_entity(conn, canonical_name="Mrs Hudson", kind="person")
+    _insert_alias(conn, entity_id=eid, alias="mrs hudson")
+    _insert_fact(
+        conn, chunk_id=chunk_id,
+        sentence="Mrs. Hudson, our landlady, brought tea.",
+        subject_id=eid, predicate="role", object_text="landlady",
+    )
+    _rebuild_fact_fts(conn)
+    yield conn
+    conn.close()
+
+
+class TestFactFts:
+    def test_copula_question_hits_fact(self, landlady_db, default_cfg, nlp):
+        """Core regression: copula 'is' no longer blocks fact retrieval."""
+        result = retrieve(
+            "Who is the landlady?",
+            conn=landlady_db, cfg=default_cfg,
+            embedder=None, nlp=nlp,
+        )
+        assert len(result.fact_hits) > 0
+        assert "[F" in result.context_text
+
+    def test_fact_fts_stopword_only_returns_empty(self, landlady_db):
+        from loci.retrieve import fact_fts_search_question
+        ids = fact_fts_search_question(landlady_db, "who is the", k=5)
+        assert ids == []
+
+    def test_fact_fts_content_word_returns_ids(self, landlady_db):
+        from loci.retrieve import fact_fts_search_question
+        ids = fact_fts_search_question(landlady_db, "landlady role", k=5)
+        assert len(ids) > 0
+
+    def test_max_facts_in_context_cap(self, tmp_path, default_cfg, nlp):
+        conn = _open_db(tmp_path / "cap.db")
+        src_id = _insert_source(conn, sha256=_hashlib.sha256(b"cap_src").hexdigest(), title="Cap")
+        for i in range(8):
+            cid = _insert_chunk(
+                conn, source_id=src_id, ordinal=i,
+                text=f"The landlady lives at place {i}.",
+                sha256=_hashlib.sha256(f"cap_chunk_{i}".encode()).hexdigest(),
+            )
+            eid = _insert_entity(conn, canonical_name=f"Lady{i}", kind="person")
+            _insert_alias(conn, entity_id=eid, alias=f"lady{i}")
+            _insert_fact(
+                conn, chunk_id=cid,
+                sentence=f"The landlady lives at place {i}.",
+                subject_id=eid, predicate="residence", object_text="landlady area",
+            )
+        _rebuild_fact_fts(conn)
+
+        from loci.config import Config
+        cfg = Config()
+        cfg.retrieval.max_facts_in_context = 2
+
+        result = retrieve(
+            "Who is the landlady?",
+            conn=conn, cfg=cfg, embedder=None, nlp=nlp,
+        )
+        conn.close()
+        assert len(result.fact_hits) <= 2
+        tags = [h.tag for h in result.fact_hits]
+        if len(tags) >= 1:
+            assert tags[0] == "[F1]"
+        if len(tags) == 2:
+            assert tags[1] == "[F2]"
+
+    def test_fact_hits_scores_non_increasing(self, landlady_db, default_cfg, nlp):
+        result = retrieve(
+            "Who is the landlady?",
+            conn=landlady_db, cfg=default_cfg, embedder=None, nlp=nlp,
+        )
+        scores = [h.score for h in result.fact_hits]
+        assert scores == sorted(scores, reverse=True)

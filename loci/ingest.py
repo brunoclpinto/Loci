@@ -311,6 +311,15 @@ def _run_pipeline(
     entities_after = conn.execute("SELECT COUNT(*) FROM entities").fetchone()[0]
     linked_after = conn.execute("SELECT COUNT(*) FROM aliases").fetchone()[0]
 
+    try:
+        from loci.store import rebuild_fact_fts
+        rebuild_fact_fts(conn)
+        conn.execute("INSERT OR REPLACE INTO db_meta(key,value) VALUES ('fact_fts_v','1')")
+        conn.commit()
+    except Exception as _fts_err:
+        import warnings
+        warnings.warn(f"fts_facts rebuild failed after ingest: {_fts_err}")
+
     return {
         "skipped": False,
         "chunks": len(chunk_records),
