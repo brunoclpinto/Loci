@@ -355,15 +355,71 @@ def vec_search_question(
     question: str,
     k: int,
     schema: str = "main",
+    *,
+    embedding: list[float] | None = None,
 ) -> list[int]:
-    """Embed question and return top-k chunk_ids by vector similarity."""
-    from loci.models import embed_batch
+    """Embed question (or reuse provided embedding) and return top-k chunk_ids."""
     from loci.store import vec_search_chunks
-    vecs = embed_batch(embedder, [question], normalize=True)
-    if not vecs:
-        return []
-    results = vec_search_chunks(conn, embedding=vecs[0], k=k, schema=schema)
+    if embedding is None:
+        from loci.models import embed_batch
+        vecs = embed_batch(embedder, [question], normalize=True)
+        if not vecs:
+            return []
+        embedding = vecs[0]
+    results = vec_search_chunks(conn, embedding=embedding, k=k, schema=schema)
     return [r["chunk_id"] for r in results]
+
+
+def vec_fact_search_question(
+    conn: sqlite3.Connection,
+    embedding: list[float],
+    k: int,
+    schema: str = "main",
+) -> list[tuple[int, float]]:
+    """Return top-k (fact_id, distance) pairs from vec_facts using a pre-computed embedding."""
+    from loci.store import vec_search_facts
+    try:
+        results = vec_search_facts(conn, embedding=embedding, k=k, schema=schema)
+        return [(r["fact_id"], r["distance"]) for r in results]
+    except Exception:
+        return []
+
+
+def canonical_names_for_facts(
+    conn: sqlite3.Connection,
+    fact_ids: list[int],
+    schema: str = "main",
+) -> list[str]:
+    """Return distinct canonical entity names (subject + object) for the given facts.
+
+    Only proper-noun-ish names (has uppercase, no comma, length ≤ 60) are returned.
+    Used by expand mode to inject bridge names into the chunk query.
+    """
+    if not fact_ids:
+        return []
+    sp = f"{schema}." if schema != "main" else ""
+    id_ph = ",".join("?" * len(fact_ids))
+    rows = conn.execute(
+        f"""SELECT DISTINCT name FROM (
+              SELECT e.canonical_name AS name
+              FROM {sp}facts f JOIN {sp}entities e ON f.subject_id = e.id
+              WHERE f.id IN ({id_ph})
+              UNION
+              SELECT COALESCE(oe.canonical_name, f.object_text) AS name
+              FROM {sp}facts f LEFT JOIN {sp}entities oe ON f.object_id = oe.id
+              WHERE f.id IN ({id_ph}) AND (f.object_id IS NOT NULL OR f.object_text IS NOT NULL)
+            )
+            WHERE name IS NOT NULL
+              AND length(name) <= 60
+              AND instr(name, ',') = 0""",
+        fact_ids + fact_ids,
+    ).fetchall()
+    names = []
+    for r in rows:
+        name = r[0]
+        if name and name != name.lower():
+            names.append(name)
+    return names
 
 
 # ---------------------------------------------------------------------------
@@ -550,6 +606,8 @@ def build_explain(
     conn: sqlite3.Connection,
     schemas: list[str] | None = None,
     fact_fts_ids: list[int] | None = None,
+    vec_fact_hits: list[tuple[int, float, str]] | None = None,
+    expand_terms: list[str] | None = None,
 ) -> str:
     lines: list[str] = ["=== Question Parse ==="]
     lines.append(f"  wh-type : {parse.wh_type or '(none)'}")
@@ -569,6 +627,14 @@ def build_explain(
     fts_fact_hits = [fh for fh in fact_hits if fh.fact_id in set(fact_fts_ids or [])]
     lines.append(f"  new_fact_ids: {(fact_fts_ids or [])[:5]}")
     lines.append(f"  in_context: {len(fts_fact_hits)}")
+
+    lines.append("\n=== Fact Vec ===")
+    vf = vec_fact_hits or []
+    lines.append(f"  candidates: {len(vf)}")
+    for fid, dist, schema in vf[:5]:
+        lines.append(f"  fact_id={fid} dist={dist:.4f} schema={schema}")
+    if expand_terms:
+        lines.append(f"  expand_terms (injected): {expand_terms}")
 
     lines.append("\n=== Vector Search ===")
     lines.append(f"  top-{len(vec_ids)}: chunk_ids={vec_ids[:5]}")
@@ -642,28 +708,61 @@ def retrieve(
             seen_fids.update(fids)
             all_fact_fts_ids.extend(fids)
 
-    # Re-sort, cap, and renumber tags
+    # 5. Vec search (embed question once; reuse for both chunk and fact vec search)
+    all_vec_keys: list[tuple] = []
+    question_embedding: list[float] | None = None
+    expand_terms: list[str] = []
+    all_vec_fact_hits: list[tuple[int, float, str]] = []  # (fact_id, distance, schema)
+    t0 = time.perf_counter()
+    if embedder is not None:
+        from loci.models import embed_batch
+        vecs = embed_batch(embedder, [question], normalize=True)
+        if vecs:
+            question_embedding = vecs[0]
+        for schema in schemas:
+            ids = vec_search_question(conn, embedder, question,
+                                      cfg.retrieval.vec_top_k, schema=schema,
+                                      embedding=question_embedding)
+            all_vec_keys.extend((schema, cid) for cid in ids)
+
+        # Vec-over-facts (mode switch)
+        if cfg.retrieval.fact_vec_mode != "off" and question_embedding is not None:
+            for schema in schemas:
+                for fid, dist in vec_fact_search_question(
+                    conn, question_embedding, cfg.retrieval.fact_vec_top_k, schema=schema
+                ):
+                    if fid not in seen_fids:
+                        all_vec_fact_hits.append((fid, dist, schema))
+                        seen_fids.add(fid)
+
+            if cfg.retrieval.fact_vec_mode == "surface":
+                for fid, dist, schema in all_vec_fact_hits:
+                    hits = load_fact_hits_by_ids(conn, [fid], schema=schema)
+                    for h in hits:
+                        h.score = max(0.0, 0.6 - 0.05 * dist)
+                    all_fact_hits.extend(hits)
+
+            elif cfg.retrieval.fact_vec_mode == "expand":
+                top_fids = [fid for fid, _, _ in all_vec_fact_hits[: cfg.retrieval.fact_expand_names]]
+                expand_terms = canonical_names_for_facts(conn, top_fids, schema="main")
+
+    if timings is not None:
+        timings["vec_ms"] = (time.perf_counter() - t0) * 1000
+
+    # Re-sort, cap, and renumber tags (after vec-surface may have added hits)
     all_fact_hits.sort(key=lambda h: -h.score)
     all_fact_hits = all_fact_hits[: cfg.retrieval.max_facts_in_context]
     for i, h in enumerate(all_fact_hits, 1):
         h.tag = f"[F{i}]"
 
-    # 5. Vec search (separated for granular timing)
-    all_vec_keys: list[tuple] = []
-    t0 = time.perf_counter()
-    if embedder is not None:
-        for schema in schemas:
-            ids = vec_search_question(conn, embedder, question,
-                                      cfg.retrieval.vec_top_k, schema=schema)
-            all_vec_keys.extend((schema, cid) for cid in ids)
-    if timings is not None:
-        timings["vec_ms"] = (time.perf_counter() - t0) * 1000
-
-    # 6. FTS search (separated for granular timing)
+    # 6. FTS search (expand mode may inject bridge names into the query)
     all_fts_keys: list[tuple] = []
     t0 = time.perf_counter()
+    fts_question = question
+    if expand_terms:
+        fts_question = question + " " + " ".join(expand_terms)
     for schema in schemas:
-        fts_ids = fts_search_question(conn, question, cfg.retrieval.fts_top_k, schema=schema)
+        fts_ids = fts_search_question(conn, fts_question, cfg.retrieval.fts_top_k, schema=schema)
         all_fts_keys.extend((schema, cid) for cid in fts_ids)
     if timings is not None:
         timings["fts_ms"] = (time.perf_counter() - t0) * 1000
@@ -688,6 +787,8 @@ def retrieve(
             parse, main_entity_ids, main_synonyms, all_fact_hits,
             all_vec_ids, all_fts_ids, fused, conn, schemas=schemas,
             fact_fts_ids=all_fact_fts_ids,
+            vec_fact_hits=all_vec_fact_hits,
+            expand_terms=expand_terms,
         )
         explain_text += f"\n\n  fact_lookup_ms: {fact_ms:.1f}"
 

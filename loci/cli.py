@@ -20,11 +20,13 @@ entities_app = typer.Typer(help="Entity management.")
 pack_app = typer.Typer(help="Knowledge-pack management.")
 synonyms_app = typer.Typer(help="Predicate synonym management.")
 bench_app = typer.Typer(help="Benchmark and evaluation suite.")
+facts_app = typer.Typer(help="Fact index management.")
 app.add_typer(config_app, name="config")
 app.add_typer(entities_app, name="entities")
 app.add_typer(pack_app, name="pack")
 app.add_typer(synonyms_app, name="synonyms")
 app.add_typer(bench_app, name="bench")
+app.add_typer(facts_app, name="facts")
 
 console = Console()
 
@@ -958,6 +960,8 @@ def bench_query_cmd(
         conn.close()
 
     # Judging
+    ea_map = {item.id: item.expected_answer for item in qna_items
+              if item.expected_answer is not None}
     judge_scores = run_judging(
         all_results,
         judge=judge if judge != "claude" or cfg.bench.judge != "none" else cfg.bench.judge,
@@ -965,6 +969,7 @@ def bench_query_cmd(
         judge_max_chars=cfg.bench.judge_max_chars,
         log_dir=cfg_exp.paths.bench_logs_dir,
         run_label=label or "query",
+        expected_answers=ea_map,
     )
     score_map = {s["id"]: s for s in judge_scores}
     for r in all_results:
@@ -1293,6 +1298,67 @@ def synonyms_learn_cmd(
             console.print(
                 f"\nRun with [bold]--auto[/bold] to write these {len(suggestions)} pairs."
             )
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# loci facts reindex-vec / reindex-fts
+# ---------------------------------------------------------------------------
+
+@facts_app.command("reindex-vec")
+def facts_reindex_vec_cmd(
+    also_fts: bool = typer.Option(False, "--fts", help="Also rebuild fts_facts."),
+    config_path: Optional[Path] = typer.Option(None, "--config", "-c"),
+) -> None:
+    """Embed all facts into vec_facts (and optionally rebuild fts_facts)."""
+    try:
+        cfg = cfg_module.load(config_path)
+    except ValueError as exc:
+        console.print(f"[red]Config error:[/red] {exc}")
+        raise typer.Exit(1)
+
+    from loci.config import expanded
+    from loci.store import open_db, rebuild_fact_vec, rebuild_fact_fts, _FACT_VEC_VERSION
+
+    cfg_exp = expanded(cfg)
+
+    if not _embedder_model_exists(cfg_exp):
+        console.print(
+            f"[red]Embedder model not found:[/red] {cfg_exp.paths.models_dir / cfg_exp.models.embedder}\n"
+            "Run: loci models pull"
+        )
+        raise typer.Exit(1)
+
+    try:
+        from loci.models import load_embedder
+    except ImportError:
+        console.print("[red]llama-cpp-python not installed.[/red]")
+        raise typer.Exit(1)
+
+    try:
+        conn = open_db(cfg_exp.paths.knowledge_db, vec_dim=cfg_exp.models.vec_dim)
+    except Exception as exc:
+        console.print(f"[red]Cannot open DB:[/red] {exc}")
+        raise typer.Exit(1)
+
+    try:
+        if also_fts:
+            console.print("Rebuilding fts_facts…", end=" ")
+            n_fts = rebuild_fact_fts(conn)
+            conn.execute("INSERT OR REPLACE INTO db_meta(key,value) VALUES ('fact_fts_v','1')")
+            conn.commit()
+            console.print(f"[green]{n_fts} facts indexed[/green]")
+
+        console.print("Embedding facts into vec_facts…")
+        with load_embedder(cfg_exp) as embedder:
+            n_vec = rebuild_fact_vec(conn, embedder)
+        conn.execute(
+            "INSERT OR REPLACE INTO db_meta(key,value) VALUES ('fact_vec_v',?)",
+            [_FACT_VEC_VERSION],
+        )
+        conn.commit()
+        console.print(f"[green]Done.[/green] {n_vec} facts embedded.")
     finally:
         conn.close()
 

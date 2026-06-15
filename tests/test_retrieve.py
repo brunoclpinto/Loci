@@ -466,3 +466,67 @@ class TestFactFts:
         )
         scores = [h.score for h in result.fact_hits]
         assert scores == sorted(scores, reverse=True)
+
+
+# ---------------------------------------------------------------------------
+# Phase B: vec-over-facts — vec_fact_search_question, canonical_names, modes
+# ---------------------------------------------------------------------------
+
+from loci.store import rebuild_fact_vec as _rebuild_fact_vec
+from loci.retrieve import vec_fact_search_question, canonical_names_for_facts
+
+
+class TestVecFacts:
+    def test_vec_fact_search_returns_tuples(self, landlady_db, fake_embedder):
+        _rebuild_fact_vec(landlady_db, fake_embedder)
+        from loci.models import embed_batch
+        emb = embed_batch(fake_embedder, ["landlady role"], normalize=True)[0]
+        results = vec_fact_search_question(landlady_db, emb, k=5)
+        assert isinstance(results, list)
+        for fid, dist in results:
+            assert isinstance(fid, int)
+            assert isinstance(dist, float)
+
+    def test_canonical_names_returns_proper_nouns(self, landlady_db):
+        fact_ids = [r[0] for r in landlady_db.execute("SELECT id FROM facts LIMIT 3").fetchall()]
+        names = canonical_names_for_facts(landlady_db, fact_ids)
+        for name in names:
+            assert name != name.lower(), f"Expected proper noun, got: {name!r}"
+
+    def test_canonical_names_empty_input(self, landlady_db):
+        assert canonical_names_for_facts(landlady_db, []) == []
+
+    def test_surface_mode_runs_without_error(self, landlady_db, fake_embedder, nlp):
+        _rebuild_fact_vec(landlady_db, fake_embedder)
+        from loci.config import Config
+        cfg = Config()
+        cfg.retrieval.max_facts_in_context = 10
+        cfg.retrieval.fact_vec_mode = "surface"
+        cfg.retrieval.fact_vec_top_k = 5
+        result = retrieve(
+            "Who is the landlady?",
+            conn=landlady_db, cfg=cfg, embedder=fake_embedder, nlp=nlp,
+        )
+        assert isinstance(result.fact_hits, list)
+
+    def test_expand_mode_runs_without_error(self, landlady_db, fake_embedder, nlp):
+        _rebuild_fact_vec(landlady_db, fake_embedder)
+        from loci.config import Config
+        cfg = Config()
+        cfg.retrieval.max_facts_in_context = 4
+        cfg.retrieval.fact_vec_mode = "expand"
+        cfg.retrieval.fact_vec_top_k = 5
+        cfg.retrieval.fact_expand_names = 2
+        result = retrieve(
+            "Who is the landlady?",
+            conn=landlady_db, cfg=cfg, embedder=fake_embedder, nlp=nlp,
+        )
+        assert isinstance(result.chunk_hits, list)
+
+    def test_off_mode_unchanged_from_baseline(self, landlady_db, default_cfg, nlp):
+        result = retrieve(
+            "Who is the landlady?",
+            conn=landlady_db, cfg=default_cfg, embedder=None, nlp=nlp,
+        )
+        # off mode with no embedder: should still surface FTS facts
+        assert isinstance(result.fact_hits, list)

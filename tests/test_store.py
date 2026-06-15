@@ -15,10 +15,12 @@ from loci.store import (
     insert_source,
     open_db,
     rebuild_fact_fts,
+    rebuild_fact_vec,
     upsert_vec_chunk,
     upsert_vec_entity,
     vec_search_chunks,
     vec_search_entities,
+    vec_search_facts,
 )
 
 
@@ -318,3 +320,41 @@ class TestFtsFacts:
         conn2.close()
         assert count > 0
         assert meta is not None and meta[0] == "1"
+
+
+# ---------------------------------------------------------------------------
+# vec_facts: Phase B — rebuild, search, idempotency
+# ---------------------------------------------------------------------------
+
+class TestVecFacts:
+    def test_vec_facts_table_exists(self, tmp_db):
+        names = {r[0] for r in tmp_db.execute("SELECT name FROM sqlite_master")}
+        assert "vec_facts" in names
+
+    def test_rebuild_fact_vec_returns_count(self, tmp_db, fake_embedder):
+        _seed_landlady_fact(tmp_db)
+        n = rebuild_fact_vec(tmp_db, fake_embedder)
+        db_n = tmp_db.execute("SELECT COUNT(*) FROM facts").fetchone()[0]
+        assert n == db_n
+
+    def test_vec_search_facts_returns_hit(self, tmp_db, fake_embedder):
+        _seed_landlady_fact(tmp_db)
+        rebuild_fact_vec(tmp_db, fake_embedder)
+        from loci.models import embed_batch
+        emb = embed_batch(fake_embedder, ["landlady role"], normalize=True)[0]
+        results = vec_search_facts(tmp_db, embedding=emb, k=5)
+        assert len(results) > 0
+        assert "fact_id" in results[0]
+        assert "distance" in results[0]
+
+    def test_rebuild_fact_vec_idempotent(self, tmp_db, fake_embedder):
+        _seed_landlady_fact(tmp_db)
+        n1 = rebuild_fact_vec(tmp_db, fake_embedder)
+        n2 = rebuild_fact_vec(tmp_db, fake_embedder)
+        assert n1 == n2
+        count = tmp_db.execute("SELECT COUNT(*) FROM vec_facts").fetchone()[0]
+        assert count == n1
+
+    def test_vec_search_facts_empty_when_not_populated(self, tmp_db, flat_embedding):
+        results = vec_search_facts(tmp_db, embedding=flat_embedding, k=5)
+        assert results == []

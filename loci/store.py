@@ -151,18 +151,37 @@ def _migrate(conn: sqlite3.Connection, vec_dim: int = 384) -> None:
             "INSERT OR REPLACE INTO db_meta(key,value) VALUES ('vec_dim',?)",
             [str(vec_dim)],
         )
+    # vec_facts: created lazily (may not exist in older DBs)
+    vec_facts_exists = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='vec_facts'"
+    ).fetchone()
+    if not vec_facts_exists:
+        conn.execute(
+            f"CREATE VIRTUAL TABLE vec_facts USING vec0("
+            f"fact_id INTEGER PRIMARY KEY, embedding FLOAT[{vec_dim}])"
+        )
+        fact_n = conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0]
+        if fact_n > 0:
+            import warnings
+            warnings.warn(
+                f"vec_facts created but not populated ({fact_n} facts exist). "
+                "Run: loci facts reindex-vec"
+            )
     # Schema evolution — add columns that were not in the original DDL
     _ensure_column(conn, "chunks", "extracted_v", "INTEGER DEFAULT 0")
     conn.commit()
 
-    # Backfill fact FTS for DBs created before fts_facts existed.
+    # Backfill/upgrade fact FTS when DB is missing or on an older version.
     fts_v = conn.execute(
         "SELECT value FROM db_meta WHERE key='fact_fts_v'"
     ).fetchone()
     fact_n = conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0]
-    if (fts_v is None) and fact_n > 0:
+    if (fts_v is None or fts_v[0] != _FACT_FTS_VERSION) and fact_n > 0:
         rebuild_fact_fts(conn)
-        conn.execute("INSERT OR REPLACE INTO db_meta(key,value) VALUES ('fact_fts_v','1')")
+        conn.execute(
+            "INSERT OR REPLACE INTO db_meta(key,value) VALUES ('fact_fts_v',?)",
+            [_FACT_FTS_VERSION],
+        )
         conn.commit()
 
 
@@ -346,6 +365,10 @@ def fts_search_chunks(
     return [dict(r) for r in rows]
 
 
+_FACT_FTS_VERSION = "1"
+_FACT_VEC_VERSION = "1"
+
+
 def rebuild_fact_fts(conn: sqlite3.Connection) -> int:
     """(Re)build the fts_facts index from the current facts table.
 
@@ -392,6 +415,56 @@ def fts_search_facts(
             f" FROM {sp}fts_facts fts WHERE fts MATCH ? ORDER BY fts.rank LIMIT ?",
             [query, k],
         ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def rebuild_fact_vec(conn: sqlite3.Connection, embedder: object) -> int:
+    """(Re)build vec_facts by embedding each fact's document string.
+
+    Doc text = same string rebuild_fact_fts builds: '{subj} {pred} {obj} {sentence}'.
+    Returns number of facts embedded.
+    """
+    from loci.models import embed_batch
+    rows = conn.execute(
+        """SELECT f.id AS fid,
+                  e.canonical_name AS subj,
+                  f.predicate AS pred,
+                  COALESCE(oe.canonical_name, f.object_text, '') AS obj,
+                  f.sentence AS sent
+           FROM facts f
+           JOIN entities e ON f.subject_id = e.id
+           LEFT JOIN entities oe ON f.object_id = oe.id"""
+    ).fetchall()
+    if not rows:
+        return 0
+    docs = [
+        f"{r['subj']} {(r['pred'] or '').replace('_', ' ')} {r['obj']} {r['sent']}"
+        for r in rows
+    ]
+    conn.execute("DELETE FROM vec_facts")
+    embs = embed_batch(embedder, docs, normalize=True)
+    for r, emb in zip(rows, embs):
+        conn.execute(
+            "INSERT INTO vec_facts(fact_id, embedding) VALUES (?,?)",
+            [r["fid"], _ser(emb)],
+        )
+    conn.commit()
+    return len(rows)
+
+
+def vec_search_facts(
+    conn: sqlite3.Connection, *, embedding: list[float], k: int = 10, schema: str = "main"
+) -> list[dict]:
+    """Return top-k facts by vector similarity. Returns [{fact_id, distance}]."""
+    sp = f"{schema}." if schema != "main" else ""
+    try:
+        rows = conn.execute(
+            f"SELECT fact_id, distance FROM {sp}vec_facts"
+            f" WHERE embedding MATCH ? ORDER BY distance LIMIT ?",
+            [_ser(embedding), k],
+        ).fetchall()
+    except Exception:
+        return []
     return [dict(r) for r in rows]
 
 
