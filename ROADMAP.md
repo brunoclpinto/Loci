@@ -24,7 +24,12 @@ plan file (linked below) with full implementation detail, tests, bench, and succ
 > minted-2=62.55, both < M=64.35, halluc=2). Gate bypass flaw fixed (`elif source_filter and not main_entity_ids:
 > all_fact_hits = []`); re-bench: minted-4+fix=63.20 (−1.15, best arm), minted-2+fix=61.15. Halluc=2 persists —
 > bound by 3B noise on negative questions + entity-matched wrong-fact injection. Definitive 🛑 FAIL on 3B.
-> Infrastructure shipped off (defaults unchanged). Escalating to 4–5B models (Qwen3.5-4B, Gemma3-4B, Phi-4-mini).
+> Infrastructure shipped off (defaults unchanged).
+>
+> **Model exploration (2026-06-15):** 4B models (Qwen3.5-4B, Qwen3-4B, Gemma3-4B) tested but make the system
+> unusable under concurrent use. Qwen3.5-4B=64.0 (≈M, fact+6.8 but para−17); Qwen3-4B=65.55 but halluc=6
+> (thinking mode active, needs /no_think); Gemma3-4B=58.15, halluc=9 (draws on training knowledge for negative Qs).
+> Reverting to 3B footprint: benchmarking Llama-3.2-3B, Qwen3.5-2B, Qwen3-1.7B, Gemma3-1B candidates (Phase N).
 
 ---
 
@@ -39,6 +44,8 @@ plan file (linked below) with full implementation detail, tests, bench, and succ
 | 4 | **C** — rerank, don't pre-truncate (P2) | [planC_rerank.md](planC_rerank.md) | `DONE (F2=off; pool=62.80 -1.55 vs M; wider pool floods RRF with mediocre overlap → para -22)` | — (independent) | yes |
 | 5 | **E** — paraphrase / multi-hop (P3) | [planE_paraphrase.md](planE_paraphrase.md) | `DONE (F2=off; HyDE=62.65 -1.70, halluc 1→3 violates guardrail; hyde_query=false)` | — | yes |
 | 6 | **Q** — SVO quarantine + fact provenance | [planQ_quarantine.md](planQ_quarantine.md) | `DONE (🛑 FAIL; best arm=minted-4+fix=63.20, −1.15 vs M; halluc=2 persists; 3B bound; escalate to 4-5B)` | P1 | no (🛑 gate) |
+| 7 | **N** — base model selection | [planN_modelbench.md](planN_modelbench.md) | `TODO` | Q | yes |
+| 8 | **P2** — multi-pass ingest | [planP2_multipass.md](planP2_multipass.md) | `TODO` | N (needs winning model first) | yes |
 
 > **Keep this table current.** When a phase finishes, set its `Status` to `DONE (overall=NN.N, fact=NN.N)`
 > and move to the next `TODO` row.
