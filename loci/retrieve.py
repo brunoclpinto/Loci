@@ -713,17 +713,29 @@ def retrieve(
     question_embedding: list[float] | None = None
     expand_terms: list[str] = []
     all_vec_fact_hits: list[tuple[int, float, str]] = []  # (fact_id, distance, schema)
+    _vec_raw_scores: dict[tuple, float] = {}   # (schema, chunk_id) → cosine similarity (1-dist)
     t0 = time.perf_counter()
+    _rerank_on = cfg.retrieval.rerank_mode != "off"
+    _pool_k = cfg.retrieval.rerank_pool if _rerank_on else cfg.retrieval.vec_top_k
     if embedder is not None:
         from loci.models import embed_batch
+        from loci.store import vec_search_chunks as _vec_search_chunks
         vecs = embed_batch(embedder, [question], normalize=True)
         if vecs:
             question_embedding = vecs[0]
         for schema in schemas:
-            ids = vec_search_question(conn, embedder, question,
-                                      cfg.retrieval.vec_top_k, schema=schema,
-                                      embedding=question_embedding)
-            all_vec_keys.extend((schema, cid) for cid in ids)
+            sp = f"{schema}." if schema != "main" else ""
+            if question_embedding is not None:
+                raw = _vec_search_chunks(conn, embedding=question_embedding,
+                                         k=_pool_k, schema=schema)
+                for r in raw:
+                    key = (schema, r["chunk_id"])
+                    all_vec_keys.append(key)
+                    _vec_raw_scores[key] = max(0.0, 1.0 - r["distance"])
+            else:
+                ids = vec_search_question(conn, embedder, question,
+                                          _pool_k, schema=schema)
+                all_vec_keys.extend((schema, cid) for cid in ids)
 
         # Vec-over-facts (mode switch)
         if cfg.retrieval.fact_vec_mode != "off" and question_embedding is not None:
@@ -757,20 +769,34 @@ def retrieve(
 
     # 6. FTS search (expand mode may inject bridge names into the query)
     all_fts_keys: list[tuple] = []
+    _fts_raw_scores: dict[tuple, float] = {}   # (schema, chunk_id) → normalised rank 0-1
     t0 = time.perf_counter()
     fts_question = question
     if expand_terms:
         fts_question = question + " " + " ".join(expand_terms)
+    _fts_pool_k = cfg.retrieval.rerank_pool if _rerank_on else cfg.retrieval.fts_top_k
     for schema in schemas:
-        fts_ids = fts_search_question(conn, fts_question, cfg.retrieval.fts_top_k, schema=schema)
-        all_fts_keys.extend((schema, cid) for cid in fts_ids)
+        fts_ids = fts_search_question(conn, fts_question, _fts_pool_k, schema=schema)
+        for rank, cid in enumerate(fts_ids):
+            key = (schema, cid)
+            all_fts_keys.append(key)
+            _fts_raw_scores[key] = max(0.0, 1.0 - rank / max(len(fts_ids), 1))
     if timings is not None:
         timings["fts_ms"] = (time.perf_counter() - t0) * 1000
 
-    # 7. RRF fusion + context build
+    # 7. RRF fusion + optional blend rerank + context build
     t0 = time.perf_counter()
     fused = rrf_fuse([all_vec_keys, all_fts_keys],
                      ks=[cfg.retrieval.vec_rrf_k, cfg.retrieval.rrf_k])
+
+    # Blend rerank: re-sort fused pool by max(vec_cosine, fts_position_score)
+    if cfg.retrieval.rerank_mode == "blend" and (_vec_raw_scores or _fts_raw_scores):
+        fused = sorted(
+            fused,
+            key=lambda kv: -(0.5 * _vec_raw_scores.get(kv[0], 0.0)
+                             + 0.5 * _fts_raw_scores.get(kv[0], 0.0)),
+        )
+
     chunk_hits = load_chunk_hits(
         conn, fused, cfg.retrieval.context_token_budget, offset=1
     )

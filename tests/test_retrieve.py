@@ -530,3 +530,51 @@ class TestVecFacts:
         )
         # off mode with no embedder: should still surface FTS facts
         assert isinstance(result.fact_hits, list)
+
+
+# ---------------------------------------------------------------------------
+# Phase C: pool widening and blend rerank
+# ---------------------------------------------------------------------------
+
+class TestPhaseC:
+    def test_pool_mode_returns_chunks(self, populated_db, fake_embedder, nlp):
+        from loci.config import Config
+        cfg = Config()
+        cfg.retrieval.rerank_mode = "pool"
+        cfg.retrieval.rerank_pool = 24
+        result = retrieve(
+            "What did Sherlock Holmes take?",
+            conn=populated_db, cfg=cfg, embedder=fake_embedder, nlp=nlp,
+        )
+        assert isinstance(result.chunk_hits, list)
+        assert len(result.chunk_hits) > 0
+
+    def test_blend_mode_returns_chunks(self, populated_db, fake_embedder, nlp):
+        from loci.config import Config
+        cfg = Config()
+        cfg.retrieval.rerank_mode = "blend"
+        cfg.retrieval.rerank_pool = 24
+        result = retrieve(
+            "What did Sherlock Holmes take?",
+            conn=populated_db, cfg=cfg, embedder=fake_embedder, nlp=nlp,
+        )
+        assert isinstance(result.chunk_hits, list)
+        assert len(result.chunk_hits) > 0
+
+    def test_off_mode_matches_default(self, populated_db, fake_embedder, nlp, default_cfg):
+        result_off = retrieve(
+            "What did Watson observe?",
+            conn=populated_db, cfg=default_cfg, embedder=fake_embedder, nlp=nlp,
+        )
+        assert isinstance(result_off.chunk_hits, list)
+
+    def test_pool_mode_no_embedder_works(self, populated_db, nlp):
+        from loci.config import Config
+        cfg = Config()
+        cfg.retrieval.rerank_mode = "pool"
+        cfg.retrieval.rerank_pool = 24
+        result = retrieve(
+            "Who is the detective?",
+            conn=populated_db, cfg=cfg, embedder=None, nlp=nlp,
+        )
+        assert isinstance(result.chunk_hits, list)

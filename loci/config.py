@@ -57,6 +57,8 @@ class RetrievalConfig:
     fact_vec_top_k: int = 10        # candidate facts from vec_facts per schema
     fact_vec_mode: str = "off"      # "off" | "surface" | "expand"
     fact_expand_names: int = 2      # expand mode: # of top-fact canonical names injected into chunk query
+    rerank_mode: str = "off"        # "off" | "pool" (widen only) | "blend" (pool + re-score)
+    rerank_pool: int = 24           # candidate pool size when rerank_mode != "off" (replaces vec/fts_top_k)
 
 
 @dataclass
