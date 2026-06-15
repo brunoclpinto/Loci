@@ -901,11 +901,29 @@ def bench_query_cmd(
                     sampler = threading.Thread(target=_sample, daemon=True)
                     sampler.start()
 
+                    # HyDE-lite: generate a hypothetical answer for richer vec query
+                    hyde_emb = None
+                    if cfg.retrieval.hyde_query and embedder is not None:
+                        try:
+                            from loci.generate import generate_response
+                            from loci.models import embed_batch as _eb
+                            _hyde_msgs = [
+                                {"role": "system", "content": "Answer the question in one short factual sentence. No hedging."},
+                                {"role": "user", "content": item.question},
+                            ]
+                            _hypo = generate_response(llm, _hyde_msgs, max_tokens=40, temperature=0.0)
+                            _h_vecs = _eb(embedder, [_hypo], normalize=True)
+                            if _h_vecs:
+                                hyde_emb = _h_vecs[0]
+                        except Exception:
+                            pass
+
                     result = retrieve(
                         item.question,
                         conn=conn, cfg=cfg,
                         embedder=embedder, nlp=nlp,
                         pack_schemas=p_schemas, timings=timings,
+                        hyde_embedding=hyde_emb,
                     )
                     messages = build_messages(item.question, result.context_text, [])
 

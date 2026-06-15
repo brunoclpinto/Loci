@@ -59,6 +59,7 @@ class RetrievalConfig:
     fact_expand_names: int = 2      # expand mode: # of top-fact canonical names injected into chunk query
     rerank_mode: str = "off"        # "off" | "pool" (widen only) | "blend" (pool + re-score)
     rerank_pool: int = 24           # candidate pool size when rerank_mode != "off" (replaces vec/fts_top_k)
+    hyde_query: bool = False        # HyDE-lite: augment vec search with embedding of a hypothetical answer
 
 
 @dataclass

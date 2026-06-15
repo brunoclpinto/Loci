@@ -664,6 +664,7 @@ def retrieve(
     explain: bool = False,
     pack_schemas: list[str] | None = None,
     timings: dict | None = None,
+    hyde_embedding: list[float] | None = None,
 ) -> RetrievalResult:
     """Full hybrid retrieval pipeline, optionally fanning out across pack schemas.
 
@@ -723,10 +724,18 @@ def retrieve(
         vecs = embed_batch(embedder, [question], normalize=True)
         if vecs:
             question_embedding = vecs[0]
+
+        # HyDE-lite: average question embedding with hypothetical answer embedding
+        # when the caller provides one. This bridges vocabulary gaps in paraphrase Qs.
+        _vec_query_embedding = question_embedding
+        if hyde_embedding is not None and question_embedding is not None:
+            avg = [(a + b) / 2 for a, b in zip(question_embedding, hyde_embedding)]
+            norm = sum(x * x for x in avg) ** 0.5
+            _vec_query_embedding = [x / norm for x in avg] if norm > 0 else avg
+
         for schema in schemas:
-            sp = f"{schema}." if schema != "main" else ""
-            if question_embedding is not None:
-                raw = _vec_search_chunks(conn, embedding=question_embedding,
+            if _vec_query_embedding is not None:
+                raw = _vec_search_chunks(conn, embedding=_vec_query_embedding,
                                          k=_pool_k, schema=schema)
                 for r in raw:
                     key = (schema, r["chunk_id"])

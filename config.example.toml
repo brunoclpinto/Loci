@@ -41,6 +41,7 @@ fact_vec_mode         = "off"  # "off" | "surface" (add [F#] lines) | "expand" (
 fact_expand_names     = 2    # expand mode: number of top-fact canonical names injected into chunk query
 rerank_mode           = "off"  # "off" | "pool" (widen candidate pool) | "blend" (pool + re-score by vec+fts blend)
 rerank_pool           = 24   # candidate pool per modality when rerank_mode != "off" (replaces vec/fts_top_k)
+hyde_query            = false  # HyDE-lite: average question embedding with hypothetical-answer embedding for richer vec retrieval
 
 [logging]
 level         = "INFO"   # DEBUG dumps retrieval explanations to runtime log
