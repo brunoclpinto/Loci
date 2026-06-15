@@ -14,6 +14,7 @@ from loci.retrieve import (
     find_mentioned_entity_ids,
     fts_search_question,
     get_synonyms,
+    load_fact_hits_by_ids,
     parse_question,
     retrieve,
     rrf_fuse,
@@ -578,3 +579,76 @@ class TestPhaseC:
             conn=populated_db, cfg=cfg, embedder=None, nlp=nlp,
         )
         assert isinstance(result.chunk_hits, list)
+
+
+# ---------------------------------------------------------------------------
+# Phase Q — source filter + relevance gate
+# ---------------------------------------------------------------------------
+
+import hashlib as _hashlib
+
+def _sha(s: str) -> str:
+    return _hashlib.sha256(s.encode()).hexdigest()
+
+
+@pytest.fixture
+def source_db(tmp_path):
+    """DB with two facts: one svo and one llm, same entity."""
+    from loci.store import (
+        open_db, insert_source, insert_chunk, insert_entity, insert_alias, insert_fact
+    )
+    conn = open_db(tmp_path / "source_test.db")
+    src_id = insert_source(conn, sha256=_sha("q_src"), title="Scarlet")
+    chunk_id = insert_chunk(conn, source_id=src_id, ordinal=0,
+                            text="Holmes took the bottle.", sha256=_sha("q_chunk"))
+    eid = insert_entity(conn, canonical_name="Holmes")
+    insert_alias(conn, entity_id=eid, alias="holmes")
+
+    insert_fact(conn, chunk_id=chunk_id, sentence="Holmes took the bottle.",
+                subject_id=eid, predicate="take", object_text="bottle",
+                confidence=1.0, source="svo")
+    insert_fact(conn, chunk_id=chunk_id, sentence="Holmes is a detective.",
+                subject_id=eid, predicate="profession", object_text="detective",
+                confidence=0.7, source="llm")
+    yield conn
+    conn.close()
+
+
+class TestFactSourceFilter:
+    def test_load_fact_hits_all_returns_both(self, source_db):
+        all_ids = [r[0] for r in source_db.execute("SELECT id FROM facts").fetchall()]
+        hits = load_fact_hits_by_ids(source_db, all_ids)
+        assert len(hits) == 2
+
+    def test_load_fact_hits_minted_excludes_svo(self, source_db):
+        all_ids = [r[0] for r in source_db.execute("SELECT id FROM facts").fetchall()]
+        hits = load_fact_hits_by_ids(source_db, all_ids, source_filter={"llm"})
+        assert all(h.predicate == "profession" for h in hits)
+        assert len(hits) == 1
+
+    def test_fact_lookup_source_filter(self, source_db):
+        eid = source_db.execute(
+            "SELECT id FROM entities WHERE canonical_name='Holmes'"
+        ).fetchone()[0]
+        all_hits = fact_lookup(source_db, [eid], "take", set())
+        filtered_hits = fact_lookup(source_db, [eid], "take", set(),
+                                    source_filter={"llm"})
+        assert len(all_hits) >= 1
+        assert len(filtered_hits) == 0  # "take" is svo, filtered out
+
+    def test_retrieve_max_facts_zero_returns_no_facts(self, source_db, nlp):
+        from loci.config import Config
+        cfg = Config()
+        cfg.retrieval.max_facts_in_context = 0
+        cfg.retrieval.fact_sources = "all"
+        result = retrieve("What did Holmes take?", conn=source_db, cfg=cfg, nlp=nlp)
+        assert result.fact_hits == []
+
+    def test_retrieve_minted_only_excludes_svo(self, source_db, nlp):
+        from loci.config import Config
+        cfg = Config()
+        cfg.retrieval.max_facts_in_context = 4
+        cfg.retrieval.fact_sources = "minted"
+        result = retrieve("What is Holmes's profession?", conn=source_db, cfg=cfg, nlp=nlp)
+        for fh in result.fact_hits:
+            assert fh.predicate != "take", "svo fact leaked through minted filter"

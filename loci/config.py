@@ -60,6 +60,7 @@ class RetrievalConfig:
     rerank_mode: str = "off"        # "off" | "pool" (widen only) | "blend" (pool + re-score)
     rerank_pool: int = 24           # candidate pool size when rerank_mode != "off" (replaces vec/fts_top_k)
     hyde_query: bool = False        # HyDE-lite: augment vec search with embedding of a hypothetical answer
+    fact_sources: str = "all"       # "all" | "minted" | "minted+coref" — quarantine gate for [F#] injection
 
 
 @dataclass

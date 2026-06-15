@@ -59,6 +59,8 @@ class FactHit:
     chunk_id: int
     source_info: str | None
     score: float                 # 1.0 exact predicate, 0.8 via synonym
+    subject_id: int = 0          # for relevance gate
+    object_id: int | None = None # for relevance gate
 
 
 @dataclass
@@ -223,20 +225,28 @@ def load_fact_hits_by_ids(
     conn: sqlite3.Connection,
     fact_ids: list[int],
     schema: str = "main",
+    source_filter: set[str] | None = None,
 ) -> list[FactHit]:
     """Fetch FactHit objects for a ranked list of fact_ids (FTS results).
 
     Preserves the ranking order from the input list; scores descend from 0.70
     so SQL-exact hits (1.0/0.8) always sort above these FTS hits.
+    When source_filter is set, only facts whose source is in the set are returned.
     """
     if not fact_ids:
         return []
     sp = f"{schema}." if schema != "main" else ""
     id_ph = ",".join("?" * len(fact_ids))
+    src_clause = ""
+    src_params: list = []
+    if source_filter:
+        src_ph = ",".join("?" * len(source_filter))
+        src_clause = f"AND f.source IN ({src_ph})"
+        src_params = sorted(source_filter)
     rows = conn.execute(
         f"""
         SELECT
-            f.id, f.predicate, f.object_text, f.object_id, f.qualifiers,
+            f.id, f.subject_id, f.predicate, f.object_text, f.object_id, f.qualifiers,
             f.negated, f.sentence, f.chunk_id,
             e.canonical_name AS subject_name,
             oe.canonical_name AS object_entity_name,
@@ -251,8 +261,9 @@ def load_fact_hits_by_ids(
           AND length(e.canonical_name) <= 60
           AND instr(e.canonical_name, ',') = 0
           AND instr(e.canonical_name, char(10)) = 0
+          {src_clause}
         """,
-        fact_ids,
+        fact_ids + src_params,
     ).fetchall()
     id_to_row = {r["id"]: r for r in rows}
     hits = []
@@ -280,6 +291,8 @@ def load_fact_hits_by_ids(
             chunk_id=r["chunk_id"],
             source_info=_source_info(r["title"], r["path"]),
             score=0.7 - 0.01 * rank,
+            subject_id=r["subject_id"],
+            object_id=r["object_id"],
         ))
     return hits
 
@@ -290,6 +303,7 @@ def fact_lookup(
     predicate: str | None,
     synonyms: set[str],
     schema: str = "main",
+    source_filter: set[str] | None = None,
 ) -> list[FactHit]:
     """Indexed SQL lookup: (subject_id IN ...) AND (predicate IN ...)."""
     if not entity_ids or not predicate:
@@ -299,11 +313,17 @@ def fact_lookup(
     all_predicates = [predicate] + sorted(synonyms)
     id_ph = ",".join("?" * len(entity_ids))
     pred_ph = ",".join("?" * len(all_predicates))
+    src_clause = ""
+    src_params: list = []
+    if source_filter:
+        src_ph = ",".join("?" * len(source_filter))
+        src_clause = f"AND f.source IN ({src_ph})"
+        src_params = sorted(source_filter)
 
     rows = conn.execute(
         f"""
         SELECT
-            f.id, f.predicate, f.object_text, f.object_id, f.qualifiers,
+            f.id, f.subject_id, f.predicate, f.object_text, f.object_id, f.qualifiers,
             f.negated, f.sentence, f.chunk_id,
             e.canonical_name AS subject_name,
             oe.canonical_name AS object_entity_name,
@@ -320,9 +340,10 @@ def fact_lookup(
           AND length(e.canonical_name) <= 60
           AND instr(e.canonical_name, ',') = 0
           AND instr(e.canonical_name, char(10)) = 0
+          {src_clause}
         ORDER BY score DESC, f.id
         """,
-        [predicate] + entity_ids + all_predicates,
+        [predicate] + entity_ids + all_predicates + src_params,
     ).fetchall()
 
     hits = []
@@ -341,6 +362,8 @@ def fact_lookup(
             chunk_id=r["chunk_id"],
             source_info=_source_info(r["title"], r["path"]),
             score=r["score"],
+            subject_id=r["subject_id"],
+            object_id=r["object_id"],
         ))
     return hits
 
@@ -543,6 +566,15 @@ def _source_info(title: str | None, path: str | None) -> str | None:
     return None
 
 
+def _fact_source_set(fact_sources: str) -> set[str] | None:
+    """Map fact_sources config value to a set of allowed source tags, or None for 'all'."""
+    if fact_sources == "minted":
+        return {"llm"}
+    if fact_sources == "minted+coref":
+        return {"llm", "coref"}
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Chunk loading
 # ---------------------------------------------------------------------------
@@ -672,6 +704,7 @@ def retrieve(
     into it (parse_ms, fact_ms, vec_ms, fts_ms, fusion_ms).
     """
     schemas = ["main"] + (pack_schemas or [])
+    source_filter = _fact_source_set(cfg.retrieval.fact_sources)
 
     # 1. Parse
     t0 = time.perf_counter()
@@ -692,20 +725,24 @@ def retrieve(
             main_entity_ids = s_eids
             main_synonyms = s_syns
         all_fact_hits.extend(
-            fact_lookup(conn, s_eids, parse.verb_lemma, s_syns, schema=schema)
+            fact_lookup(conn, s_eids, parse.verb_lemma, s_syns, schema=schema,
+                        source_filter=source_filter)
         )
     fact_ms = (time.perf_counter() - t0) * 1000
     if timings is not None:
         timings["fact_ms"] = fact_ms
 
     # Fact FTS (additive): keyword recall over fact triples + source sentences.
+    # Over-pull by 4× when source_filter is active so quarantining doesn't starve the pool.
+    _fts_fact_k = cfg.retrieval.fact_fts_top_k * (4 if source_filter else 1)
     all_fact_fts_ids: list[int] = []
     seen_fids = {h.fact_id for h in all_fact_hits}
     for schema in schemas:
-        fids = fact_fts_search_question(conn, question, cfg.retrieval.fact_fts_top_k, schema=schema)
+        fids = fact_fts_search_question(conn, question, _fts_fact_k, schema=schema)
         fids = [fid for fid in fids if fid not in seen_fids]
         if fids:
-            all_fact_hits.extend(load_fact_hits_by_ids(conn, fids, schema=schema))
+            all_fact_hits.extend(load_fact_hits_by_ids(conn, fids, schema=schema,
+                                                        source_filter=source_filter))
             seen_fids.update(fids)
             all_fact_fts_ids.extend(fids)
 
@@ -769,6 +806,16 @@ def retrieve(
 
     if timings is not None:
         timings["vec_ms"] = (time.perf_counter() - t0) * 1000
+
+    # Relevance gate: when source filter is active, drop facts whose subject/object
+    # entity doesn't appear in the question's resolved entity set. This prevents
+    # topically-loose minted facts from consuming slots on paraphrase questions.
+    if source_filter and main_entity_ids:
+        entity_id_set = set(main_entity_ids)
+        all_fact_hits = [
+            h for h in all_fact_hits
+            if h.subject_id in entity_id_set or h.object_id in entity_id_set
+        ]
 
     # Re-sort, cap, and renumber tags (after vec-surface may have added hits)
     all_fact_hits.sort(key=lambda h: -h.score)

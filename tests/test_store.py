@@ -358,3 +358,73 @@ class TestVecFacts:
     def test_vec_search_facts_empty_when_not_populated(self, tmp_db, flat_embedding):
         results = vec_search_facts(tmp_db, embedding=flat_embedding, k=5)
         assert results == []
+
+
+# ---------------------------------------------------------------------------
+# Phase Q — source provenance column + backfill
+# ---------------------------------------------------------------------------
+
+class TestFactSourceColumn:
+    def test_source_column_exists(self, tmp_db):
+        cols = {r[1] for r in tmp_db.execute("PRAGMA table_info(facts)").fetchall()}
+        assert "source" in cols
+
+    def test_insert_fact_stores_source(self, tmp_db):
+        src_id = insert_source(tmp_db, sha256=sha("src_q"), title="Q")
+        chunk_id = insert_chunk(tmp_db, source_id=src_id, ordinal=0,
+                                text="text", sha256=sha("text_q"))
+        eid = insert_entity(tmp_db, canonical_name="Holmes")
+        fid = insert_fact(tmp_db, chunk_id=chunk_id, sentence="s",
+                          subject_id=eid, predicate="role",
+                          object_text="detective", source="llm")
+        row = tmp_db.execute("SELECT source FROM facts WHERE id=?", [fid]).fetchone()
+        assert row["source"] == "llm"
+
+    def test_backfill_runs_on_existing_db(self, tmp_path):
+        """Open a fresh DB that has no fact_source_v meta; backfill must fire."""
+        conn = open_db(tmp_path / "backfill.db")
+        src_id = insert_source(conn, sha256=sha("bf_src"), title="BF")
+        chunk_id = insert_chunk(conn, source_id=src_id, ordinal=0,
+                                text="t", sha256=sha("bf_t"))
+        eid = insert_entity(conn, canonical_name="Watson")
+        # Insert fact with confidence=0.7 (pre-source era: simulates llm fact)
+        conn.execute(
+            "INSERT INTO facts(chunk_id, sentence, subject_id, predicate, object_text, confidence)"
+            " VALUES (?,?,?,?,?,?)",
+            [chunk_id, "s", eid, "role", "doctor", 0.7],
+        )
+        conn.commit()
+        # Remove the meta key so backfill triggers on next open
+        conn.execute("DELETE FROM db_meta WHERE key='fact_source_v'")
+        conn.commit()
+        conn.close()
+
+        conn2 = open_db(tmp_path / "backfill.db")
+        row = conn2.execute(
+            "SELECT source FROM facts WHERE predicate='role'"
+        ).fetchone()
+        conn2.close()
+        assert row["source"] == "llm"
+
+    def test_backfill_svo_confidence(self, tmp_path):
+        conn = open_db(tmp_path / "backfill2.db")
+        src_id = insert_source(conn, sha256=sha("svo_src"), title="SVO")
+        chunk_id = insert_chunk(conn, source_id=src_id, ordinal=0,
+                                text="t2", sha256=sha("svo_t"))
+        eid = insert_entity(conn, canonical_name="Hope")
+        conn.execute(
+            "INSERT INTO facts(chunk_id, sentence, subject_id, predicate, object_text, confidence)"
+            " VALUES (?,?,?,?,?,?)",
+            [chunk_id, "s", eid, "drive", "cab", 1.0],
+        )
+        conn.commit()
+        conn.execute("DELETE FROM db_meta WHERE key='fact_source_v'")
+        conn.commit()
+        conn.close()
+
+        conn2 = open_db(tmp_path / "backfill2.db")
+        row = conn2.execute(
+            "SELECT source FROM facts WHERE predicate='drive'"
+        ).fetchone()
+        conn2.close()
+        assert row["source"] == "svo"

@@ -212,6 +212,7 @@ def enhance_chunk(
             qualifiers=rf["qualifiers"],
             negated=rf["negated"],
             confidence=0.7,
+            source="llm",
         )
         if fact_id is not None:
             n_inserted += 1

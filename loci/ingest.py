@@ -268,6 +268,7 @@ def _run_pipeline(
                     object_text=obj_text,
                     qualifiers=rf.qualifiers,
                     negated=rf.negated,
+                    source="svo",
                 )
                 if fact_id is not None:
                     n_facts += 1
@@ -304,6 +305,7 @@ def _run_pipeline(
                         qualifiers=rf.qualifiers,
                         negated=rf.negated,
                         confidence=0.6,
+                        source="coref",
                     )
                     if fact_id is not None:
                         n_facts += 1

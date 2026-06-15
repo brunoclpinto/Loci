@@ -169,7 +169,19 @@ def _migrate(conn: sqlite3.Connection, vec_dim: int = 384) -> None:
             )
     # Schema evolution — add columns that were not in the original DDL
     _ensure_column(conn, "chunks", "extracted_v", "INTEGER DEFAULT 0")
+    _ensure_column(conn, "facts", "source", "TEXT")
     conn.commit()
+
+    # Backfill source column from confidence values (one-time migration).
+    source_v = conn.execute(
+        "SELECT value FROM db_meta WHERE key='fact_source_v'"
+    ).fetchone()
+    if source_v is None:
+        conn.execute("UPDATE facts SET source='svo'   WHERE source IS NULL AND confidence=1.0")
+        conn.execute("UPDATE facts SET source='coref' WHERE source IS NULL AND confidence=0.6")
+        conn.execute("UPDATE facts SET source='llm'   WHERE source IS NULL AND confidence=0.7")
+        conn.execute("INSERT OR REPLACE INTO db_meta(key,value) VALUES ('fact_source_v','1')")
+        conn.commit()
 
     # Backfill/upgrade fact FTS when DB is missing or on an older version.
     fts_v = conn.execute(
@@ -276,6 +288,7 @@ def insert_fact(
     qualifiers: dict | None = None,
     negated: bool = False,
     confidence: float = 1.0,
+    source: str = "svo",
 ) -> int | None:
     """Insert fact; returns new id, or None if it duplicates an existing fact."""
     q_json = json.dumps(qualifiers, sort_keys=True) if qualifiers else None
@@ -290,10 +303,10 @@ def insert_fact(
     cur = conn.execute(
         """INSERT INTO facts
              (chunk_id, sentence, subject_id, predicate, object_id,
-              object_text, qualifiers, negated, confidence)
-           VALUES (?,?,?,?,?,?,?,?,?)""",
+              object_text, qualifiers, negated, confidence, source)
+           VALUES (?,?,?,?,?,?,?,?,?,?)""",
         [chunk_id, sentence, subject_id, predicate, object_id,
-         object_text, q_json, int(negated), confidence],
+         object_text, q_json, int(negated), confidence, source],
     )
     conn.commit()
     return cur.lastrowid

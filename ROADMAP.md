@@ -17,6 +17,13 @@ plan file (linked below) with full implementation detail, tests, bench, and succ
 > is that the 3B model degrades when context includes any noisy [F#] injection; 63 new P1 taxonomy facts are in
 > scarlet_v2.db (1676→1739) and help specific questions, but enabling injection always hurts paraphrase more.
 > Infrastructure in place: vec_facts, taxonomy enhance, rerank config, HyDE flag — all ready for a stronger base model.
+>
+> **Phase Q (2026-06-15):** Added `source` provenance column (svo/coref/llm), `fact_sources` quarantine knob, relevance
+> gate, and 4× FTS over-pull. Deep ablation bench (5 arms × qna_20 runs=3, 2 arms × qna_scarlet runs=3):
+> minted-only injection showed qna_20 improvement (73.75, +10.0 vs M-20) but regressed on 100-Q (minted-4=62.05,
+> minted-2=62.55, both < M=64.35, halluc=2). Root cause: gate bypass flaw (empty entity_ids case passes all minted
+> facts) + 3B model noise sensitivity. Infrastructure shipped as off (defaults unchanged). Next: fix gate bypass OR
+> escalate to 7B+ model.
 
 ---
 
@@ -30,6 +37,7 @@ plan file (linked below) with full implementation detail, tests, bench, and succ
 | 3 | **P1** — semantic fact minting | [planP1_factmint.md](planP1_factmint.md) | `DONE (63 facts minted; fact +1.2 on 100Q; qna_20=70.75; max_facts=0 prevents paraphrase noise)` | B (uses B's missing-fact backlog) | yes |
 | 4 | **C** — rerank, don't pre-truncate (P2) | [planC_rerank.md](planC_rerank.md) | `DONE (F2=off; pool=62.80 -1.55 vs M; wider pool floods RRF with mediocre overlap → para -22)` | — (independent) | yes |
 | 5 | **E** — paraphrase / multi-hop (P3) | [planE_paraphrase.md](planE_paraphrase.md) | `DONE (F2=off; HyDE=62.65 -1.70, halluc 1→3 violates guardrail; hyde_query=false)` | — | yes |
+| 6 | **Q** — SVO quarantine + fact provenance | [planQ_quarantine.md](planQ_quarantine.md) | `DONE (🛑 FAIL; minted-4=62.05, minted-2=62.55, both < M=64.35; halluc=2; gate bypass flaw; F2=off)` | P1 | no (🛑 gate) |
 
 > **Keep this table current.** When a phase finishes, set its `Status` to `DONE (overall=NN.N, fact=NN.N)`
 > and move to the next `TODO` row.
