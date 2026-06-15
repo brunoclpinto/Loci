@@ -1143,6 +1143,7 @@ def _question_template(subject: str, predicate: str, obj: str) -> str:
 @app.command("enhance")
 def enhance_cmd(
     limit: Optional[int] = typer.Option(None, "--limit", help="Max chunks to process."),
+    all_chunks: bool = typer.Option(False, "--all", help="Re-run on ALL chunks (reset extracted_v first). Needed for the P1 taxonomy re-extraction pass."),
     config_path: Optional[Path] = typer.Option(None, "--config", "-c"),
     low_mem: bool = typer.Option(False, "--low-mem"),
 ) -> None:
@@ -1194,7 +1195,8 @@ def enhance_cmd(
     try:
         with load_chat(cfg_exp, low_mem=low_mem) as llm:
             with measure("enhance", log_dir=cfg_exp.paths.runtime_logs_dir) as counters:
-                stats = run_enhance(conn, llm=llm, cfg=cfg, embedder=embedder, limit=limit)
+                stats = run_enhance(conn, llm=llm, cfg=cfg, embedder=embedder,
+                                    limit=limit, force_all=all_chunks)
                 counters.update(stats)
     finally:
         if _emb_ctx is not None:

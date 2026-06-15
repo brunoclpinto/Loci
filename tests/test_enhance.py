@@ -105,7 +105,7 @@ class TestParseLlmFacts:
         assert facts[0]["negated"] is False
 
     def test_strips_markdown_fences(self):
-        raw = '```json\n[{"subject":"A","predicate":"b","object":"c","qualifiers":{},"negated":false}]\n```'
+        raw = '```json\n[{"subject":"A","predicate":"role","object":"c","qualifiers":{},"negated":false}]\n```'
         facts = parse_llm_facts(raw)
         assert len(facts) == 1
 
@@ -124,22 +124,51 @@ class TestParseLlmFacts:
         assert parse_llm_facts(raw) == []
 
     def test_predicate_lowercased(self):
-        raw = '[{"subject":"Holmes","predicate":"TAKE","object":"bottle","qualifiers":{},"negated":false}]'
+        raw = '[{"subject":"Holmes","predicate":"PROFESSION","object":"detective","qualifiers":{},"negated":false}]'
         facts = parse_llm_facts(raw)
-        assert facts[0]["predicate"] == "take"
+        assert len(facts) == 1
+        assert facts[0]["predicate"] == "profession"
 
     def test_multiple_facts(self):
         raw = json.dumps([
-            {"subject": "A", "predicate": "do", "object": "x", "qualifiers": {}, "negated": False},
+            {"subject": "A", "predicate": "role", "object": "x", "qualifiers": {}, "negated": False},
             {"subject": "B", "predicate": "be", "object": "y", "qualifiers": {}, "negated": True},
         ])
         facts = parse_llm_facts(raw)
         assert len(facts) == 2
 
     def test_negated_preserved(self):
-        raw = '[{"subject":"Holmes","predicate":"take","object":"drug","qualifiers":{},"negated":true}]'
+        raw = '[{"subject":"Holmes","predicate":"profession","object":"detective","qualifiers":{},"negated":true}]'
         facts = parse_llm_facts(raw)
         assert facts[0]["negated"] is True
+
+    def test_taxonomy_rejects_out_of_scope_predicate(self):
+        raw = '[{"subject":"Holmes","predicate":"take","object":"bottle","qualifiers":{},"negated":false}]'
+        facts = parse_llm_facts(raw)
+        assert facts == [], "predicates outside the taxonomy should be rejected"
+
+    def test_taxonomy_accepts_profession(self):
+        raw = '[{"subject":"Holmes","predicate":"profession","object":"consulting detective","qualifiers":{},"negated":false,"sentence":"I am a consulting detective."}]'
+        facts = parse_llm_facts(raw)
+        assert len(facts) == 1
+        assert facts[0]["predicate"] == "profession"
+        assert facts[0]["sentence"] == "I am a consulting detective."
+
+    def test_taxonomy_accepts_role(self):
+        raw = '[{"subject":"Mrs Hudson","predicate":"role","object":"landlady","qualifiers":{},"negated":false,"sentence":"Mrs Hudson, our landlady, knocked."}]'
+        facts = parse_llm_facts(raw)
+        assert len(facts) == 1
+        assert facts[0]["predicate"] == "role"
+
+    def test_sentence_field_extracted(self):
+        raw = '[{"subject":"Hope","predicate":"occupation","object":"cab driver","qualifiers":{},"negated":false,"sentence":"He worked as a cab driver."}]'
+        facts = parse_llm_facts(raw)
+        assert facts[0]["sentence"] == "He worked as a cab driver."
+
+    def test_sentence_field_absent_returns_none(self):
+        raw = '[{"subject":"Holmes","predicate":"be","object":"detective","qualifiers":{},"negated":false}]'
+        facts = parse_llm_facts(raw)
+        assert facts[0]["sentence"] is None
 
     def test_non_list_response_returns_empty(self):
         assert parse_llm_facts('{"subject":"X","predicate":"y","object":"z"}') == []
@@ -260,6 +289,41 @@ class TestRunEnhance:
         stats = run_enhance(conn, llm=fake_llm, cfg=default_cfg, limit=2)
         assert stats["chunks_processed"] == 2
         conn.close()
+
+    def test_force_all_reprocesses_extracted_chunks(self, tmp_path, fake_llm, default_cfg):
+        from loci.store import open_db, insert_source, insert_chunk
+        conn = open_db(tmp_path / "force.db")
+        src_id = insert_source(conn, path="f.txt", sha256="xforce")
+        insert_chunk(conn, source_id=src_id, ordinal=0,
+                     text="Holmes is a consulting detective.", sha256="cforce")
+        conn.commit()
+
+        # First run — marks chunk as extracted
+        run_enhance(conn, llm=fake_llm, cfg=default_cfg)
+        # Second run without force_all — nothing to process
+        stats2 = run_enhance(conn, llm=fake_llm, cfg=default_cfg)
+        assert stats2["chunks_processed"] == 0
+        # Third run with force_all — resets extracted_v and processes again
+        stats3 = run_enhance(conn, llm=fake_llm, cfg=default_cfg, force_all=True)
+        assert stats3["chunks_processed"] == 1
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# P1: build_extraction_messages with known_entities
+# ---------------------------------------------------------------------------
+
+class TestBuildExtractionMessagesP1:
+    def test_known_entities_in_user_message(self):
+        msgs = build_extraction_messages("Some text.", known_entities=["Sherlock Holmes", "Mrs Hudson"])
+        user = next(m for m in msgs if m["role"] == "user")
+        assert "Sherlock Holmes" in user["content"]
+        assert "Mrs Hudson" in user["content"]
+
+    def test_no_entities_still_works(self):
+        msgs = build_extraction_messages("Some text.")
+        user = next(m for m in msgs if m["role"] == "user")
+        assert "Some text." in user["content"]
 
 
 # ---------------------------------------------------------------------------
