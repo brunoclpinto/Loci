@@ -23,7 +23,7 @@ plan file (linked below) with full implementation detail, tests, bench, and succ
 | 1 | **M** — judge answer key (measurement) | [planM_judgekey.md](planM_judgekey.md) | `DONE (new baseline=64.35, fact=44.4, para=47.0, multi=19.0, neg=96.8)` | — | yes |
 | 2 | **B** — vec-over-facts (P0.1) | [planB_vecfacts.md](planB_vecfacts.md) | `DONE (F1=off; surface=59.90, expand=61.95, both < M=64.35; facts MISSING not unretrievable)` | M | yes |
 | 3 | **P1** — semantic fact minting | [planP1_factmint.md](planP1_factmint.md) | `DONE (63 facts minted; fact +1.2 on 100Q; qna_20=70.75; max_facts=0 prevents paraphrase noise)` | B (uses B's missing-fact backlog) | yes |
-| 4 | **C** — rerank, don't pre-truncate (P2) | [planC_rerank.md](planC_rerank.md) | `TODO` | — (independent) | yes |
+| 4 | **C** — rerank, don't pre-truncate (P2) | [planC_rerank.md](planC_rerank.md) | `DONE (F2=off; pool=62.80 -1.55 vs M; wider pool floods RRF with mediocre overlap → para -22)` | — (independent) | yes |
 | 5 | **E** — paraphrase / multi-hop (P3) | [planE_paraphrase.md](planE_paraphrase.md) | `TODO` | — | yes |
 
 > **Keep this table current.** When a phase finishes, set its `Status` to `DONE (overall=NN.N, fact=NN.N)`
