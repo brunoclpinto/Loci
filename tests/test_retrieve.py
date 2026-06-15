@@ -652,3 +652,15 @@ class TestFactSourceFilter:
         result = retrieve("What is Holmes's profession?", conn=source_db, cfg=cfg, nlp=nlp)
         for fh in result.fact_hits:
             assert fh.predicate != "take", "svo fact leaked through minted filter"
+
+    def test_gate_bypass_fix_empty_entities(self, source_db, nlp):
+        """When source_filter is active but no entities resolve, gate must return [] not bypass."""
+        from loci.config import Config
+        from unittest.mock import patch
+        cfg = Config()
+        cfg.retrieval.max_facts_in_context = 4
+        cfg.retrieval.fact_sources = "minted"
+        # Patch entity resolution to return [] (simulates unrecognised query)
+        with patch("loci.retrieve.find_mentioned_entity_ids", return_value=[]):
+            result = retrieve("xyzzy quux", conn=source_db, cfg=cfg, nlp=nlp)
+        assert result.fact_hits == [], "bypass flaw: minted facts injected when entity_ids=[]"

@@ -2,7 +2,7 @@
 
 > **◀ [ROADMAP](ROADMAP.md)** · prev: [planE_paraphrase.md](planE_paraphrase.md) · **next ▶ (gated) ingest-scale**
 >
-> **Phase:** Q · **Status:** `DONE (🛑 FAIL — minted-4=62.05, minted-2=62.55, both < M=64.35; halluc=2; gate bypass flaw identified)` · **Depends on:** P1 (consumes the 63 minted facts), B (vec_facts) · **Auto-advance:** no (🛑 gate at §5)
+> **Phase:** Q · **Status:** `DONE (🛑 FAIL — best arm minted-4+fix=63.20 (−1.15 vs M); halluc=2 persists; gate bypass fixed but 3B bound; escalate to 4-5B)` · **Depends on:** P1 (consumes the 63 minted facts), B (vec_facts) · **Auto-advance:** no (🛑 gate at §5)
 
 **Owner:** worker (Claude Sonnet 4.6) · **Repo:** `/Users/brunopinto/Repos/Loci` · **Branch:** `p0-fact-fts`
 Run everything with `uv run`. DB override: `LOCI_PATHS__KNOWLEDGE_DB=/Volumes/SSD1TB001/loci/knowledge/scarlet_v2.db`.

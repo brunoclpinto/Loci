@@ -816,6 +816,10 @@ def retrieve(
             h for h in all_fact_hits
             if h.subject_id in entity_id_set or h.object_id in entity_id_set
         ]
+    elif source_filter and not main_entity_ids:
+        # No entities resolved → cannot gate by entity; drop all to avoid injecting
+        # unrelated minted facts into slots (the bypass flaw from Phase Q bench).
+        all_fact_hits = []
 
     # Re-sort, cap, and renumber tags (after vec-surface may have added hits)
     all_fact_hits.sort(key=lambda h: -h.score)
