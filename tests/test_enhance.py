@@ -6,9 +6,13 @@ import pytest
 
 from loci.enhance import (
     build_extraction_messages,
+    build_entity_messages,
+    build_implied_messages,
     enhance_chunk,
     parse_llm_facts,
     run_enhance,
+    run_entity_pass,
+    run_implied_pass,
 )
 from loci.extract import extract_coref_facts
 
@@ -480,4 +484,114 @@ class TestExtractedV:
                          text=f"t{i}", sha256=f"cl{i}")
         conn.commit()
         assert len(get_unextracted_chunks(conn, limit=3)) == 3
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# P2 message builders
+# ---------------------------------------------------------------------------
+
+class TestP2MessageBuilders:
+    def test_entity_messages_has_system_and_user(self):
+        msgs = build_entity_messages("Holmes", "Some text about Holmes.")
+        assert msgs[0]["role"] == "system"
+        assert msgs[1]["role"] == "user"
+
+    def test_entity_messages_entity_in_system(self):
+        msgs = build_entity_messages("Mrs Hudson", "Text.")
+        assert "Mrs Hudson" in msgs[0]["content"]
+
+    def test_entity_messages_known_entities_in_user(self):
+        msgs = build_entity_messages("Holmes", "Text.", known_entities=["Watson", "Moriarty"])
+        assert "Watson" in msgs[1]["content"]
+
+    def test_implied_messages_has_system_and_user(self):
+        msgs = build_implied_messages("He drove a cab.")
+        assert msgs[0]["role"] == "system"
+        assert msgs[1]["role"] == "user"
+
+    def test_implied_messages_system_mentions_occupation(self):
+        msgs = build_implied_messages("text")
+        assert "occupation" in msgs[0]["content"] or "Occupation" in msgs[0]["content"]
+
+    def test_implied_messages_known_entities_in_user(self):
+        msgs = build_implied_messages("text", known_entities=["Holmes"])
+        assert "Holmes" in msgs[1]["content"]
+
+
+# ---------------------------------------------------------------------------
+# P2 pass runners
+# ---------------------------------------------------------------------------
+
+def _make_p2_db(tmp_path, fake_embedder, nlp, default_cfg):
+    from loci.store import open_db, insert_source, insert_chunk, insert_entity, insert_alias
+    conn = open_db(tmp_path / "p2.db")
+    src_id = insert_source(conn, path="f.txt", sha256="xp2")
+    chunk_id = insert_chunk(
+        conn, source_id=src_id, ordinal=0,
+        text="Mrs Hudson our landlady knocked on the door. Jefferson Hope drove the cab.",
+        sha256="cp2",
+    )
+    eid = insert_entity(conn, canonical_name="Mrs Hudson", kind="person")
+    insert_alias(conn, entity_id=eid, alias="mrs hudson")
+    eid2 = insert_entity(conn, canonical_name="Jefferson Hope", kind="person")
+    insert_alias(conn, entity_id=eid2, alias="jefferson hope")
+    conn.commit()
+    return conn, chunk_id
+
+
+class TestRunEntityPass:
+    def test_returns_stats(self, tmp_path, fake_embedder, nlp, default_cfg):
+        conn, _ = _make_p2_db(tmp_path, fake_embedder, nlp, default_cfg)
+        llm = FakeExtractLLM('[{"subject":"Mrs Hudson","predicate":"role","object":"landlady","qualifiers":{},"negated":false,"sentence":"Mrs Hudson our landlady knocked."}]')
+        stats = run_entity_pass(conn, llm=llm, cfg=default_cfg)
+        assert "entities_processed" in stats
+        assert "facts_added" in stats
+        conn.close()
+
+    def test_idempotent(self, tmp_path, fake_embedder, nlp, default_cfg):
+        conn, _ = _make_p2_db(tmp_path / "idem_ep", fake_embedder, nlp, default_cfg)
+        llm = FakeExtractLLM("[]")
+        run_entity_pass(conn, llm=llm, cfg=default_cfg)
+        stats2 = run_entity_pass(conn, llm=llm, cfg=default_cfg)
+        assert stats2.get("skipped") is True
+        assert stats2["entities_processed"] == 0
+        conn.close()
+
+    def test_inserts_source_llm(self, tmp_path, fake_embedder, nlp, default_cfg):
+        conn, _ = _make_p2_db(tmp_path / "src_ep", fake_embedder, nlp, default_cfg)
+        llm = FakeExtractLLM('[{"subject":"Mrs Hudson","predicate":"role","object":"landlady","qualifiers":{},"negated":false,"sentence":"Mrs Hudson our landlady."}]')
+        run_entity_pass(conn, llm=llm, cfg=default_cfg)
+        rows = conn.execute("SELECT source FROM facts WHERE source='llm'").fetchall()
+        assert len(rows) > 0
+        conn.close()
+
+
+class TestRunImpliedPass:
+    def test_returns_stats(self, tmp_path, fake_embedder, nlp, default_cfg):
+        conn, _ = _make_p2_db(tmp_path / "imp", fake_embedder, nlp, default_cfg)
+        llm = FakeExtractLLM('[{"subject":"Jefferson Hope","predicate":"occupation","object":"cab driver","qualifiers":{},"negated":false,"sentence":"Jefferson Hope drove the cab."}]')
+        stats = run_implied_pass(conn, llm=llm, cfg=default_cfg)
+        assert "chunks_processed" in stats
+        assert "facts_added" in stats
+        conn.close()
+
+    def test_idempotent(self, tmp_path, fake_embedder, nlp, default_cfg):
+        conn, _ = _make_p2_db(tmp_path / "idem_imp", fake_embedder, nlp, default_cfg)
+        llm = FakeExtractLLM("[]")
+        run_implied_pass(conn, llm=llm, cfg=default_cfg)
+        stats2 = run_implied_pass(conn, llm=llm, cfg=default_cfg)
+        assert stats2.get("skipped") is True
+        conn.close()
+
+    def test_processes_all_chunks(self, tmp_path, fake_embedder, nlp, default_cfg):
+        from loci.store import open_db, insert_source, insert_chunk
+        conn = open_db(tmp_path / "allc.db")
+        src_id = insert_source(conn, path="f.txt", sha256="xallc")
+        for i in range(3):
+            insert_chunk(conn, source_id=src_id, ordinal=i, text=f"Chunk {i}.", sha256=f"callc{i}")
+        conn.commit()
+        llm = FakeExtractLLM("[]")
+        stats = run_implied_pass(conn, llm=llm, cfg=default_cfg)
+        assert stats["chunks_processed"] == 3
         conn.close()

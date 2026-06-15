@@ -30,6 +30,13 @@ plan file (linked below) with full implementation detail, tests, bench, and succ
 > unusable under concurrent use. Qwen3.5-4B=64.0 (≈M, fact+6.8 but para−17); Qwen3-4B=65.55 but halluc=6
 > (thinking mode active, needs /no_think); Gemma3-4B=58.15, halluc=9 (draws on training knowledge for negative Qs).
 > Reverting to 3B footprint: benchmarking Llama-3.2-3B, Qwen3.5-2B, Qwen3-1.7B, Gemma3-1B candidates (Phase N).
+>
+> **Phase P2 (ran ahead of N, 2026-06-15):** Two new extraction passes added to enhance.py: entity-centric
+> (cross-chunk coref, 110 entities → 174 new facts) and implied/archaic (138 chunks → 111 new facts). Total llm
+> facts: 380→665; total facts: 1739→2024. Key fixes in data: RACHE|mean|revenge confirmed, Hope|work_as|jarvey
+> and jarvey|mean|cab driver minted. Bench: minted-4 runs=1=65.25 (+0.90, noise); runs=3=61.70 (−2.65), halluc=2
+> — same 3B bound as Phase Q. Data improvements are real but 3B model can't handle injection. Injection stays OFF.
+> Phase N (model bench) is the unblocking step.
 
 ---
 
@@ -45,7 +52,7 @@ plan file (linked below) with full implementation detail, tests, bench, and succ
 | 5 | **E** — paraphrase / multi-hop (P3) | [planE_paraphrase.md](planE_paraphrase.md) | `DONE (F2=off; HyDE=62.65 -1.70, halluc 1→3 violates guardrail; hyde_query=false)` | — | yes |
 | 6 | **Q** — SVO quarantine + fact provenance | [planQ_quarantine.md](planQ_quarantine.md) | `DONE (🛑 FAIL; best arm=minted-4+fix=63.20, −1.15 vs M; halluc=2 persists; 3B bound; escalate to 4-5B)` | P1 | no (🛑 gate) |
 | 7 | **N** — base model selection | [planN_modelbench.md](planN_modelbench.md) | `TODO` | Q | yes |
-| 8 | **P2** — multi-pass ingest | [planP2_multipass.md](planP2_multipass.md) | `TODO` | N (needs winning model first) | yes |
+| 8 | **P2** — multi-pass ingest | [planP2_multipass.md](planP2_multipass.md) | `DONE (🛑 FAIL on injection; ran ahead of N; entity+implied passes minted 285 new llm facts (380→665, 1739→2024 total); RACHE+Hope cab driver now correct; but minted-4 runs=3=61.70 −2.65 vs M, halluc=2 — same 3B bound as Q; injection off; data in DB ready for N winner)` | N (needs winning model first) | yes |
 
 > **Keep this table current.** When a phase finishes, set its `Status` to `DONE (overall=NN.N, fact=NN.N)`
 > and move to the next `TODO` row.

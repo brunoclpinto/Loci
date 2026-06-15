@@ -5,6 +5,12 @@ import json
 import re
 from typing import Any
 
+# db_meta keys for idempotency guards
+_P2_ENTITY_META_KEY = "p2_entity_v"
+_P2_IMPLIED_META_KEY = "p2_implied_v"
+_P2_ENTITY_VERSION = "1"
+_P2_IMPLIED_VERSION = "1"
+
 # ---------------------------------------------------------------------------
 # P1 relation taxonomy — predicates that match question vocabulary
 # ---------------------------------------------------------------------------
@@ -75,6 +81,66 @@ OUTPUT: A JSON array. Each element MUST have exactly these fields:
 - Never infer beyond what the text says. If nothing fits the taxonomy: []"""
 
 _FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL)
+
+# ---------------------------------------------------------------------------
+# P2 Pass 1 — entity-centric cross-chunk extraction
+# ---------------------------------------------------------------------------
+
+_ENTITY_SYSTEM_PROMPT = """\
+You are a precise fact extractor for a knowledge graph.
+The passages below all mention the entity [{entity}]. Extract every factual relationship about [{entity}].
+
+Focus on:
+1. Occupation/profession/role — what do they do or what are they called?
+2. Residence — where do they live or where are they found?
+3. Relationships — who are they related to, introduced by, affiliated with?
+4. Aliases — what other names or descriptions refer to them?
+5. Actions with named outcomes — murders, introductions, causes.
+
+COREFERENCE: Descriptions like "our landlady", "the cabman", "the old pioneer" that clearly refer to [{entity}]
+should produce a fact with [{entity}] as subject using the canonical name, not the description.
+
+PREDICATE TAXONOMY — use ONLY these values (exact strings, lowercase):
+  profession, occupation, role, identity, alias_of, title,
+  means, mean,
+  located_at, resides_at, reside_at,
+  relationship_to, affiliation, leader_of,
+  introduce, murder, cause_of, named_after,
+  work_as, call, be, possess, sign, employ, found
+
+OUTPUT: A JSON array. Each element MUST have exactly these fields:
+  {{"subject": "...", "predicate": "...", "object": "...", "sentence": "...", "qualifiers": {{}}, "negated": false}}
+- "sentence": the exact sentence from the text that most directly supports this fact.
+- "subject": always use the canonical name [{entity}], not a pronoun or description.
+- Never infer beyond what the text says. If nothing fits the taxonomy: []"""
+
+# ---------------------------------------------------------------------------
+# P2 Pass 2 — implication / archaic-vocab extraction
+# ---------------------------------------------------------------------------
+
+_IMPLIED_SYSTEM_PROMPT = """\
+You are a precise fact extractor for a knowledge graph.
+Extract facts that are IMPLIED but not stated directly in the text passage below.
+
+Focus on:
+1. Occupations described by action — "he drove a cab" → occupation=cab driver; "worked as a constable" → occupation=constable
+2. Foreign-word translations — "RACHE is the German word for revenge" → RACHE, means, revenge
+3. Archaic or indirect terms decoded — "jarvey" is Victorian slang for cab driver
+4. Aliases or disguises — "the old man was in fact Holmes" → alias_of
+5. Roles implied by description — "our landlady Mrs Hudson" → Mrs Hudson, role, landlady
+
+PREDICATE TAXONOMY — use ONLY these values (exact strings, lowercase):
+  profession, occupation, role, identity, alias_of, title,
+  means, mean,
+  located_at, resides_at, reside_at,
+  relationship_to, affiliation, leader_of,
+  introduce, murder, cause_of, named_after,
+  work_as, call, be, possess, sign, employ, found
+
+OUTPUT: A JSON array. Each element MUST have exactly these fields:
+  {{"subject": "...", "predicate": "...", "object": "...", "sentence": "...", "qualifiers": {{}}, "negated": false}}
+- "subject" and "object": use canonical proper names when you can identify them.
+- Only output high-confidence implications (0.8+). If nothing fits: []"""
 
 
 def build_extraction_messages(
@@ -219,6 +285,267 @@ def enhance_chunk(
 
     mark_chunk_extracted(conn, chunk_id)
     return n_inserted
+
+
+def build_entity_messages(
+    entity_name: str,
+    chunks_text: str,
+    known_entities: list[str] | None = None,
+) -> list[dict]:
+    system = _ENTITY_SYSTEM_PROMPT.replace("{entity}", entity_name)
+    user = ""
+    if known_entities:
+        user = (
+            "Known entities in this corpus (prefer these canonical names):\n"
+            + ", ".join(known_entities[:25])
+            + "\n\n"
+        )
+    user += f"Text passages about {entity_name}:\n{chunks_text}"
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
+
+
+def build_implied_messages(
+    chunk_text: str,
+    known_entities: list[str] | None = None,
+) -> list[dict]:
+    user = ""
+    if known_entities:
+        user = (
+            "Known entities in this corpus (prefer these canonical names):\n"
+            + ", ".join(known_entities[:25])
+            + "\n\n"
+        )
+    user += f"Text:\n{chunk_text}"
+    return [
+        {"role": "system", "content": _IMPLIED_SYSTEM_PROMPT},
+        {"role": "user", "content": user},
+    ]
+
+
+def _get_proper_entities(conn: Any) -> list[dict]:
+    """Return clean proper-noun entities suitable for entity-centric extraction."""
+    rows = conn.execute(
+        "SELECT id, canonical_name FROM entities ORDER BY canonical_name"
+    ).fetchall()
+    result = []
+    for r in rows:
+        eid = r[0] if isinstance(r, (list, tuple)) else r["id"]
+        name = r[1] if isinstance(r, (list, tuple)) else r["canonical_name"]
+        if not name:
+            continue
+        # Filter: must have uppercase, reasonable length, no garbage chars
+        if (
+            len(name) > 2
+            and len(name) <= 40
+            and name != name.lower()
+            and "\n" not in name
+            and "|" not in name
+            and "(" not in name
+            and not name.startswith("_")
+        ):
+            result.append({"id": eid, "name": name})
+    return result
+
+
+def _insert_extracted_facts(
+    conn: Any,
+    raw_facts: list[dict],
+    chunk_id: int,
+    embedder: Any,
+    cfg: Any,
+    confidence: float,
+) -> int:
+    """Resolve and insert a list of raw fact dicts; returns count inserted."""
+    from loci.generate import generate_response  # noqa: F401 (unused but consistent import pattern)
+    from loci.resolve import resolve_entity
+    from loci.store import insert_fact
+
+    n = 0
+    for rf in raw_facts:
+        subj_id = resolve_entity(
+            conn, rf["subject"],
+            embedder=embedder,
+            entity_sim_threshold=cfg.retrieval.entity_sim_threshold,
+        )
+        if subj_id is None:
+            continue
+
+        obj_id = None
+        obj_text = rf["object"]
+        if obj_text and obj_text[0].isupper():
+            resolved = resolve_entity(
+                conn, obj_text,
+                embedder=embedder,
+                entity_sim_threshold=cfg.retrieval.entity_sim_threshold,
+            )
+            if resolved is not None:
+                obj_id = resolved
+                obj_text = None
+
+        sentence = rf.get("sentence") or ""
+        fact_id = insert_fact(
+            conn,
+            chunk_id=chunk_id,
+            sentence=sentence,
+            subject_id=subj_id,
+            predicate=rf["predicate"],
+            object_id=obj_id,
+            object_text=obj_text,
+            qualifiers=rf["qualifiers"],
+            negated=rf["negated"],
+            confidence=confidence,
+            source="llm",
+        )
+        if fact_id is not None:
+            n += 1
+    return n
+
+
+def run_entity_pass(
+    conn: Any,
+    *,
+    llm: Any,
+    cfg: Any,
+    embedder: Any = None,
+) -> dict:
+    """P2 Pass 1: entity-centric cross-chunk fact extraction.
+
+    For each proper-noun entity, gathers all chunks mentioning it via FTS,
+    concatenates them as a single context window, and asks the LLM to extract
+    all facts about that entity. Resolves cross-chunk coreferences naturally.
+    """
+    from loci.generate import generate_response
+    from loci.store import fts_search_chunks
+
+    # Idempotency guard
+    done = conn.execute(
+        "SELECT value FROM db_meta WHERE key=?", [_P2_ENTITY_META_KEY]
+    ).fetchone()
+    if done and done[0] == _P2_ENTITY_VERSION:
+        return {"entities_processed": 0, "facts_added": 0, "skipped": True}
+
+    entities = _get_proper_entities(conn)
+    known_entities = _get_entity_names(conn)
+
+    # Use the first chunk id as a stable anchor for dedup UNIQUE key.
+    # We pass chunk_id=0 since entity-centric facts span many chunks.
+    # chunk_id=0 is reserved (no chunk has id=0 in SQLite autoincrement).
+    n_facts = 0
+    n_entities = 0
+
+    for ent in entities:
+        eid = ent["id"]
+        name = ent["name"]
+
+        # FTS search for entity name across all chunks (up to 8)
+        try:
+            hits = fts_search_chunks(conn, query=f'"{name}"', k=8)
+        except Exception:
+            # FTS may reject some names with special chars
+            try:
+                hits = fts_search_chunks(conn, query=name, k=8)
+            except Exception:
+                continue
+
+        if not hits:
+            continue
+
+        # Fetch chunk texts
+        chunk_ids = [h["chunk_id"] for h in hits]
+        placeholders = ",".join("?" * len(chunk_ids))
+        rows = conn.execute(
+            f"SELECT id, text FROM chunks WHERE id IN ({placeholders}) ORDER BY ordinal",
+            chunk_ids,
+        ).fetchall()
+
+        if not rows:
+            continue
+
+        # Use first chunk id as anchor for UNIQUE dedup
+        first_chunk_id = rows[0][0] if isinstance(rows[0], (list, tuple)) else rows[0]["id"]
+
+        # Concatenate chunk texts with separator
+        sep = "\n\n---\n\n"
+        combined = sep.join(
+            (r[1] if isinstance(r, (list, tuple)) else r["text"]) for r in rows
+        )
+        # Cap context to avoid token overflow (~4000 chars ≈ 1000 tokens)
+        if len(combined) > 4000:
+            combined = combined[:4000]
+
+        messages = build_entity_messages(name, combined, known_entities=known_entities)
+        try:
+            response = generate_response(llm, messages, max_tokens=512, temperature=0.0)
+        except Exception:
+            continue
+
+        raw_facts = parse_llm_facts(response)
+        n_inserted = _insert_extracted_facts(
+            conn, raw_facts, first_chunk_id, embedder, cfg, confidence=0.75
+        )
+        if n_inserted > 0:
+            n_facts += n_inserted
+        n_entities += 1
+
+    conn.execute(
+        "INSERT OR REPLACE INTO db_meta(key,value) VALUES (?,?)",
+        [_P2_ENTITY_META_KEY, _P2_ENTITY_VERSION],
+    )
+    conn.commit()
+    return {"entities_processed": n_entities, "facts_added": n_facts, "skipped": False}
+
+
+def run_implied_pass(
+    conn: Any,
+    *,
+    llm: Any,
+    cfg: Any,
+    embedder: Any = None,
+) -> dict:
+    """P2 Pass 2: implication/archaic-vocab fact extraction.
+
+    Runs a secondary prompt over every chunk targeting implied facts:
+    occupations described by action, foreign-word translations, archaic terms,
+    and roles implied by description.
+    """
+    from loci.generate import generate_response
+
+    # Idempotency guard
+    done = conn.execute(
+        "SELECT value FROM db_meta WHERE key=?", [_P2_IMPLIED_META_KEY]
+    ).fetchone()
+    if done and done[0] == _P2_IMPLIED_VERSION:
+        return {"chunks_processed": 0, "facts_added": 0, "skipped": True}
+
+    rows = conn.execute("SELECT id, text FROM chunks ORDER BY ordinal").fetchall()
+    known_entities = _get_entity_names(conn)
+
+    n_facts = 0
+    for row in rows:
+        cid = row[0] if isinstance(row, (list, tuple)) else row["id"]
+        ctext = row[1] if isinstance(row, (list, tuple)) else row["text"]
+
+        messages = build_implied_messages(ctext, known_entities=known_entities)
+        try:
+            response = generate_response(llm, messages, max_tokens=512, temperature=0.0)
+        except Exception:
+            continue
+
+        raw_facts = parse_llm_facts(response)
+        n_inserted = _insert_extracted_facts(
+            conn, raw_facts, cid, embedder, cfg, confidence=0.65
+        )
+        n_facts += n_inserted
+
+    conn.execute(
+        "INSERT OR REPLACE INTO db_meta(key,value) VALUES (?,?)",
+        [_P2_IMPLIED_META_KEY, _P2_IMPLIED_VERSION],
+    )
+    conn.commit()
+    return {"chunks_processed": len(rows), "facts_added": n_facts, "skipped": False}
 
 
 def run_enhance(

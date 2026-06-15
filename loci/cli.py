@@ -1162,10 +1162,14 @@ def _question_template(subject: str, predicate: str, obj: str) -> str:
 def enhance_cmd(
     limit: Optional[int] = typer.Option(None, "--limit", help="Max chunks to process."),
     all_chunks: bool = typer.Option(False, "--all", help="Re-run on ALL chunks (reset extracted_v first). Needed for the P1 taxonomy re-extraction pass."),
+    passes: Optional[str] = typer.Option(None, "--passes", help="Comma-separated P2 passes: entity,implied. Omit for P1 chunk pass."),
     config_path: Optional[Path] = typer.Option(None, "--config", "-c"),
     low_mem: bool = typer.Option(False, "--low-mem"),
 ) -> None:
-    """LLM-assisted extraction pass: finds passives, copulas, and possessives."""
+    """LLM-assisted extraction pass: finds passives, copulas, and possessives.
+
+    --passes entity,implied  runs P2 cross-chunk and implication passes instead of the P1 chunk pass.
+    """
     try:
         cfg = cfg_module.load(config_path)
     except ValueError as exc:
@@ -1174,7 +1178,7 @@ def enhance_cmd(
 
     from loci.config import expanded
     from loci.store import open_db, get_unextracted_chunks
-    from loci.enhance import run_enhance
+    from loci.enhance import run_enhance, run_entity_pass, run_implied_pass
 
     cfg_exp = expanded(cfg)
 
@@ -1197,8 +1201,7 @@ def enhance_cmd(
         console.print(f"[red]Cannot open DB:[/red] {exc}")
         raise typer.Exit(1)
 
-    pending = len(get_unextracted_chunks(conn, limit=limit))
-    console.print(f"[bold]Enhancing[/bold] {pending} chunks with LLM extraction…")
+    requested_passes = {p.strip() for p in passes.split(",")} if passes else set()
 
     embedder = None
     _emb_ctx = None
@@ -1210,12 +1213,48 @@ def enhance_cmd(
         except Exception:
             pass
 
+    combined_stats: dict = {}
     try:
         with load_chat(cfg_exp, low_mem=low_mem) as llm:
-            with measure("enhance", log_dir=cfg_exp.paths.runtime_logs_dir) as counters:
-                stats = run_enhance(conn, llm=llm, cfg=cfg, embedder=embedder,
-                                    limit=limit, force_all=all_chunks)
-                counters.update(stats)
+            if not requested_passes:
+                # P1 chunk pass (original behaviour)
+                pending = len(get_unextracted_chunks(conn, limit=limit))
+                console.print(f"[bold]Enhancing[/bold] {pending} chunks with LLM extraction…")
+                with measure("enhance", log_dir=cfg_exp.paths.runtime_logs_dir) as counters:
+                    stats = run_enhance(conn, llm=llm, cfg=cfg, embedder=embedder,
+                                        limit=limit, force_all=all_chunks)
+                    counters.update(stats)
+                combined_stats = stats
+            else:
+                if "entity" in requested_passes:
+                    console.print("[bold]P2 entity pass[/bold] — cross-chunk entity-centric extraction…")
+                    with measure("enhance_entity", log_dir=cfg_exp.paths.runtime_logs_dir) as counters:
+                        stats = run_entity_pass(conn, llm=llm, cfg=cfg, embedder=embedder)
+                        counters.update(stats)
+                    console.print(
+                        f"  entities: {stats.get('entities_processed', 0)}"
+                        f"  new facts: {stats.get('facts_added', 0)}"
+                        + (" [dim](skipped — already done)[/dim]" if stats.get("skipped") else "")
+                    )
+                    combined_stats.update(stats)
+                if "implied" in requested_passes:
+                    console.print("[bold]P2 implied pass[/bold] — implication/archaic-vocab extraction…")
+                    with measure("enhance_implied", log_dir=cfg_exp.paths.runtime_logs_dir) as counters:
+                        stats = run_implied_pass(conn, llm=llm, cfg=cfg, embedder=embedder)
+                        counters.update(stats)
+                    console.print(
+                        f"  chunks: {stats.get('chunks_processed', 0)}"
+                        f"  new facts: {stats.get('facts_added', 0)}"
+                        + (" [dim](skipped — already done)[/dim]" if stats.get("skipped") else "")
+                    )
+                    combined_stats.update(stats)
+
+                # Rebuild FTS after P2 passes
+                from loci.store import rebuild_fact_fts
+                n_fts = rebuild_fact_fts(conn)
+                conn.execute("INSERT OR REPLACE INTO db_meta(key,value) VALUES ('fact_fts_v','1')")
+                conn.commit()
+                console.print(f"[green]FTS rebuilt[/green] ({n_fts} facts indexed)")
     finally:
         if _emb_ctx is not None:
             try:
@@ -1224,10 +1263,14 @@ def enhance_cmd(
                 pass
         conn.close()
 
-    console.print(
-        f"[green]Done.[/green]  chunks processed: {stats['chunks_processed']}"
-        f"  new facts: {stats['facts_added']}"
-    )
+    if not requested_passes:
+        stats = combined_stats
+        console.print(
+            f"[green]Done.[/green]  chunks processed: {stats['chunks_processed']}"
+            f"  new facts: {stats['facts_added']}"
+        )
+    else:
+        console.print(f"[green]P2 passes complete.[/green] Total new facts: {combined_stats.get('facts_added', 0)}")
 
 
 # ---------------------------------------------------------------------------
