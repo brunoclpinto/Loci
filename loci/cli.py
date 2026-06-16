@@ -1178,14 +1178,14 @@ def enhance_cmd(
 
     from loci.config import expanded
     from loci.store import open_db, get_unextracted_chunks
-    from loci.enhance import run_enhance, run_entity_pass, run_implied_pass, run_closure_pass
+    from loci.enhance import run_enhance, run_entity_pass, run_implied_pass, run_closure_pass, run_prune_pass
 
     cfg_exp = expanded(cfg)
 
     requested_passes = {p.strip() for p in passes.split(",")} if passes else set()
-    llm_passes = requested_passes - {"closure"}
+    llm_passes = requested_passes - {"closure", "prune"}
 
-    # Closure pass needs no LLM — validate model only when LLM passes are requested.
+    # Prune and closure passes need no LLM — validate model only when LLM passes are requested.
     if not requested_passes or llm_passes:
         if not _chat_model_exists(cfg_exp):
             console.print(
@@ -1259,6 +1259,28 @@ def enhance_cmd(
                     conn.execute("INSERT OR REPLACE INTO db_meta(key,value) VALUES ('fact_fts_v','1')")
                     conn.commit()
                     console.print(f"[green]FTS rebuilt[/green] ({n_fts} facts indexed)")
+
+        # Prune pass — removes misattributed llm/closure facts, resets closure_v
+        if "prune" in requested_passes:
+            console.print("[bold]Prune pass[/bold] — removing misattributed occupation facts…")
+            with measure("enhance_prune", log_dir=cfg_exp.paths.runtime_logs_dir) as counters:
+                stats = run_prune_pass(conn)
+                counters.update(stats)
+            console.print(
+                f"  removed llm: {stats.get('pruned_llm', 0)}"
+                f"  removed closure: {stats.get('pruned_closure', 0)}"
+            )
+            # Rebuild both FTS tables after pruning
+            from loci.store import rebuild_fact_fts, rebuild_fact_fts_llm, _FACT_FTS_LLM_VERSION
+            rebuild_fact_fts(conn)
+            conn.execute("INSERT OR REPLACE INTO db_meta(key,value) VALUES ('fact_fts_v','1')")
+            rebuild_fact_fts_llm(conn)
+            conn.execute(
+                "INSERT OR REPLACE INTO db_meta(key,value) VALUES ('fact_fts_llm_v',?)",
+                [_FACT_FTS_LLM_VERSION],
+            )
+            conn.commit()
+            combined_stats.update(stats)
 
         # Closure pass — no LLM required; runs after any LLM passes or standalone
         if "closure" in requested_passes:

@@ -13,6 +13,9 @@ _P2_ENTITY_VERSION = "1"
 _P2_IMPLIED_VERSION = "1"
 _CLOSURE_VERSION = "1"
 
+# Predicates that signal a contradicting occupation/role (used by prune pass)
+_ROLE_PREDICATES = frozenset(["title", "profession", "role", "occupation", "work_as"])
+
 # ---------------------------------------------------------------------------
 # P1 relation taxonomy — predicates that match question vocabulary
 # ---------------------------------------------------------------------------
@@ -548,6 +551,122 @@ def run_implied_pass(
     )
     conn.commit()
     return {"chunks_processed": len(rows), "facts_added": n_facts, "skipped": False}
+
+
+def run_prune_pass(
+    conn: Any,
+    *,
+    dry_run: bool = False,
+) -> dict:
+    """Remove likely misattributed llm/closure facts.
+
+    Detects entities that have a contradicting role/title/profession fact AND
+    also have facts with object_text matching occupation bridging terms (e.g.
+    'jarvey'). For those entities the bridging-term facts are almost certainly
+    caused by the entity appearing in the same passage as the true subject —
+    cross-entity contamination from the P2 entity/implied passes.
+
+    After pruning, also deletes closure facts derived from the removed llm
+    facts, then resets closure_v so the closure pass can re-run cleanly.
+
+    dry_run=True: report counts without deleting anything.
+    Returns: {pruned_llm, pruned_closure, dry_run}
+    """
+    # Vocabulary terms that act as "occupation bridges" — if an entity has
+    # these as object_text, and the entity also has a DIFFERENT role that
+    # contradicts it, the bridge fact is likely misattributed.
+    _BRIDGE_TERMS: frozenset[str] = frozenset(["jarvey"])
+
+    # Object texts that clearly signal the entity is NOT a jarvey/cab-driver.
+    # Any entity with these in a role/title/profession fact is safe to prune
+    # its bridge-term facts from.
+    _NONCAB_SIGNALS: frozenset[str] = frozenset([
+        "inspector", "detective", "constable", "sergeant", "physician",
+        "consulting detective", "scotland yard", "policeman", "officer",
+        "doctor",
+    ])
+
+    # Step 1: find entities with a contradicting role AND a bridge-term fact
+    role_rows = conn.execute(
+        """SELECT f.subject_id, LOWER(COALESCE(f.object_text, '')) AS obj
+           FROM facts f
+           WHERE f.predicate IN ('title','profession','role','occupation','work_as')
+             AND f.source IN ('llm','svo','coref')
+             AND NOT f.negated"""
+    ).fetchall()
+
+    # Map: entity_id → set of role/title objects
+    entity_roles: dict[int, set[str]] = {}
+    for r in role_rows:
+        eid = r[0] if isinstance(r, (list, tuple)) else r["subject_id"]
+        obj = r[1] if isinstance(r, (list, tuple)) else r["obj"]
+        entity_roles.setdefault(eid, set()).add(obj)
+
+    # Identify entities that have at least one noncab signal in their roles
+    noncab_entities: set[int] = {
+        eid for eid, roles in entity_roles.items()
+        if any(any(sig in role for sig in _NONCAB_SIGNALS) for role in roles)
+    }
+
+    # Find bridge-term llm facts for those entities
+    bridge_rows = conn.execute(
+        """SELECT f.id
+           FROM facts f
+           WHERE f.source IN ('llm', 'coref')
+             AND LOWER(COALESCE(f.object_text,'')) IN ({})
+        """.format(",".join(f"'{t}'" for t in _BRIDGE_TERMS))
+    ).fetchall()
+
+    bad_llm_ids = [
+        (r[0] if isinstance(r, (list, tuple)) else r["id"])
+        for r in bridge_rows
+    ]
+
+    # Filter to only entities identified as noncab
+    bad_llm_ids_filtered: list[int] = []
+    for fid in bad_llm_ids:
+        row = conn.execute("SELECT subject_id FROM facts WHERE id=?", [fid]).fetchone()
+        if row is None:
+            continue
+        sid = row[0] if isinstance(row, (list, tuple)) else row["subject_id"]
+        if sid in noncab_entities:
+            bad_llm_ids_filtered.append(fid)
+
+    # Step 2: find closure facts for the same subjects with derived bridge synonyms
+    # (e.g. subject|work_as|cab driver where subject is a noncab entity)
+    closure_rows = conn.execute(
+        "SELECT id, subject_id FROM facts WHERE source='closure'"
+    ).fetchall()
+    bad_closure_ids = [
+        (r[0] if isinstance(r, (list, tuple)) else r["id"])
+        for r in closure_rows
+        if (r[1] if isinstance(r, (list, tuple)) else r["subject_id"]) in noncab_entities
+    ]
+
+    if not dry_run:
+        if bad_llm_ids_filtered:
+            conn.execute(
+                "DELETE FROM facts WHERE id IN ({})".format(
+                    ",".join("?" * len(bad_llm_ids_filtered))
+                ),
+                bad_llm_ids_filtered,
+            )
+        if bad_closure_ids:
+            conn.execute(
+                "DELETE FROM facts WHERE id IN ({})".format(
+                    ",".join("?" * len(bad_closure_ids))
+                ),
+                bad_closure_ids,
+            )
+        # Reset closure_v so closure pass can re-run with clean data
+        conn.execute("DELETE FROM db_meta WHERE key=?", [_CLOSURE_META_KEY])
+        conn.commit()
+
+    return {
+        "pruned_llm": len(bad_llm_ids_filtered),
+        "pruned_closure": len(bad_closure_ids),
+        "dry_run": dry_run,
+    }
 
 
 def run_closure_pass(

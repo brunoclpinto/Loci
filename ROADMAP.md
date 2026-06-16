@@ -47,15 +47,14 @@ plan file (linked below) with full implementation detail, tests, bench, and succ
 > is load-bearing for Qwen2.5-3B). No candidate beats Qwen2.5-3B. **Incumbent stays (verbose prompt kept).**
 > Qwen2.5-7B (4.4 GB, on SSD) remains the only untested upgrade path.
 >
-> **Phase F (2026-06-16) — Fact Graph Closure + LLM-only FTS:** Built graph closure pass (run_closure_pass in
-> enhance.py): materialises X--[pred]-->Z from X--[pred]-->Y + Y--[means]-->Z at ingest time, no LLM calls.
-> Added fts_facts_llm table (llm+closure facts only, 688 entries) and routed fact_fts_search_question to use it
-> when fact_sources=minted — eliminating 4× SVO noise from FTS rankings. 44 chains found, 23 closure facts added
-> (key win: Young Jefferson Hope|work_as|cab driver). Bench closure+minted-4 runs=3: 62.45 (−1.90 vs M),
-> fact=40.78 (−3.67!), halluc=2. 🛑 FAIL — closure amplified upstream P2 attribution noise (Holmes/Lestrade/Drebber
-> misattributed as jarvey → now also appear as cab drivers and confuse the 3B model). Root cause: P2 entity+implied
-> passes produced wrong-subject facts that must be cleaned before closure can help. Infrastructure shipped with
-> max_facts=0 (default unchanged). fts_facts_llm + routing ready for Qwen2.5-7B.
+> **Phase F (2026-06-16) — Fact Graph Closure + LLM-only FTS:** Built graph closure pass (run_closure_pass),
+> prune pass (run_prune_pass), fts_facts_llm table, and source-filtered FTS routing. Bench sequence:
+> (1) closure+minted-4=62.45 (−1.90 vs M, halluc=2): closure amplified P2 noise (Holmes/Lestrade as cab drivers).
+> (2) prune(22 bad llm + 10 closure) + re-closure + minted-4=60.15 (−4.20, halluc=2): worse — removing noisy
+> facts changed what gets injected for para questions, para 47→37.5 (−9.5). Both attempts 🛑 FAIL. 3B bound is
+> immutable regardless of data quality: any imperfect fact injection causes regression. DB restored to pre-F state
+> (2024 facts, 665 llm, 0 closure, closure_v cleared). Infrastructure shipped max_facts=0 (unchanged):
+> run_closure_pass, run_prune_pass, fts_facts_llm ready for a stronger model. 218 tests passing.
 
 ---
 
@@ -72,7 +71,7 @@ plan file (linked below) with full implementation detail, tests, bench, and succ
 | 6 | **Q** — SVO quarantine + fact provenance | [planQ_quarantine.md](planQ_quarantine.md) | `DONE (🛑 FAIL; best arm=minted-4+fix=63.20, −1.15 vs M; halluc=2 persists; 3B bound; escalate to 4-5B)` | P1 | no (🛑 gate) |
 | 7 | **N** — base model selection | [planN_modelbench.md](planN_modelbench.md) | `DONE (🛑 no winner; Qwen2.5-3B stays incumbent; all candidates failed: Llama-3.2-3B=63.55 halluc=3, Qwen3.5-2B=52.55 halluc=5, Qwen3-1.7B=46.30 over-refuses, Gemma3-1B=41.0 halluc=18, Phi-4-mini=53.15 multi=0 RSS=3.6GB)` | Q | yes |
 | 8 | **P2** — multi-pass ingest | [planP2_multipass.md](planP2_multipass.md) | `DONE (🛑 FAIL on injection; ran ahead of N; entity+implied passes minted 285 new llm facts (380→665, 1739→2024 total); RACHE+Hope cab driver now correct; but minted-4 runs=3=61.70 −2.65 vs M, halluc=2 — same 3B bound as Q; injection off; data in DB ready for N winner)` | N (needs winning model first) | yes |
-| 9 | **F** — fact graph closure + LLM-only FTS | [jaunty-honking-hare.md](../.claude/plans/jaunty-honking-hare.md) | `DONE (🛑 FAIL; closure+minted-4=62.45 −1.90 vs M; fact=40.78 −3.67; halluc=2; closure amplified P2 attribution noise → Holmes/Lestrade/Drebber appear as cab drivers; infra shipped max_facts=0; fts_facts_llm+routing ready for 7B)` | P2 | no (🛑 gate) |
+| 9 | **F** — fact graph closure + LLM-only FTS + prune | [jaunty-honking-hare.md](../.claude/plans/jaunty-honking-hare.md) | `DONE (🛑 FAIL; closure=62.45 then prune+closure=60.15, both < M=64.35; 3B bound immutable; DB restored; infra ready for stronger model)` | P2 | no (🛑 gate) |
 
 > **Keep this table current.** When a phase finishes, set its `Status` to `DONE (overall=NN.N, fact=NN.N)`
 > and move to the next `TODO` row.

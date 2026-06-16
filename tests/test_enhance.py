@@ -14,6 +14,7 @@ from loci.enhance import (
     run_enhance,
     run_entity_pass,
     run_implied_pass,
+    run_prune_pass,
 )
 from loci.extract import extract_coref_facts
 
@@ -676,4 +677,86 @@ class TestRunClosurePass:
         conn.commit()
         stats = run_closure_pass(conn, cfg=default_cfg)
         assert stats["facts_added"] == 0
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Prune pass
+# ---------------------------------------------------------------------------
+
+def _make_prune_db(tmp_path):
+    """DB with:
+    - Lestrade|title|Inspector  (signals non-jarvey)
+    - Lestrade|work_as|jarvey   (bad llm fact → should be pruned)
+    - Hope|work_as|jarvey       (correct fact → should be kept)
+    """
+    from loci.store import open_db, insert_source, insert_chunk, insert_entity, insert_alias, insert_fact
+    conn = open_db(tmp_path / "prune.db")
+    src_id = insert_source(conn, path="p.txt", sha256="xpr")
+    cid = insert_chunk(conn, source_id=src_id, ordinal=0,
+                       text="Lestrade the Inspector drove a jarvey.", sha256="cpr")
+    lestrade_id = insert_entity(conn, canonical_name="Lestrade", kind="person")
+    insert_alias(conn, entity_id=lestrade_id, alias="lestrade")
+    hope_id = insert_entity(conn, canonical_name="Jefferson Hope", kind="person")
+    insert_alias(conn, entity_id=hope_id, alias="jefferson hope")
+
+    # Lestrade has a title fact → signals non-jarvey
+    insert_fact(conn, chunk_id=cid, sentence="Lestrade is Inspector.",
+                subject_id=lestrade_id, predicate="title",
+                object_text="Inspector", source="llm", confidence=0.75)
+    # Bad attribution
+    lestrade_jarvey_id = insert_fact(conn, chunk_id=cid, sentence="Lestrade drove a jarvey.",
+                                     subject_id=lestrade_id, predicate="work_as",
+                                     object_text="jarvey", source="llm", confidence=0.65)
+    # Correct fact for Hope — should survive
+    insert_fact(conn, chunk_id=cid, sentence="Hope worked as a jarvey.",
+                subject_id=hope_id, predicate="work_as",
+                object_text="jarvey", source="llm", confidence=0.65)
+    conn.commit()
+    return conn, lestrade_id, hope_id, lestrade_jarvey_id
+
+
+class TestRunPrunePass:
+    def test_removes_bad_attribution(self, tmp_path):
+        conn, lestrade_id, hope_id, bad_id = _make_prune_db(tmp_path)
+        stats = run_prune_pass(conn)
+        assert stats["pruned_llm"] >= 1
+        # Bad fact gone
+        assert conn.execute("SELECT id FROM facts WHERE id=?", [bad_id]).fetchone() is None
+        # Good Hope fact survives
+        row = conn.execute(
+            "SELECT id FROM facts WHERE subject_id=? AND object_text='jarvey'",
+            [hope_id]
+        ).fetchone()
+        assert row is not None
+        conn.close()
+
+    def test_dry_run_does_not_delete(self, tmp_path):
+        conn, lestrade_id, _, bad_id = _make_prune_db(tmp_path / "dry")
+        stats = run_prune_pass(conn, dry_run=True)
+        assert stats["dry_run"] is True
+        assert stats["pruned_llm"] >= 1
+        # Fact still present
+        assert conn.execute("SELECT id FROM facts WHERE id=?", [bad_id]).fetchone() is not None
+        conn.close()
+
+    def test_resets_closure_meta(self, tmp_path):
+        conn, _, _, _ = _make_prune_db(tmp_path / "meta")
+        conn.execute("INSERT OR REPLACE INTO db_meta(key,value) VALUES ('closure_v','1')")
+        conn.commit()
+        run_prune_pass(conn)
+        meta = conn.execute("SELECT value FROM db_meta WHERE key='closure_v'").fetchone()
+        assert meta is None
+        conn.close()
+
+    def test_removes_derived_closure_facts(self, tmp_path):
+        conn, lestrade_id, _, _ = _make_prune_db(tmp_path / "cl")
+        from loci.store import insert_fact as _if, insert_source, insert_chunk
+        # Simulate a closure fact for Lestrade
+        cl_id = _if(conn, chunk_id=1, sentence="Derived closure.",
+                    subject_id=lestrade_id, predicate="work_as",
+                    object_text="cab driver", source="closure", confidence=0.585)
+        conn.commit()
+        run_prune_pass(conn)
+        assert conn.execute("SELECT id FROM facts WHERE id=?", [cl_id]).fetchone() is None
         conn.close()
