@@ -6,9 +6,15 @@ import pytest
 
 from loci.enhance import (
     build_extraction_messages,
+    build_entity_messages,
+    build_implied_messages,
     enhance_chunk,
     parse_llm_facts,
+    run_closure_pass,
     run_enhance,
+    run_entity_pass,
+    run_implied_pass,
+    run_prune_pass,
 )
 from loci.extract import extract_coref_facts
 
@@ -105,7 +111,7 @@ class TestParseLlmFacts:
         assert facts[0]["negated"] is False
 
     def test_strips_markdown_fences(self):
-        raw = '```json\n[{"subject":"A","predicate":"b","object":"c","qualifiers":{},"negated":false}]\n```'
+        raw = '```json\n[{"subject":"A","predicate":"role","object":"c","qualifiers":{},"negated":false}]\n```'
         facts = parse_llm_facts(raw)
         assert len(facts) == 1
 
@@ -124,22 +130,51 @@ class TestParseLlmFacts:
         assert parse_llm_facts(raw) == []
 
     def test_predicate_lowercased(self):
-        raw = '[{"subject":"Holmes","predicate":"TAKE","object":"bottle","qualifiers":{},"negated":false}]'
+        raw = '[{"subject":"Holmes","predicate":"PROFESSION","object":"detective","qualifiers":{},"negated":false}]'
         facts = parse_llm_facts(raw)
-        assert facts[0]["predicate"] == "take"
+        assert len(facts) == 1
+        assert facts[0]["predicate"] == "profession"
 
     def test_multiple_facts(self):
         raw = json.dumps([
-            {"subject": "A", "predicate": "do", "object": "x", "qualifiers": {}, "negated": False},
+            {"subject": "A", "predicate": "role", "object": "x", "qualifiers": {}, "negated": False},
             {"subject": "B", "predicate": "be", "object": "y", "qualifiers": {}, "negated": True},
         ])
         facts = parse_llm_facts(raw)
         assert len(facts) == 2
 
     def test_negated_preserved(self):
-        raw = '[{"subject":"Holmes","predicate":"take","object":"drug","qualifiers":{},"negated":true}]'
+        raw = '[{"subject":"Holmes","predicate":"profession","object":"detective","qualifiers":{},"negated":true}]'
         facts = parse_llm_facts(raw)
         assert facts[0]["negated"] is True
+
+    def test_taxonomy_rejects_out_of_scope_predicate(self):
+        raw = '[{"subject":"Holmes","predicate":"take","object":"bottle","qualifiers":{},"negated":false}]'
+        facts = parse_llm_facts(raw)
+        assert facts == [], "predicates outside the taxonomy should be rejected"
+
+    def test_taxonomy_accepts_profession(self):
+        raw = '[{"subject":"Holmes","predicate":"profession","object":"consulting detective","qualifiers":{},"negated":false,"sentence":"I am a consulting detective."}]'
+        facts = parse_llm_facts(raw)
+        assert len(facts) == 1
+        assert facts[0]["predicate"] == "profession"
+        assert facts[0]["sentence"] == "I am a consulting detective."
+
+    def test_taxonomy_accepts_role(self):
+        raw = '[{"subject":"Mrs Hudson","predicate":"role","object":"landlady","qualifiers":{},"negated":false,"sentence":"Mrs Hudson, our landlady, knocked."}]'
+        facts = parse_llm_facts(raw)
+        assert len(facts) == 1
+        assert facts[0]["predicate"] == "role"
+
+    def test_sentence_field_extracted(self):
+        raw = '[{"subject":"Hope","predicate":"occupation","object":"cab driver","qualifiers":{},"negated":false,"sentence":"He worked as a cab driver."}]'
+        facts = parse_llm_facts(raw)
+        assert facts[0]["sentence"] == "He worked as a cab driver."
+
+    def test_sentence_field_absent_returns_none(self):
+        raw = '[{"subject":"Holmes","predicate":"be","object":"detective","qualifiers":{},"negated":false}]'
+        facts = parse_llm_facts(raw)
+        assert facts[0]["sentence"] is None
 
     def test_non_list_response_returns_empty(self):
         assert parse_llm_facts('{"subject":"X","predicate":"y","object":"z"}') == []
@@ -260,6 +295,41 @@ class TestRunEnhance:
         stats = run_enhance(conn, llm=fake_llm, cfg=default_cfg, limit=2)
         assert stats["chunks_processed"] == 2
         conn.close()
+
+    def test_force_all_reprocesses_extracted_chunks(self, tmp_path, fake_llm, default_cfg):
+        from loci.store import open_db, insert_source, insert_chunk
+        conn = open_db(tmp_path / "force.db")
+        src_id = insert_source(conn, path="f.txt", sha256="xforce")
+        insert_chunk(conn, source_id=src_id, ordinal=0,
+                     text="Holmes is a consulting detective.", sha256="cforce")
+        conn.commit()
+
+        # First run — marks chunk as extracted
+        run_enhance(conn, llm=fake_llm, cfg=default_cfg)
+        # Second run without force_all — nothing to process
+        stats2 = run_enhance(conn, llm=fake_llm, cfg=default_cfg)
+        assert stats2["chunks_processed"] == 0
+        # Third run with force_all — resets extracted_v and processes again
+        stats3 = run_enhance(conn, llm=fake_llm, cfg=default_cfg, force_all=True)
+        assert stats3["chunks_processed"] == 1
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# P1: build_extraction_messages with known_entities
+# ---------------------------------------------------------------------------
+
+class TestBuildExtractionMessagesP1:
+    def test_known_entities_in_user_message(self):
+        msgs = build_extraction_messages("Some text.", known_entities=["Sherlock Holmes", "Mrs Hudson"])
+        user = next(m for m in msgs if m["role"] == "user")
+        assert "Sherlock Holmes" in user["content"]
+        assert "Mrs Hudson" in user["content"]
+
+    def test_no_entities_still_works(self):
+        msgs = build_extraction_messages("Some text.")
+        user = next(m for m in msgs if m["role"] == "user")
+        assert "Some text." in user["content"]
 
 
 # ---------------------------------------------------------------------------
@@ -416,4 +486,277 @@ class TestExtractedV:
                          text=f"t{i}", sha256=f"cl{i}")
         conn.commit()
         assert len(get_unextracted_chunks(conn, limit=3)) == 3
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# P2 message builders
+# ---------------------------------------------------------------------------
+
+class TestP2MessageBuilders:
+    def test_entity_messages_has_system_and_user(self):
+        msgs = build_entity_messages("Holmes", "Some text about Holmes.")
+        assert msgs[0]["role"] == "system"
+        assert msgs[1]["role"] == "user"
+
+    def test_entity_messages_entity_in_system(self):
+        msgs = build_entity_messages("Mrs Hudson", "Text.")
+        assert "Mrs Hudson" in msgs[0]["content"]
+
+    def test_entity_messages_known_entities_in_user(self):
+        msgs = build_entity_messages("Holmes", "Text.", known_entities=["Watson", "Moriarty"])
+        assert "Watson" in msgs[1]["content"]
+
+    def test_implied_messages_has_system_and_user(self):
+        msgs = build_implied_messages("He drove a cab.")
+        assert msgs[0]["role"] == "system"
+        assert msgs[1]["role"] == "user"
+
+    def test_implied_messages_system_mentions_occupation(self):
+        msgs = build_implied_messages("text")
+        assert "occupation" in msgs[0]["content"] or "Occupation" in msgs[0]["content"]
+
+    def test_implied_messages_known_entities_in_user(self):
+        msgs = build_implied_messages("text", known_entities=["Holmes"])
+        assert "Holmes" in msgs[1]["content"]
+
+
+# ---------------------------------------------------------------------------
+# P2 pass runners
+# ---------------------------------------------------------------------------
+
+def _make_p2_db(tmp_path, fake_embedder, nlp, default_cfg):
+    from loci.store import open_db, insert_source, insert_chunk, insert_entity, insert_alias
+    conn = open_db(tmp_path / "p2.db")
+    src_id = insert_source(conn, path="f.txt", sha256="xp2")
+    chunk_id = insert_chunk(
+        conn, source_id=src_id, ordinal=0,
+        text="Mrs Hudson our landlady knocked on the door. Jefferson Hope drove the cab.",
+        sha256="cp2",
+    )
+    eid = insert_entity(conn, canonical_name="Mrs Hudson", kind="person")
+    insert_alias(conn, entity_id=eid, alias="mrs hudson")
+    eid2 = insert_entity(conn, canonical_name="Jefferson Hope", kind="person")
+    insert_alias(conn, entity_id=eid2, alias="jefferson hope")
+    conn.commit()
+    return conn, chunk_id
+
+
+class TestRunEntityPass:
+    def test_returns_stats(self, tmp_path, fake_embedder, nlp, default_cfg):
+        conn, _ = _make_p2_db(tmp_path, fake_embedder, nlp, default_cfg)
+        llm = FakeExtractLLM('[{"subject":"Mrs Hudson","predicate":"role","object":"landlady","qualifiers":{},"negated":false,"sentence":"Mrs Hudson our landlady knocked."}]')
+        stats = run_entity_pass(conn, llm=llm, cfg=default_cfg)
+        assert "entities_processed" in stats
+        assert "facts_added" in stats
+        conn.close()
+
+    def test_idempotent(self, tmp_path, fake_embedder, nlp, default_cfg):
+        conn, _ = _make_p2_db(tmp_path / "idem_ep", fake_embedder, nlp, default_cfg)
+        llm = FakeExtractLLM("[]")
+        run_entity_pass(conn, llm=llm, cfg=default_cfg)
+        stats2 = run_entity_pass(conn, llm=llm, cfg=default_cfg)
+        assert stats2.get("skipped") is True
+        assert stats2["entities_processed"] == 0
+        conn.close()
+
+    def test_inserts_source_llm(self, tmp_path, fake_embedder, nlp, default_cfg):
+        conn, _ = _make_p2_db(tmp_path / "src_ep", fake_embedder, nlp, default_cfg)
+        llm = FakeExtractLLM('[{"subject":"Mrs Hudson","predicate":"role","object":"landlady","qualifiers":{},"negated":false,"sentence":"Mrs Hudson our landlady."}]')
+        run_entity_pass(conn, llm=llm, cfg=default_cfg)
+        rows = conn.execute("SELECT source FROM facts WHERE source='llm'").fetchall()
+        assert len(rows) > 0
+        conn.close()
+
+
+class TestRunImpliedPass:
+    def test_returns_stats(self, tmp_path, fake_embedder, nlp, default_cfg):
+        conn, _ = _make_p2_db(tmp_path / "imp", fake_embedder, nlp, default_cfg)
+        llm = FakeExtractLLM('[{"subject":"Jefferson Hope","predicate":"occupation","object":"cab driver","qualifiers":{},"negated":false,"sentence":"Jefferson Hope drove the cab."}]')
+        stats = run_implied_pass(conn, llm=llm, cfg=default_cfg)
+        assert "chunks_processed" in stats
+        assert "facts_added" in stats
+        conn.close()
+
+    def test_idempotent(self, tmp_path, fake_embedder, nlp, default_cfg):
+        conn, _ = _make_p2_db(tmp_path / "idem_imp", fake_embedder, nlp, default_cfg)
+        llm = FakeExtractLLM("[]")
+        run_implied_pass(conn, llm=llm, cfg=default_cfg)
+        stats2 = run_implied_pass(conn, llm=llm, cfg=default_cfg)
+        assert stats2.get("skipped") is True
+        conn.close()
+
+    def test_processes_all_chunks(self, tmp_path, fake_embedder, nlp, default_cfg):
+        from loci.store import open_db, insert_source, insert_chunk
+        conn = open_db(tmp_path / "allc.db")
+        src_id = insert_source(conn, path="f.txt", sha256="xallc")
+        for i in range(3):
+            insert_chunk(conn, source_id=src_id, ordinal=i, text=f"Chunk {i}.", sha256=f"callc{i}")
+        conn.commit()
+        llm = FakeExtractLLM("[]")
+        stats = run_implied_pass(conn, llm=llm, cfg=default_cfg)
+        assert stats["chunks_processed"] == 3
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Closure pass
+# ---------------------------------------------------------------------------
+
+def _make_closure_db(tmp_path):
+    """DB with Hope|work_as|jarvey + jarvey|means|cab driver ready for closure."""
+    from loci.store import open_db, insert_source, insert_chunk, insert_entity, insert_alias, insert_fact
+    conn = open_db(tmp_path / "closure.db")
+    src_id = insert_source(conn, path="c.txt", sha256="xcl")
+    chunk_id = insert_chunk(conn, source_id=src_id, ordinal=0,
+                            text="Hope drove a jarvey.", sha256="ccl")
+    hope_id = insert_entity(conn, canonical_name="Jefferson Hope", kind="person")
+    insert_alias(conn, entity_id=hope_id, alias="jefferson hope")
+    jarvey_id = insert_entity(conn, canonical_name="jarvey", kind="concept")
+    insert_alias(conn, entity_id=jarvey_id, alias="jarvey")
+    # Hope|work_as|jarvey (object_text, not object_id)
+    insert_fact(conn, chunk_id=chunk_id, sentence="Hope drove a jarvey.",
+                subject_id=hope_id, predicate="work_as", object_text="jarvey",
+                confidence=0.75, source="llm")
+    # jarvey|means|cab driver
+    insert_fact(conn, chunk_id=chunk_id, sentence="A jarvey means a cab driver.",
+                subject_id=jarvey_id, predicate="means", object_text="cab driver",
+                confidence=0.9, source="llm")
+    conn.commit()
+    return conn, hope_id, jarvey_id
+
+
+class TestRunClosurePass:
+    def test_basic(self, tmp_path, default_cfg):
+        conn, hope_id, _ = _make_closure_db(tmp_path)
+        stats = run_closure_pass(conn, cfg=default_cfg)
+        assert stats["facts_added"] >= 1
+        assert stats["chains_found"] >= 1
+        row = conn.execute(
+            "SELECT source, object_text FROM facts WHERE subject_id=? AND predicate='work_as' AND object_text='cab driver'",
+            [hope_id],
+        ).fetchone()
+        assert row is not None
+        assert row["source"] == "closure"
+        conn.close()
+
+    def test_idempotent(self, tmp_path, default_cfg):
+        conn, _, _ = _make_closure_db(tmp_path / "idem_cl")
+        run_closure_pass(conn, cfg=default_cfg)
+        stats2 = run_closure_pass(conn, cfg=default_cfg)
+        assert stats2.get("skipped") is True
+        assert stats2["facts_added"] == 0
+        conn.close()
+
+    def test_skips_means_facts(self, tmp_path, default_cfg):
+        conn, _, jarvey_id = _make_closure_db(tmp_path / "nomeans")
+        run_closure_pass(conn, cfg=default_cfg)
+        # jarvey|means|cab driver should not spawn jarvey|means|<something else>
+        rows = conn.execute(
+            "SELECT * FROM facts WHERE subject_id=? AND predicate='means' AND source='closure'",
+            [jarvey_id],
+        ).fetchall()
+        assert len(rows) == 0
+        conn.close()
+
+    def test_skips_negated(self, tmp_path, default_cfg):
+        from loci.store import open_db, insert_source, insert_chunk, insert_entity, insert_alias, insert_fact
+        conn = open_db(tmp_path / "neg_cl.db")
+        src_id = insert_source(conn, path="n.txt", sha256="xneg")
+        cid = insert_chunk(conn, source_id=src_id, ordinal=0, text="Not a jarvey.", sha256="cneg")
+        eid = insert_entity(conn, canonical_name="Holmes", kind="person")
+        insert_alias(conn, entity_id=eid, alias="holmes")
+        jid = insert_entity(conn, canonical_name="jarvey", kind="concept")
+        # negated source fact
+        insert_fact(conn, chunk_id=cid, sentence="Holmes was not a jarvey.",
+                    subject_id=eid, predicate="work_as", object_text="jarvey",
+                    negated=True, confidence=0.75, source="llm")
+        insert_fact(conn, chunk_id=cid, sentence="A jarvey means a cab driver.",
+                    subject_id=jid, predicate="means", object_text="cab driver",
+                    confidence=0.9, source="llm")
+        conn.commit()
+        stats = run_closure_pass(conn, cfg=default_cfg)
+        assert stats["facts_added"] == 0
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Prune pass
+# ---------------------------------------------------------------------------
+
+def _make_prune_db(tmp_path):
+    """DB with:
+    - Lestrade|title|Inspector  (signals non-jarvey)
+    - Lestrade|work_as|jarvey   (bad llm fact → should be pruned)
+    - Hope|work_as|jarvey       (correct fact → should be kept)
+    """
+    from loci.store import open_db, insert_source, insert_chunk, insert_entity, insert_alias, insert_fact
+    conn = open_db(tmp_path / "prune.db")
+    src_id = insert_source(conn, path="p.txt", sha256="xpr")
+    cid = insert_chunk(conn, source_id=src_id, ordinal=0,
+                       text="Lestrade the Inspector drove a jarvey.", sha256="cpr")
+    lestrade_id = insert_entity(conn, canonical_name="Lestrade", kind="person")
+    insert_alias(conn, entity_id=lestrade_id, alias="lestrade")
+    hope_id = insert_entity(conn, canonical_name="Jefferson Hope", kind="person")
+    insert_alias(conn, entity_id=hope_id, alias="jefferson hope")
+
+    # Lestrade has a title fact → signals non-jarvey
+    insert_fact(conn, chunk_id=cid, sentence="Lestrade is Inspector.",
+                subject_id=lestrade_id, predicate="title",
+                object_text="Inspector", source="llm", confidence=0.75)
+    # Bad attribution
+    lestrade_jarvey_id = insert_fact(conn, chunk_id=cid, sentence="Lestrade drove a jarvey.",
+                                     subject_id=lestrade_id, predicate="work_as",
+                                     object_text="jarvey", source="llm", confidence=0.65)
+    # Correct fact for Hope — should survive
+    insert_fact(conn, chunk_id=cid, sentence="Hope worked as a jarvey.",
+                subject_id=hope_id, predicate="work_as",
+                object_text="jarvey", source="llm", confidence=0.65)
+    conn.commit()
+    return conn, lestrade_id, hope_id, lestrade_jarvey_id
+
+
+class TestRunPrunePass:
+    def test_removes_bad_attribution(self, tmp_path):
+        conn, lestrade_id, hope_id, bad_id = _make_prune_db(tmp_path)
+        stats = run_prune_pass(conn)
+        assert stats["pruned_llm"] >= 1
+        # Bad fact gone
+        assert conn.execute("SELECT id FROM facts WHERE id=?", [bad_id]).fetchone() is None
+        # Good Hope fact survives
+        row = conn.execute(
+            "SELECT id FROM facts WHERE subject_id=? AND object_text='jarvey'",
+            [hope_id]
+        ).fetchone()
+        assert row is not None
+        conn.close()
+
+    def test_dry_run_does_not_delete(self, tmp_path):
+        conn, lestrade_id, _, bad_id = _make_prune_db(tmp_path / "dry")
+        stats = run_prune_pass(conn, dry_run=True)
+        assert stats["dry_run"] is True
+        assert stats["pruned_llm"] >= 1
+        # Fact still present
+        assert conn.execute("SELECT id FROM facts WHERE id=?", [bad_id]).fetchone() is not None
+        conn.close()
+
+    def test_resets_closure_meta(self, tmp_path):
+        conn, _, _, _ = _make_prune_db(tmp_path / "meta")
+        conn.execute("INSERT OR REPLACE INTO db_meta(key,value) VALUES ('closure_v','1')")
+        conn.commit()
+        run_prune_pass(conn)
+        meta = conn.execute("SELECT value FROM db_meta WHERE key='closure_v'").fetchone()
+        assert meta is None
+        conn.close()
+
+    def test_removes_derived_closure_facts(self, tmp_path):
+        conn, lestrade_id, _, _ = _make_prune_db(tmp_path / "cl")
+        from loci.store import insert_fact as _if, insert_source, insert_chunk
+        # Simulate a closure fact for Lestrade
+        cl_id = _if(conn, chunk_id=1, sentence="Derived closure.",
+                    subject_id=lestrade_id, predicate="work_as",
+                    object_text="cab driver", source="closure", confidence=0.585)
+        conn.commit()
+        run_prune_pass(conn)
+        assert conn.execute("SELECT id FROM facts WHERE id=?", [cl_id]).fetchone() is None
         conn.close()

@@ -47,6 +47,13 @@ def fake_embedder():
 
 @pytest.fixture(scope="session")
 def default_cfg():
-    """Bare default config — no file loading, no path expansion."""
+    """Bare default config — no file loading, no path expansion.
+
+    Pins max_facts_in_context > 0 so fact-FTS *mechanism* tests exercise the
+    [F#] injection path. The production default is 0 (fact-FTS neutralized to
+    the bench baseline); these tests verify the mechanism, not that default.
+    """
     from loci.config import Config
-    return Config()
+    cfg = Config()
+    cfg.retrieval.max_facts_in_context = 4
+    return cfg

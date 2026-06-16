@@ -20,6 +20,10 @@ _NO_CONTEXT_NOTE = ""  # prompt rule 4 already covers the no-context case
 
 _PREFILL = "Based on the provided context: "
 
+# When set, prepended to every user message to suppress Qwen3 chain-of-thought.
+# Enable via: LOCI_MODELS__NO_THINK=1 (checked at build_messages time).
+_NO_THINK_PREFIX = "/no_think\n"
+
 _TAG_RE = re.compile(r"\[([FC]\d+)\]")
 
 
@@ -37,16 +41,20 @@ def build_messages(
     history contains alternating user/assistant dicts from previous turns.
     Fresh context is injected into the current user message each turn.
     """
+    import os
+    no_think = os.environ.get("LOCI_MODELS__NO_THINK", "").strip() in ("1", "true", "yes")
+    prefix = _NO_THINK_PREFIX if no_think else ""
+
     sys_content = _SYSTEM_PROMPT
     if not context_text.strip():
         sys_content += _NO_CONTEXT_NOTE
-        user_content = f"Question: {question}"
+        user_content = f"{prefix}Question: {question}"
         messages: list[dict] = [{"role": "system", "content": sys_content}]
         messages.extend(history)
         messages.append({"role": "user", "content": user_content})
     else:
         user_content = (
-            f"Context:\n{context_text}\n\n"
+            f"{prefix}Context:\n{context_text}\n\n"
             f"Question: {question}\n"
             f"Answer with inline citations ([C#] or [F#]):"
         )

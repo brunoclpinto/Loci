@@ -7,16 +7,21 @@ import pytest
 from loci.store import (
     attach_pack,
     fts_search_chunks,
+    fts_search_facts,
     insert_alias,
     insert_chunk,
     insert_entity,
     insert_fact,
     insert_source,
     open_db,
+    rebuild_fact_fts,
+    rebuild_fact_fts_llm,
+    rebuild_fact_vec,
     upsert_vec_chunk,
     upsert_vec_entity,
     vec_search_chunks,
     vec_search_entities,
+    vec_search_facts,
 )
 
 
@@ -256,3 +261,248 @@ class TestAttach:
         assert total == 5
 
         main_conn.close()
+
+
+# ---------------------------------------------------------------------------
+# fts_facts: rebuild, search, idempotency, backfill
+# ---------------------------------------------------------------------------
+
+def _seed_landlady_fact(conn):
+    """Insert entity+chunk+fact for 'Mrs Hudson — role — landlady'."""
+    src_id = insert_source(conn, sha256=sha("src_landlady"), title="Test")
+    chunk_id = insert_chunk(
+        conn, source_id=src_id, ordinal=0,
+        text="Mrs. Hudson, our landlady, brought tea.",
+        sha256=sha("chunk_landlady"),
+    )
+    eid = insert_entity(conn, canonical_name="Mrs Hudson", kind="person")
+    insert_alias(conn, entity_id=eid, alias="mrs hudson")
+    fact_id = insert_fact(
+        conn, chunk_id=chunk_id,
+        sentence="Mrs. Hudson, our landlady, brought tea.",
+        subject_id=eid, predicate="role", object_text="landlady",
+    )
+    return fact_id
+
+
+class TestFtsFacts:
+    def test_rebuild_count_matches_facts(self, tmp_db):
+        _seed_landlady_fact(tmp_db)
+        n = rebuild_fact_fts(tmp_db)
+        db_n = tmp_db.execute("SELECT COUNT(*) FROM facts").fetchone()[0]
+        assert n == db_n
+        assert tmp_db.execute("SELECT COUNT(*) FROM fts_facts").fetchone()[0] == db_n
+
+    def test_search_finds_object_keyword(self, tmp_db):
+        fact_id = _seed_landlady_fact(tmp_db)
+        rebuild_fact_fts(tmp_db)
+        results = fts_search_facts(tmp_db, query="landlady", k=5)
+        ids = [r["fact_id"] for r in results]
+        assert fact_id in ids
+
+    def test_idempotent_rebuild(self, tmp_db):
+        _seed_landlady_fact(tmp_db)
+        n1 = rebuild_fact_fts(tmp_db)
+        n2 = rebuild_fact_fts(tmp_db)
+        assert n1 == n2
+        assert tmp_db.execute("SELECT COUNT(*) FROM fts_facts").fetchone()[0] == n1
+
+    def test_backfill_on_reopen(self, tmp_path):
+        db_path = tmp_path / "backfill.db"
+        conn = open_db(db_path)
+        _seed_landlady_fact(conn)
+        conn.close()
+
+        conn2 = open_db(db_path)
+        count = conn2.execute("SELECT COUNT(*) FROM fts_facts").fetchone()[0]
+        meta = conn2.execute(
+            "SELECT value FROM db_meta WHERE key='fact_fts_v'"
+        ).fetchone()
+        conn2.close()
+        assert count > 0
+        assert meta is not None and meta[0] == "1"
+
+
+# ---------------------------------------------------------------------------
+# vec_facts: Phase B — rebuild, search, idempotency
+# ---------------------------------------------------------------------------
+
+class TestVecFacts:
+    def test_vec_facts_table_exists(self, tmp_db):
+        names = {r[0] for r in tmp_db.execute("SELECT name FROM sqlite_master")}
+        assert "vec_facts" in names
+
+    def test_rebuild_fact_vec_returns_count(self, tmp_db, fake_embedder):
+        _seed_landlady_fact(tmp_db)
+        n = rebuild_fact_vec(tmp_db, fake_embedder)
+        db_n = tmp_db.execute("SELECT COUNT(*) FROM facts").fetchone()[0]
+        assert n == db_n
+
+    def test_vec_search_facts_returns_hit(self, tmp_db, fake_embedder):
+        _seed_landlady_fact(tmp_db)
+        rebuild_fact_vec(tmp_db, fake_embedder)
+        from loci.models import embed_batch
+        emb = embed_batch(fake_embedder, ["landlady role"], normalize=True)[0]
+        results = vec_search_facts(tmp_db, embedding=emb, k=5)
+        assert len(results) > 0
+        assert "fact_id" in results[0]
+        assert "distance" in results[0]
+
+    def test_rebuild_fact_vec_idempotent(self, tmp_db, fake_embedder):
+        _seed_landlady_fact(tmp_db)
+        n1 = rebuild_fact_vec(tmp_db, fake_embedder)
+        n2 = rebuild_fact_vec(tmp_db, fake_embedder)
+        assert n1 == n2
+        count = tmp_db.execute("SELECT COUNT(*) FROM vec_facts").fetchone()[0]
+        assert count == n1
+
+    def test_vec_search_facts_empty_when_not_populated(self, tmp_db, flat_embedding):
+        results = vec_search_facts(tmp_db, embedding=flat_embedding, k=5)
+        assert results == []
+
+
+# ---------------------------------------------------------------------------
+# Phase Q — source provenance column + backfill
+# ---------------------------------------------------------------------------
+
+class TestFactSourceColumn:
+    def test_source_column_exists(self, tmp_db):
+        cols = {r[1] for r in tmp_db.execute("PRAGMA table_info(facts)").fetchall()}
+        assert "source" in cols
+
+    def test_insert_fact_stores_source(self, tmp_db):
+        src_id = insert_source(tmp_db, sha256=sha("src_q"), title="Q")
+        chunk_id = insert_chunk(tmp_db, source_id=src_id, ordinal=0,
+                                text="text", sha256=sha("text_q"))
+        eid = insert_entity(tmp_db, canonical_name="Holmes")
+        fid = insert_fact(tmp_db, chunk_id=chunk_id, sentence="s",
+                          subject_id=eid, predicate="role",
+                          object_text="detective", source="llm")
+        row = tmp_db.execute("SELECT source FROM facts WHERE id=?", [fid]).fetchone()
+        assert row["source"] == "llm"
+
+    def test_backfill_runs_on_existing_db(self, tmp_path):
+        """Open a fresh DB that has no fact_source_v meta; backfill must fire."""
+        conn = open_db(tmp_path / "backfill.db")
+        src_id = insert_source(conn, sha256=sha("bf_src"), title="BF")
+        chunk_id = insert_chunk(conn, source_id=src_id, ordinal=0,
+                                text="t", sha256=sha("bf_t"))
+        eid = insert_entity(conn, canonical_name="Watson")
+        # Insert fact with confidence=0.7 (pre-source era: simulates llm fact)
+        conn.execute(
+            "INSERT INTO facts(chunk_id, sentence, subject_id, predicate, object_text, confidence)"
+            " VALUES (?,?,?,?,?,?)",
+            [chunk_id, "s", eid, "role", "doctor", 0.7],
+        )
+        conn.commit()
+        # Remove the meta key so backfill triggers on next open
+        conn.execute("DELETE FROM db_meta WHERE key='fact_source_v'")
+        conn.commit()
+        conn.close()
+
+        conn2 = open_db(tmp_path / "backfill.db")
+        row = conn2.execute(
+            "SELECT source FROM facts WHERE predicate='role'"
+        ).fetchone()
+        conn2.close()
+        assert row["source"] == "llm"
+
+    def test_backfill_svo_confidence(self, tmp_path):
+        conn = open_db(tmp_path / "backfill2.db")
+        src_id = insert_source(conn, sha256=sha("svo_src"), title="SVO")
+        chunk_id = insert_chunk(conn, source_id=src_id, ordinal=0,
+                                text="t2", sha256=sha("svo_t"))
+        eid = insert_entity(conn, canonical_name="Hope")
+        conn.execute(
+            "INSERT INTO facts(chunk_id, sentence, subject_id, predicate, object_text, confidence)"
+            " VALUES (?,?,?,?,?,?)",
+            [chunk_id, "s", eid, "drive", "cab", 1.0],
+        )
+        conn.commit()
+        conn.execute("DELETE FROM db_meta WHERE key='fact_source_v'")
+        conn.commit()
+        conn.close()
+
+        conn2 = open_db(tmp_path / "backfill2.db")
+        row = conn2.execute(
+            "SELECT source FROM facts WHERE predicate='drive'"
+        ).fetchone()
+        conn2.close()
+        assert row["source"] == "svo"
+
+
+# ---------------------------------------------------------------------------
+# fts_facts_llm — llm+closure only index
+# ---------------------------------------------------------------------------
+
+def _seed_mixed_sources(conn):
+    """Insert one svo fact and one llm fact into the same DB."""
+    src_id = insert_source(conn, sha256=sha("mix_src"), title="Mix")
+    chunk_id = insert_chunk(conn, source_id=src_id, ordinal=0,
+                            text="Holmes took a cab.", sha256=sha("mix_chunk"))
+    eid = insert_entity(conn, canonical_name="Holmes", kind="person")
+    svo_id = insert_fact(conn, chunk_id=chunk_id,
+                         sentence="Holmes took a cab.",
+                         subject_id=eid, predicate="take",
+                         object_text="cab", source="svo")
+    llm_id = insert_fact(conn, chunk_id=chunk_id,
+                         sentence="Holmes is a consulting detective.",
+                         subject_id=eid, predicate="profession",
+                         object_text="consulting detective", source="llm")
+    return svo_id, llm_id, eid
+
+
+class TestFtsFactsLLM:
+    def test_table_exists(self, tmp_db):
+        names = {r[0] for r in tmp_db.execute("SELECT name FROM sqlite_master")}
+        assert "fts_facts_llm" in names
+
+    def test_rebuild_excludes_svo(self, tmp_db):
+        svo_id, llm_id, _ = _seed_mixed_sources(tmp_db)
+        n = rebuild_fact_fts_llm(tmp_db)
+        assert n == 1  # only the llm fact
+        rows = tmp_db.execute("SELECT rowid FROM fts_facts_llm").fetchall()
+        ids = {r[0] for r in rows}
+        assert llm_id in ids
+        assert svo_id not in ids
+
+    def test_rebuild_includes_closure(self, tmp_db):
+        _, _, eid = _seed_mixed_sources(tmp_db)
+        src_id = insert_source(tmp_db, sha256=sha("cl_src"), title="Cl")
+        chunk_id = insert_chunk(tmp_db, source_id=src_id, ordinal=0,
+                                text="Derived.", sha256=sha("cl_chunk"))
+        cl_id = insert_fact(tmp_db, chunk_id=chunk_id,
+                            sentence="Derived: Holmes profession detective.",
+                            subject_id=eid, predicate="profession",
+                            object_text="detective", source="closure")
+        rebuild_fact_fts_llm(tmp_db)
+        rows = tmp_db.execute("SELECT rowid FROM fts_facts_llm").fetchall()
+        ids = {r[0] for r in rows}
+        assert cl_id in ids
+
+    def test_idempotent_rebuild(self, tmp_db):
+        _seed_mixed_sources(tmp_db)
+        n1 = rebuild_fact_fts_llm(tmp_db)
+        n2 = rebuild_fact_fts_llm(tmp_db)
+        assert n1 == n2
+        assert tmp_db.execute("SELECT COUNT(*) FROM fts_facts_llm").fetchone()[0] == n1
+
+    def test_excludes_generic_predicate(self, tmp_db):
+        src_id = insert_source(tmp_db, sha256=sha("gp_src"), title="GP")
+        chunk_id = insert_chunk(tmp_db, source_id=src_id, ordinal=0,
+                                text="Holmes said something.", sha256=sha("gp_chunk"))
+        eid = insert_entity(tmp_db, canonical_name="Holmes", kind="person")
+        generic_id = insert_fact(tmp_db, chunk_id=chunk_id,
+                                 sentence="Holmes said something.",
+                                 subject_id=eid, predicate="be",
+                                 object_text="something", source="llm")
+        shaped_id = insert_fact(tmp_db, chunk_id=chunk_id,
+                                sentence="Holmes works as a detective.",
+                                subject_id=eid, predicate="work_as",
+                                object_text="detective", source="llm")
+        n = rebuild_fact_fts_llm(tmp_db)
+        assert n == 1
+        rows = tmp_db.execute("SELECT rowid FROM fts_facts_llm").fetchall()
+        ids = {r[0] for r in rows}
+        assert shaped_id in ids
+        assert generic_id not in ids

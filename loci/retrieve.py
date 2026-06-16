@@ -59,6 +59,8 @@ class FactHit:
     chunk_id: int
     source_info: str | None
     score: float                 # 1.0 exact predicate, 0.8 via synonym
+    subject_id: int = 0          # for relevance gate
+    object_id: int | None = None # for relevance gate
 
 
 @dataclass
@@ -219,12 +221,89 @@ def get_synonyms(
 # Fact lookup (SQL)
 # ---------------------------------------------------------------------------
 
+def load_fact_hits_by_ids(
+    conn: sqlite3.Connection,
+    fact_ids: list[int],
+    schema: str = "main",
+    source_filter: set[str] | None = None,
+) -> list[FactHit]:
+    """Fetch FactHit objects for a ranked list of fact_ids (FTS results).
+
+    Preserves the ranking order from the input list; scores descend from 0.70
+    so SQL-exact hits (1.0/0.8) always sort above these FTS hits.
+    When source_filter is set, only facts whose source is in the set are returned.
+    """
+    if not fact_ids:
+        return []
+    sp = f"{schema}." if schema != "main" else ""
+    id_ph = ",".join("?" * len(fact_ids))
+    src_clause = ""
+    src_params: list = []
+    if source_filter:
+        src_ph = ",".join("?" * len(source_filter))
+        src_clause = f"AND f.source IN ({src_ph})"
+        src_params = sorted(source_filter)
+    rows = conn.execute(
+        f"""
+        SELECT
+            f.id, f.subject_id, f.predicate, f.object_text, f.object_id, f.qualifiers,
+            f.negated, f.sentence, f.chunk_id,
+            e.canonical_name AS subject_name,
+            oe.canonical_name AS object_entity_name,
+            s.title, s.path
+        FROM {sp}facts f
+        JOIN {sp}entities e ON f.subject_id = e.id
+        LEFT JOIN {sp}entities oe ON f.object_id = oe.id
+        JOIN {sp}chunks c ON f.chunk_id = c.id
+        LEFT JOIN {sp}sources s ON c.source_id = s.id
+        WHERE f.id IN ({id_ph})
+          AND (f.object_text IS NOT NULL OR f.object_id IS NOT NULL)
+          AND length(e.canonical_name) <= 60
+          AND instr(e.canonical_name, ',') = 0
+          AND instr(e.canonical_name, char(10)) = 0
+          {src_clause}
+        """,
+        fact_ids + src_params,
+    ).fetchall()
+    id_to_row = {r["id"]: r for r in rows}
+    hits = []
+    for rank, fid in enumerate(fact_ids):
+        r = id_to_row.get(fid)
+        if r is None:
+            continue
+        # Skip facts whose subject name is entirely lowercase (common noun phrases
+        # treated as entities by spaCy, e.g. "address", "young hunter", "door").
+        # Real story entities have at least one uppercase letter in their name.
+        sn = r["subject_name"] or ""
+        if sn and sn == sn.lower():
+            continue
+        quals = json.loads(r["qualifiers"]) if r["qualifiers"] else None
+        hits.append(FactHit(
+            fact_id=r["id"],
+            tag="",  # renumbered later
+            subject_name=sn,
+            predicate=r["predicate"],
+            object_text=r["object_text"],
+            object_entity_name=r["object_entity_name"],
+            qualifiers=quals,
+            negated=bool(r["negated"]),
+            sentence=r["sentence"],
+            chunk_id=r["chunk_id"],
+            source_info=_source_info(r["title"], r["path"]),
+            score=0.7 - 0.01 * rank,
+            subject_id=r["subject_id"],
+            object_id=r["object_id"],
+        ))
+    return hits
+
+
 def fact_lookup(
     conn: sqlite3.Connection,
     entity_ids: list[int],
     predicate: str | None,
     synonyms: set[str],
     schema: str = "main",
+    source_filter: set[str] | None = None,
 ) -> list[FactHit]:
     """Indexed SQL lookup: (subject_id IN ...) AND (predicate IN ...)."""
     if not entity_ids or not predicate:
@@ -234,11 +313,17 @@ def fact_lookup(
     all_predicates = [predicate] + sorted(synonyms)
     id_ph = ",".join("?" * len(entity_ids))
     pred_ph = ",".join("?" * len(all_predicates))
+    src_clause = ""
+    src_params: list = []
+    if source_filter:
+        src_ph = ",".join("?" * len(source_filter))
+        src_clause = f"AND f.source IN ({src_ph})"
+        src_params = sorted(source_filter)
 
     rows = conn.execute(
         f"""
         SELECT
-            f.id, f.predicate, f.object_text, f.object_id, f.qualifiers,
+            f.id, f.subject_id, f.predicate, f.object_text, f.object_id, f.qualifiers,
             f.negated, f.sentence, f.chunk_id,
             e.canonical_name AS subject_name,
             oe.canonical_name AS object_entity_name,
@@ -255,9 +340,10 @@ def fact_lookup(
           AND length(e.canonical_name) <= 60
           AND instr(e.canonical_name, ',') = 0
           AND instr(e.canonical_name, char(10)) = 0
+          {src_clause}
         ORDER BY score DESC, f.id
         """,
-        [predicate] + entity_ids + all_predicates,
+        [predicate] + entity_ids + all_predicates + src_params,
     ).fetchall()
 
     hits = []
@@ -276,6 +362,8 @@ def fact_lookup(
             chunk_id=r["chunk_id"],
             source_info=_source_info(r["title"], r["path"]),
             score=r["score"],
+            subject_id=r["subject_id"],
+            object_id=r["object_id"],
         ))
     return hits
 
@@ -290,15 +378,71 @@ def vec_search_question(
     question: str,
     k: int,
     schema: str = "main",
+    *,
+    embedding: list[float] | None = None,
 ) -> list[int]:
-    """Embed question and return top-k chunk_ids by vector similarity."""
-    from loci.models import embed_batch
+    """Embed question (or reuse provided embedding) and return top-k chunk_ids."""
     from loci.store import vec_search_chunks
-    vecs = embed_batch(embedder, [question], normalize=True)
-    if not vecs:
-        return []
-    results = vec_search_chunks(conn, embedding=vecs[0], k=k, schema=schema)
+    if embedding is None:
+        from loci.models import embed_batch
+        vecs = embed_batch(embedder, [question], normalize=True)
+        if not vecs:
+            return []
+        embedding = vecs[0]
+    results = vec_search_chunks(conn, embedding=embedding, k=k, schema=schema)
     return [r["chunk_id"] for r in results]
+
+
+def vec_fact_search_question(
+    conn: sqlite3.Connection,
+    embedding: list[float],
+    k: int,
+    schema: str = "main",
+) -> list[tuple[int, float]]:
+    """Return top-k (fact_id, distance) pairs from vec_facts using a pre-computed embedding."""
+    from loci.store import vec_search_facts
+    try:
+        results = vec_search_facts(conn, embedding=embedding, k=k, schema=schema)
+        return [(r["fact_id"], r["distance"]) for r in results]
+    except Exception:
+        return []
+
+
+def canonical_names_for_facts(
+    conn: sqlite3.Connection,
+    fact_ids: list[int],
+    schema: str = "main",
+) -> list[str]:
+    """Return distinct canonical entity names (subject + object) for the given facts.
+
+    Only proper-noun-ish names (has uppercase, no comma, length ≤ 60) are returned.
+    Used by expand mode to inject bridge names into the chunk query.
+    """
+    if not fact_ids:
+        return []
+    sp = f"{schema}." if schema != "main" else ""
+    id_ph = ",".join("?" * len(fact_ids))
+    rows = conn.execute(
+        f"""SELECT DISTINCT name FROM (
+              SELECT e.canonical_name AS name
+              FROM {sp}facts f JOIN {sp}entities e ON f.subject_id = e.id
+              WHERE f.id IN ({id_ph})
+              UNION
+              SELECT COALESCE(oe.canonical_name, f.object_text) AS name
+              FROM {sp}facts f LEFT JOIN {sp}entities oe ON f.object_id = oe.id
+              WHERE f.id IN ({id_ph}) AND (f.object_id IS NOT NULL OR f.object_text IS NOT NULL)
+            )
+            WHERE name IS NOT NULL
+              AND length(name) <= 60
+              AND instr(name, ',') = 0""",
+        fact_ids + fact_ids,
+    ).fetchall()
+    names = []
+    for r in rows:
+        name = r[0]
+        if name and name != name.lower():
+            names.append(name)
+    return names
 
 
 # ---------------------------------------------------------------------------
@@ -319,6 +463,48 @@ def fts_search_question(
     try:
         results = fts_search_chunks(conn, query=query, k=k, schema=schema)
         return [r["chunk_id"] for r in results]
+    except Exception:
+        return []
+
+
+def fact_fts_search_question(
+    conn: sqlite3.Connection,
+    question: str,
+    k: int,
+    schema: str = "main",
+    *,
+    source_filter: set | None = None,
+) -> list[int]:
+    """Stopword-stripped OR query over fts_facts → ranked fact_ids.
+
+    When source_filter contains 'llm', queries fts_facts_llm (llm+closure only)
+    instead of fts_facts (all sources). This eliminates SVO noise from rankings
+    when minted injection is active.
+    """
+    words = _NONWORD.sub(" ", question.lower()).split()
+    content = [w for w in words if w and w not in _FTS_STOPWORDS and len(w) > 2]
+    if not content:
+        return []
+    query = " OR ".join(content)
+
+    use_llm_table = source_filter is not None and "llm" in source_filter
+    table = "fts_facts_llm" if use_llm_table else "fts_facts"
+
+    try:
+        if schema == "main":
+            rows = conn.execute(
+                f"SELECT rowid AS fact_id, rank FROM {table}"
+                f" WHERE text MATCH ? ORDER BY rank LIMIT ?",
+                [query, k],
+            ).fetchall()
+        else:
+            sp = f"{schema}."
+            rows = conn.execute(
+                f"SELECT fts.rowid AS fact_id, fts.rank"
+                f" FROM {sp}{table} fts WHERE fts MATCH ? ORDER BY fts.rank LIMIT ?",
+                [query, k],
+            ).fetchall()
+        return [r["fact_id"] for r in rows]
     except Exception:
         return []
 
@@ -350,20 +536,24 @@ def build_context(
     chunk_hits: list[ChunkHit],
     token_budget: int,
 ) -> str:
-    """Assemble context ≤ token_budget tokens: facts first, then chunks."""
+    """Assemble context ≤ token_budget tokens: chunks first, then facts.
+
+    Chunks come first so reliable passage content always reaches the model.
+    Facts follow as supplementary citable evidence (bridging facts, named entities).
+    """
     budget_chars = token_budget * _CHARS_PER_TOKEN
     parts: list[str] = []
     used = 0
 
-    for fh in fact_hits:
-        line = _format_fact(fh)
+    for ch in chunk_hits:
+        line = _format_chunk(ch)
         if used + len(line) > budget_chars:
             break
         parts.append(line)
         used += len(line)
 
-    for ch in chunk_hits:
-        line = _format_chunk(ch)
+    for fh in fact_hits:
+        line = _format_fact(fh)
         if used + len(line) > budget_chars:
             break
         parts.append(line)
@@ -399,6 +589,15 @@ def _source_info(title: str | None, path: str | None) -> str | None:
         return title
     if path:
         return Path(path).name
+    return None
+
+
+def _fact_source_set(fact_sources: str) -> set[str] | None:
+    """Map fact_sources config value to a set of allowed source tags, or None for 'all'."""
+    if fact_sources == "minted":
+        return {"llm"}
+    if fact_sources == "minted+coref":
+        return {"llm", "coref"}
     return None
 
 
@@ -464,6 +663,9 @@ def build_explain(
     fused: list[tuple],
     conn: sqlite3.Connection,
     schemas: list[str] | None = None,
+    fact_fts_ids: list[int] | None = None,
+    vec_fact_hits: list[tuple[int, float, str]] | None = None,
+    expand_terms: list[str] | None = None,
 ) -> str:
     lines: list[str] = ["=== Question Parse ==="]
     lines.append(f"  wh-type : {parse.wh_type or '(none)'}")
@@ -478,6 +680,19 @@ def build_explain(
     lines.append(f"  hits: {len(fact_hits)}")
     for fh in fact_hits[:5]:
         lines.append(f"  {fh.tag} {fh.subject_name} — {fh.predicate} — {fh.object_text} (score={fh.score})")
+
+    lines.append("\n=== Fact FTS ===")
+    fts_fact_hits = [fh for fh in fact_hits if fh.fact_id in set(fact_fts_ids or [])]
+    lines.append(f"  new_fact_ids: {(fact_fts_ids or [])[:5]}")
+    lines.append(f"  in_context: {len(fts_fact_hits)}")
+
+    lines.append("\n=== Fact Vec ===")
+    vf = vec_fact_hits or []
+    lines.append(f"  candidates: {len(vf)}")
+    for fid, dist, schema in vf[:5]:
+        lines.append(f"  fact_id={fid} dist={dist:.4f} schema={schema}")
+    if expand_terms:
+        lines.append(f"  expand_terms (injected): {expand_terms}")
 
     lines.append("\n=== Vector Search ===")
     lines.append(f"  top-{len(vec_ids)}: chunk_ids={vec_ids[:5]}")
@@ -507,6 +722,7 @@ def retrieve(
     explain: bool = False,
     pack_schemas: list[str] | None = None,
     timings: dict | None = None,
+    hyde_embedding: list[float] | None = None,
 ) -> RetrievalResult:
     """Full hybrid retrieval pipeline, optionally fanning out across pack schemas.
 
@@ -514,6 +730,7 @@ def retrieve(
     into it (parse_ms, fact_ms, vec_ms, fts_ms, fusion_ms).
     """
     schemas = ["main"] + (pack_schemas or [])
+    source_filter = _fact_source_set(cfg.retrieval.fact_sources)
 
     # 1. Parse
     t0 = time.perf_counter()
@@ -534,43 +751,146 @@ def retrieve(
             main_entity_ids = s_eids
             main_synonyms = s_syns
         all_fact_hits.extend(
-            fact_lookup(conn, s_eids, parse.verb_lemma, s_syns, schema=schema)
+            fact_lookup(conn, s_eids, parse.verb_lemma, s_syns, schema=schema,
+                        source_filter=source_filter)
         )
     fact_ms = (time.perf_counter() - t0) * 1000
     if timings is not None:
         timings["fact_ms"] = fact_ms
 
-    # Re-sort and renumber tags
-    all_fact_hits.sort(key=lambda h: -h.score)
-    for i, h in enumerate(all_fact_hits, 1):
-        h.tag = f"[F{i}]"
+    # Fact FTS (additive): keyword recall over fact triples + source sentences.
+    # When source_filter includes 'llm', routes to fts_facts_llm (no SVO noise)
+    # so no over-pull is needed. Otherwise over-pull 4× to compensate for dilution.
+    _use_llm_fts = source_filter is not None and "llm" in source_filter
+    _fts_fact_k = cfg.retrieval.fact_fts_top_k if _use_llm_fts else (
+        cfg.retrieval.fact_fts_top_k * (4 if source_filter else 1)
+    )
+    all_fact_fts_ids: list[int] = []
+    seen_fids = {h.fact_id for h in all_fact_hits}
+    for schema in schemas:
+        fids = fact_fts_search_question(
+            conn, question, _fts_fact_k, schema=schema, source_filter=source_filter
+        )
+        fids = [fid for fid in fids if fid not in seen_fids]
+        if fids:
+            all_fact_hits.extend(load_fact_hits_by_ids(conn, fids, schema=schema,
+                                                        source_filter=source_filter))
+            seen_fids.update(fids)
+            all_fact_fts_ids.extend(fids)
 
-    # 5. Vec search (separated for granular timing)
+    # 5. Vec search (embed question once; reuse for both chunk and fact vec search)
     all_vec_keys: list[tuple] = []
+    question_embedding: list[float] | None = None
+    expand_terms: list[str] = []
+    all_vec_fact_hits: list[tuple[int, float, str]] = []  # (fact_id, distance, schema)
+    _vec_raw_scores: dict[tuple, float] = {}   # (schema, chunk_id) → cosine similarity (1-dist)
     t0 = time.perf_counter()
+    _rerank_on = cfg.retrieval.rerank_mode != "off"
+    _pool_k = cfg.retrieval.rerank_pool if _rerank_on else cfg.retrieval.vec_top_k
     if embedder is not None:
+        from loci.models import embed_batch
+        from loci.store import vec_search_chunks as _vec_search_chunks
+        vecs = embed_batch(embedder, [question], normalize=True)
+        if vecs:
+            question_embedding = vecs[0]
+
+        # HyDE-lite: average question embedding with hypothetical answer embedding
+        # when the caller provides one. This bridges vocabulary gaps in paraphrase Qs.
+        _vec_query_embedding = question_embedding
+        if hyde_embedding is not None and question_embedding is not None:
+            avg = [(a + b) / 2 for a, b in zip(question_embedding, hyde_embedding)]
+            norm = sum(x * x for x in avg) ** 0.5
+            _vec_query_embedding = [x / norm for x in avg] if norm > 0 else avg
+
         for schema in schemas:
-            ids = vec_search_question(conn, embedder, question,
-                                      cfg.retrieval.vec_top_k, schema=schema)
-            all_vec_keys.extend((schema, cid) for cid in ids)
+            if _vec_query_embedding is not None:
+                raw = _vec_search_chunks(conn, embedding=_vec_query_embedding,
+                                         k=_pool_k, schema=schema)
+                for r in raw:
+                    key = (schema, r["chunk_id"])
+                    all_vec_keys.append(key)
+                    _vec_raw_scores[key] = max(0.0, 1.0 - r["distance"])
+            else:
+                ids = vec_search_question(conn, embedder, question,
+                                          _pool_k, schema=schema)
+                all_vec_keys.extend((schema, cid) for cid in ids)
+
+        # Vec-over-facts (mode switch)
+        if cfg.retrieval.fact_vec_mode != "off" and question_embedding is not None:
+            for schema in schemas:
+                for fid, dist in vec_fact_search_question(
+                    conn, question_embedding, cfg.retrieval.fact_vec_top_k, schema=schema
+                ):
+                    if fid not in seen_fids:
+                        all_vec_fact_hits.append((fid, dist, schema))
+                        seen_fids.add(fid)
+
+            if cfg.retrieval.fact_vec_mode == "surface":
+                for fid, dist, schema in all_vec_fact_hits:
+                    hits = load_fact_hits_by_ids(conn, [fid], schema=schema)
+                    for h in hits:
+                        h.score = max(0.0, 0.6 - 0.05 * dist)
+                    all_fact_hits.extend(hits)
+
+            elif cfg.retrieval.fact_vec_mode == "expand":
+                top_fids = [fid for fid, _, _ in all_vec_fact_hits[: cfg.retrieval.fact_expand_names]]
+                expand_terms = canonical_names_for_facts(conn, top_fids, schema="main")
+
     if timings is not None:
         timings["vec_ms"] = (time.perf_counter() - t0) * 1000
 
-    # 6. FTS search (separated for granular timing)
+    # Relevance gate: when source filter is active, drop facts whose subject/object
+    # entity doesn't appear in the question's resolved entity set. This prevents
+    # topically-loose minted facts from consuming slots on paraphrase questions.
+    if source_filter and main_entity_ids:
+        entity_id_set = set(main_entity_ids)
+        all_fact_hits = [
+            h for h in all_fact_hits
+            if h.subject_id in entity_id_set or h.object_id in entity_id_set
+        ]
+    elif source_filter and not main_entity_ids:
+        # No entities resolved → cannot gate by entity; drop all to avoid injecting
+        # unrelated minted facts into slots (the bypass flaw from Phase Q bench).
+        all_fact_hits = []
+
+    # Re-sort, cap, and renumber tags (after vec-surface may have added hits)
+    all_fact_hits.sort(key=lambda h: -h.score)
+    all_fact_hits = all_fact_hits[: cfg.retrieval.max_facts_in_context]
+    for i, h in enumerate(all_fact_hits, 1):
+        h.tag = f"[F{i}]"
+
+    # 6. FTS search (expand mode may inject bridge names into the query)
     all_fts_keys: list[tuple] = []
+    _fts_raw_scores: dict[tuple, float] = {}   # (schema, chunk_id) → normalised rank 0-1
     t0 = time.perf_counter()
+    fts_question = question
+    if expand_terms:
+        fts_question = question + " " + " ".join(expand_terms)
+    _fts_pool_k = cfg.retrieval.rerank_pool if _rerank_on else cfg.retrieval.fts_top_k
     for schema in schemas:
-        fts_ids = fts_search_question(conn, question, cfg.retrieval.fts_top_k, schema=schema)
-        all_fts_keys.extend((schema, cid) for cid in fts_ids)
+        fts_ids = fts_search_question(conn, fts_question, _fts_pool_k, schema=schema)
+        for rank, cid in enumerate(fts_ids):
+            key = (schema, cid)
+            all_fts_keys.append(key)
+            _fts_raw_scores[key] = max(0.0, 1.0 - rank / max(len(fts_ids), 1))
     if timings is not None:
         timings["fts_ms"] = (time.perf_counter() - t0) * 1000
 
-    # 7. RRF fusion + context build
+    # 7. RRF fusion + optional blend rerank + context build
     t0 = time.perf_counter()
     fused = rrf_fuse([all_vec_keys, all_fts_keys],
                      ks=[cfg.retrieval.vec_rrf_k, cfg.retrieval.rrf_k])
+
+    # Blend rerank: re-sort fused pool by max(vec_cosine, fts_position_score)
+    if cfg.retrieval.rerank_mode == "blend" and (_vec_raw_scores or _fts_raw_scores):
+        fused = sorted(
+            fused,
+            key=lambda kv: -(0.5 * _vec_raw_scores.get(kv[0], 0.0)
+                             + 0.5 * _fts_raw_scores.get(kv[0], 0.0)),
+        )
+
     chunk_hits = load_chunk_hits(
-        conn, fused, cfg.retrieval.context_token_budget, offset=len(all_fact_hits) + 1
+        conn, fused, cfg.retrieval.context_token_budget, offset=1
     )
     context = build_context(all_fact_hits, chunk_hits, cfg.retrieval.context_token_budget)
     if timings is not None:
@@ -584,6 +904,9 @@ def retrieve(
         explain_text = build_explain(
             parse, main_entity_ids, main_synonyms, all_fact_hits,
             all_vec_ids, all_fts_ids, fused, conn, schemas=schemas,
+            fact_fts_ids=all_fact_fts_ids,
+            vec_fact_hits=all_vec_fact_hits,
+            expand_terms=expand_terms,
         )
         explain_text += f"\n\n  fact_lookup_ms: {fact_ms:.1f}"
 

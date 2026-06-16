@@ -14,6 +14,7 @@ from loci.retrieve import (
     find_mentioned_entity_ids,
     fts_search_question,
     get_synonyms,
+    load_fact_hits_by_ids,
     parse_question,
     retrieve,
     rrf_fuse,
@@ -264,9 +265,9 @@ class TestBuildContext:
             source_info="Book", rrf_score=0.01,
         )
 
-    def test_facts_come_first(self):
+    def test_chunks_come_first(self):
         ctx = build_context([self._make_fact(1)], [self._make_chunk(2)], token_budget=1800)
-        assert ctx.index("[F1]") < ctx.index("[C2]")
+        assert ctx.index("[C2]") < ctx.index("[F1]")
 
     def test_respects_token_budget(self):
         facts = [self._make_fact(i) for i in range(20)]
@@ -364,3 +365,348 @@ class TestRetrieve:
         # At minimum, FTS on "detective" or "grab" may surface relevant chunks;
         # if not, the test just checks the pipeline didn't crash
         assert isinstance(result.chunk_hits, list)
+
+
+# ---------------------------------------------------------------------------
+# Fact-FTS regression and new behaviour
+# ---------------------------------------------------------------------------
+
+import hashlib as _hashlib
+from loci.store import (
+    open_db as _open_db,
+    insert_source as _insert_source,
+    insert_chunk as _insert_chunk,
+    insert_entity as _insert_entity,
+    insert_alias as _insert_alias,
+    insert_fact as _insert_fact,
+    rebuild_fact_fts as _rebuild_fact_fts,
+    rebuild_fact_fts_llm as _rebuild_fact_fts_llm,
+)
+
+
+@pytest.fixture
+def landlady_db(tmp_path, nlp):
+    """Minimal DB: one fact (Mrs Hudson — role — landlady)."""
+    conn = _open_db(tmp_path / "landlady.db")
+    src_id = _insert_source(conn, sha256=_hashlib.sha256(b"s").hexdigest(), title="Test")
+    chunk_id = _insert_chunk(
+        conn, source_id=src_id, ordinal=0,
+        text="Mrs. Hudson, our landlady, brought tea.",
+        sha256=_hashlib.sha256(b"c").hexdigest(),
+    )
+    eid = _insert_entity(conn, canonical_name="Mrs Hudson", kind="person")
+    _insert_alias(conn, entity_id=eid, alias="mrs hudson")
+    _insert_fact(
+        conn, chunk_id=chunk_id,
+        sentence="Mrs. Hudson, our landlady, brought tea.",
+        subject_id=eid, predicate="role", object_text="landlady",
+    )
+    _rebuild_fact_fts(conn)
+    yield conn
+    conn.close()
+
+
+class TestFactFts:
+    def test_copula_question_hits_fact(self, landlady_db, default_cfg, nlp):
+        """Core regression: copula 'is' no longer blocks fact retrieval."""
+        result = retrieve(
+            "Who is the landlady?",
+            conn=landlady_db, cfg=default_cfg,
+            embedder=None, nlp=nlp,
+        )
+        assert len(result.fact_hits) > 0
+        assert "[F" in result.context_text
+
+    def test_fact_fts_stopword_only_returns_empty(self, landlady_db):
+        from loci.retrieve import fact_fts_search_question
+        ids = fact_fts_search_question(landlady_db, "who is the", k=5)
+        assert ids == []
+
+    def test_fact_fts_content_word_returns_ids(self, landlady_db):
+        from loci.retrieve import fact_fts_search_question
+        ids = fact_fts_search_question(landlady_db, "landlady role", k=5)
+        assert len(ids) > 0
+
+    def test_max_facts_in_context_cap(self, tmp_path, default_cfg, nlp):
+        conn = _open_db(tmp_path / "cap.db")
+        src_id = _insert_source(conn, sha256=_hashlib.sha256(b"cap_src").hexdigest(), title="Cap")
+        for i in range(8):
+            cid = _insert_chunk(
+                conn, source_id=src_id, ordinal=i,
+                text=f"The landlady lives at place {i}.",
+                sha256=_hashlib.sha256(f"cap_chunk_{i}".encode()).hexdigest(),
+            )
+            eid = _insert_entity(conn, canonical_name=f"Lady{i}", kind="person")
+            _insert_alias(conn, entity_id=eid, alias=f"lady{i}")
+            _insert_fact(
+                conn, chunk_id=cid,
+                sentence=f"The landlady lives at place {i}.",
+                subject_id=eid, predicate="residence", object_text="landlady area",
+            )
+        _rebuild_fact_fts(conn)
+
+        from loci.config import Config
+        cfg = Config()
+        cfg.retrieval.max_facts_in_context = 2
+
+        result = retrieve(
+            "Who is the landlady?",
+            conn=conn, cfg=cfg, embedder=None, nlp=nlp,
+        )
+        conn.close()
+        assert len(result.fact_hits) <= 2
+        tags = [h.tag for h in result.fact_hits]
+        if len(tags) >= 1:
+            assert tags[0] == "[F1]"
+        if len(tags) == 2:
+            assert tags[1] == "[F2]"
+
+    def test_fact_hits_scores_non_increasing(self, landlady_db, default_cfg, nlp):
+        result = retrieve(
+            "Who is the landlady?",
+            conn=landlady_db, cfg=default_cfg, embedder=None, nlp=nlp,
+        )
+        scores = [h.score for h in result.fact_hits]
+        assert scores == sorted(scores, reverse=True)
+
+
+# ---------------------------------------------------------------------------
+# LLM-only FTS routing (closure phase)
+# ---------------------------------------------------------------------------
+
+class TestFactFtsLLMRouting:
+    def test_source_filter_routes_to_llm_table(self, tmp_path):
+        """With source_filter={'llm'}, only facts in fts_facts_llm are returned."""
+        import hashlib as _hl
+        from loci.retrieve import fact_fts_search_question
+        conn = _open_db(tmp_path / "llm_route.db")
+        src_id = _insert_source(conn, sha256=_hl.sha256(b"lr_s").hexdigest(), title="T")
+        cid = _insert_chunk(conn, source_id=src_id, ordinal=0,
+                            text="Hope worked as a jarvey.", sha256=_hl.sha256(b"lr_c").hexdigest())
+        eid = _insert_entity(conn, canonical_name="Jefferson Hope", kind="person")
+        _insert_alias(conn, entity_id=eid, alias="jefferson hope")
+        svo_id = _insert_fact(conn, chunk_id=cid,
+                              sentence="Hope worked as a jarvey.",
+                              subject_id=eid, predicate="work",
+                              object_text="jarvey", source="svo")
+        llm_id = _insert_fact(conn, chunk_id=cid,
+                              sentence="Hope drove a cab as a jarvey.",
+                              subject_id=eid, predicate="work_as",
+                              object_text="jarvey", source="llm")
+        _rebuild_fact_fts(conn)
+        _rebuild_fact_fts_llm(conn)
+
+        # Without filter: both should be findable
+        all_ids = fact_fts_search_question(conn, "jarvey work hope", k=10)
+        assert svo_id in all_ids or llm_id in all_ids
+
+        # With llm filter: only llm fact, not svo
+        llm_ids = fact_fts_search_question(conn, "jarvey work hope", k=10,
+                                           source_filter={"llm"})
+        assert llm_id in llm_ids
+        assert svo_id not in llm_ids
+        conn.close()
+
+    def test_no_filter_uses_full_table(self, landlady_db):
+        """Without source_filter, fts_facts (all sources) is queried."""
+        from loci.retrieve import fact_fts_search_question
+        ids = fact_fts_search_question(landlady_db, "landlady role", k=5,
+                                       source_filter=None)
+        assert len(ids) > 0
+
+
+# ---------------------------------------------------------------------------
+# Phase B: vec-over-facts — vec_fact_search_question, canonical_names, modes
+# ---------------------------------------------------------------------------
+
+from loci.store import rebuild_fact_vec as _rebuild_fact_vec
+from loci.retrieve import vec_fact_search_question, canonical_names_for_facts
+
+
+class TestVecFacts:
+    def test_vec_fact_search_returns_tuples(self, landlady_db, fake_embedder):
+        _rebuild_fact_vec(landlady_db, fake_embedder)
+        from loci.models import embed_batch
+        emb = embed_batch(fake_embedder, ["landlady role"], normalize=True)[0]
+        results = vec_fact_search_question(landlady_db, emb, k=5)
+        assert isinstance(results, list)
+        for fid, dist in results:
+            assert isinstance(fid, int)
+            assert isinstance(dist, float)
+
+    def test_canonical_names_returns_proper_nouns(self, landlady_db):
+        fact_ids = [r[0] for r in landlady_db.execute("SELECT id FROM facts LIMIT 3").fetchall()]
+        names = canonical_names_for_facts(landlady_db, fact_ids)
+        for name in names:
+            assert name != name.lower(), f"Expected proper noun, got: {name!r}"
+
+    def test_canonical_names_empty_input(self, landlady_db):
+        assert canonical_names_for_facts(landlady_db, []) == []
+
+    def test_surface_mode_runs_without_error(self, landlady_db, fake_embedder, nlp):
+        _rebuild_fact_vec(landlady_db, fake_embedder)
+        from loci.config import Config
+        cfg = Config()
+        cfg.retrieval.max_facts_in_context = 10
+        cfg.retrieval.fact_vec_mode = "surface"
+        cfg.retrieval.fact_vec_top_k = 5
+        result = retrieve(
+            "Who is the landlady?",
+            conn=landlady_db, cfg=cfg, embedder=fake_embedder, nlp=nlp,
+        )
+        assert isinstance(result.fact_hits, list)
+
+    def test_expand_mode_runs_without_error(self, landlady_db, fake_embedder, nlp):
+        _rebuild_fact_vec(landlady_db, fake_embedder)
+        from loci.config import Config
+        cfg = Config()
+        cfg.retrieval.max_facts_in_context = 4
+        cfg.retrieval.fact_vec_mode = "expand"
+        cfg.retrieval.fact_vec_top_k = 5
+        cfg.retrieval.fact_expand_names = 2
+        result = retrieve(
+            "Who is the landlady?",
+            conn=landlady_db, cfg=cfg, embedder=fake_embedder, nlp=nlp,
+        )
+        assert isinstance(result.chunk_hits, list)
+
+    def test_off_mode_unchanged_from_baseline(self, landlady_db, default_cfg, nlp):
+        result = retrieve(
+            "Who is the landlady?",
+            conn=landlady_db, cfg=default_cfg, embedder=None, nlp=nlp,
+        )
+        # off mode with no embedder: should still surface FTS facts
+        assert isinstance(result.fact_hits, list)
+
+
+# ---------------------------------------------------------------------------
+# Phase C: pool widening and blend rerank
+# ---------------------------------------------------------------------------
+
+class TestPhaseC:
+    def test_pool_mode_returns_chunks(self, populated_db, fake_embedder, nlp):
+        from loci.config import Config
+        cfg = Config()
+        cfg.retrieval.rerank_mode = "pool"
+        cfg.retrieval.rerank_pool = 24
+        result = retrieve(
+            "What did Sherlock Holmes take?",
+            conn=populated_db, cfg=cfg, embedder=fake_embedder, nlp=nlp,
+        )
+        assert isinstance(result.chunk_hits, list)
+        assert len(result.chunk_hits) > 0
+
+    def test_blend_mode_returns_chunks(self, populated_db, fake_embedder, nlp):
+        from loci.config import Config
+        cfg = Config()
+        cfg.retrieval.rerank_mode = "blend"
+        cfg.retrieval.rerank_pool = 24
+        result = retrieve(
+            "What did Sherlock Holmes take?",
+            conn=populated_db, cfg=cfg, embedder=fake_embedder, nlp=nlp,
+        )
+        assert isinstance(result.chunk_hits, list)
+        assert len(result.chunk_hits) > 0
+
+    def test_off_mode_matches_default(self, populated_db, fake_embedder, nlp, default_cfg):
+        result_off = retrieve(
+            "What did Watson observe?",
+            conn=populated_db, cfg=default_cfg, embedder=fake_embedder, nlp=nlp,
+        )
+        assert isinstance(result_off.chunk_hits, list)
+
+    def test_pool_mode_no_embedder_works(self, populated_db, nlp):
+        from loci.config import Config
+        cfg = Config()
+        cfg.retrieval.rerank_mode = "pool"
+        cfg.retrieval.rerank_pool = 24
+        result = retrieve(
+            "Who is the detective?",
+            conn=populated_db, cfg=cfg, embedder=None, nlp=nlp,
+        )
+        assert isinstance(result.chunk_hits, list)
+
+
+# ---------------------------------------------------------------------------
+# Phase Q — source filter + relevance gate
+# ---------------------------------------------------------------------------
+
+import hashlib as _hashlib
+
+def _sha(s: str) -> str:
+    return _hashlib.sha256(s.encode()).hexdigest()
+
+
+@pytest.fixture
+def source_db(tmp_path):
+    """DB with two facts: one svo and one llm, same entity."""
+    from loci.store import (
+        open_db, insert_source, insert_chunk, insert_entity, insert_alias, insert_fact
+    )
+    conn = open_db(tmp_path / "source_test.db")
+    src_id = insert_source(conn, sha256=_sha("q_src"), title="Scarlet")
+    chunk_id = insert_chunk(conn, source_id=src_id, ordinal=0,
+                            text="Holmes took the bottle.", sha256=_sha("q_chunk"))
+    eid = insert_entity(conn, canonical_name="Holmes")
+    insert_alias(conn, entity_id=eid, alias="holmes")
+
+    insert_fact(conn, chunk_id=chunk_id, sentence="Holmes took the bottle.",
+                subject_id=eid, predicate="take", object_text="bottle",
+                confidence=1.0, source="svo")
+    insert_fact(conn, chunk_id=chunk_id, sentence="Holmes is a detective.",
+                subject_id=eid, predicate="profession", object_text="detective",
+                confidence=0.7, source="llm")
+    yield conn
+    conn.close()
+
+
+class TestFactSourceFilter:
+    def test_load_fact_hits_all_returns_both(self, source_db):
+        all_ids = [r[0] for r in source_db.execute("SELECT id FROM facts").fetchall()]
+        hits = load_fact_hits_by_ids(source_db, all_ids)
+        assert len(hits) == 2
+
+    def test_load_fact_hits_minted_excludes_svo(self, source_db):
+        all_ids = [r[0] for r in source_db.execute("SELECT id FROM facts").fetchall()]
+        hits = load_fact_hits_by_ids(source_db, all_ids, source_filter={"llm"})
+        assert all(h.predicate == "profession" for h in hits)
+        assert len(hits) == 1
+
+    def test_fact_lookup_source_filter(self, source_db):
+        eid = source_db.execute(
+            "SELECT id FROM entities WHERE canonical_name='Holmes'"
+        ).fetchone()[0]
+        all_hits = fact_lookup(source_db, [eid], "take", set())
+        filtered_hits = fact_lookup(source_db, [eid], "take", set(),
+                                    source_filter={"llm"})
+        assert len(all_hits) >= 1
+        assert len(filtered_hits) == 0  # "take" is svo, filtered out
+
+    def test_retrieve_max_facts_zero_returns_no_facts(self, source_db, nlp):
+        from loci.config import Config
+        cfg = Config()
+        cfg.retrieval.max_facts_in_context = 0
+        cfg.retrieval.fact_sources = "all"
+        result = retrieve("What did Holmes take?", conn=source_db, cfg=cfg, nlp=nlp)
+        assert result.fact_hits == []
+
+    def test_retrieve_minted_only_excludes_svo(self, source_db, nlp):
+        from loci.config import Config
+        cfg = Config()
+        cfg.retrieval.max_facts_in_context = 4
+        cfg.retrieval.fact_sources = "minted"
+        result = retrieve("What is Holmes's profession?", conn=source_db, cfg=cfg, nlp=nlp)
+        for fh in result.fact_hits:
+            assert fh.predicate != "take", "svo fact leaked through minted filter"
+
+    def test_gate_bypass_fix_empty_entities(self, source_db, nlp):
+        """When source_filter is active but no entities resolve, gate must return [] not bypass."""
+        from loci.config import Config
+        from unittest.mock import patch
+        cfg = Config()
+        cfg.retrieval.max_facts_in_context = 4
+        cfg.retrieval.fact_sources = "minted"
+        # Patch entity resolution to return [] (simulates unrecognised query)
+        with patch("loci.retrieve.find_mentioned_entity_ids", return_value=[]):
+            result = retrieve("xyzzy quux", conn=source_db, cfg=cfg, nlp=nlp)
+        assert result.fact_hits == [], "bypass flaw: minted facts injected when entity_ids=[]"

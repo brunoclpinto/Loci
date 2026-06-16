@@ -34,6 +34,14 @@ fts_top_k             = 12
 context_token_budget  = 1800
 entity_sim_threshold  = 0.92
 rrf_k                 = 60
+fact_fts_top_k        = 10   # candidate facts pulled from fts_facts per schema
+max_facts_in_context  = 4    # hard cap on [F#] lines placed before chunks
+fact_vec_top_k        = 10   # candidate facts from vec_facts per schema
+fact_vec_mode         = "off"  # "off" | "surface" (add [F#] lines) | "expand" (inject names into chunk query)
+fact_expand_names     = 2    # expand mode: number of top-fact canonical names injected into chunk query
+rerank_mode           = "off"  # "off" | "pool" (widen candidate pool) | "blend" (pool + re-score by vec+fts blend)
+rerank_pool           = 24   # candidate pool per modality when rerank_mode != "off" (replaces vec/fts_top_k)
+hyde_query            = false  # HyDE-lite: average question embedding with hypothetical-answer embedding for richer vec retrieval
 
 [logging]
 level         = "INFO"   # DEBUG dumps retrieval explanations to runtime log

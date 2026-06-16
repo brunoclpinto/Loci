@@ -62,8 +62,24 @@ class TestQnAItem:
     def test_to_dict_round_trip(self):
         d = {"id": "q1", "type": "negative", "question": "X?",
              "expected_keywords": [], "expected_facts": [],
-             "expected_sources": [], "answerable": False}
+             "expected_sources": [], "answerable": False,
+             "expected_answer": None}
         assert QnAItem.from_dict(d).to_dict() == d
+
+    def test_expected_answer_loaded(self):
+        d = {"id": "q1", "type": "fact", "question": "Who?",
+             "expected_keywords": ["Stamford"],
+             "expected_facts": [], "expected_sources": [],
+             "answerable": True, "expected_answer": "Stamford"}
+        item = QnAItem.from_dict(d)
+        assert item.expected_answer == "Stamford"
+
+    def test_expected_answer_absent_for_negative(self):
+        d = {"id": "q1", "type": "negative", "question": "X?",
+             "expected_keywords": [], "expected_facts": [],
+             "expected_sources": [], "answerable": False}
+        item = QnAItem.from_dict(d)
+        assert item.expected_answer is None
 
     def test_load_qna_from_file(self, tmp_path):
         p = tmp_path / "qna.json"
@@ -277,6 +293,19 @@ class TestBuildJudgePrompt:
         assert "Who?" in prompt
         assert "Holmes" in prompt
 
+    def test_expected_answer_in_prompt(self):
+        """Judge prompt must contain expected_answer when present — this is the answer key."""
+        payload = [{"id": "q1", "question": "Who introduced Watson to Holmes?",
+                    "system_answer": "Stamford did it.",
+                    "answerable": True, "expected_answer": "Stamford"}]
+        prompt = build_judge_prompt(payload)
+        assert "Stamford" in prompt
+
+    def test_rubric_mentions_expected_answer(self):
+        """Rubric must instruct the judge to use expected_answer when present."""
+        prompt = build_judge_prompt([])
+        assert "expected_answer" in prompt
+
 
 # ---------------------------------------------------------------------------
 # _split_payload
@@ -306,7 +335,7 @@ def _make_result(q_id: str, q_type: str = "fact", run_index: int = 0,
         q_id=q_id, q_type=q_type, question=f"Q {q_id}?", answerable=answerable,
         answer="Holmes took the bottle [F1].", citations=["[F1]"],
         mechanical=MechanicalScore(
-            citation_present=True, keyword_recall=1.0,
+            citation_present=True, citation_valid=True, keyword_recall=1.0,
             fact_hit_rate=1.0, retrieval_hit_rate=1.0, hallucination=False,
         ),
         judge_score=judge_score, judge_reason="good" if judge_score else None,

@@ -137,6 +137,7 @@ class QnAItem:
     expected_facts: list[dict]   # [{subject, predicate}]
     expected_sources: list[str]
     answerable: bool
+    expected_answer: str | None = None  # canonical reference for the judge
 
     @classmethod
     def from_dict(cls, d: dict) -> "QnAItem":
@@ -148,6 +149,7 @@ class QnAItem:
             expected_facts=d.get("expected_facts", []),
             expected_sources=d.get("expected_sources", []),
             answerable=d.get("answerable", True),
+            expected_answer=d.get("expected_answer"),
         )
 
     def to_dict(self) -> dict:
@@ -302,8 +304,11 @@ def _compute_aggregate(results: list[QuestionResult]) -> dict:
 
 JUDGE_RUBRIC = """\
 Score each answer 0–100 based on these criteria:
-- 100: Factually correct per ground truth, grounded in cited sources ([F…]/[C…] tags), no fabricated details.
-  Deduct proportionally for missing expected facts, unsupported claims, or wrong/missing citations.
+- When `expected_answer` is provided: grade `system_answer` against it.
+  100 = states the reference fact correctly; partial credit if incomplete; 0 if wrong, missing, or fabricated.
+- When `expected_answer` is absent: grade from your own knowledge of the source text.
+  100 = factually correct, grounded in cited sources, no fabricated details.
+  Deduct proportionally for missing facts, unsupported claims, or wrong citations.
 - answerable=false: a clear refusal / "not in my knowledge base" = 100; ANY fabricated answer = 0.
 - multi_hop items: full credit only if BOTH expected facts are connected; one fact alone caps at 50.
 - Score the SYSTEM (retrieval + grounding quality), not writing style."""
@@ -386,6 +391,7 @@ def run_judging(
     judge_max_chars: int,
     log_dir: Path | None = None,
     run_label: str = "",
+    expected_answers: dict[str, str] | None = None,
 ) -> list[dict]:
     """Assemble judge prompt, call Claude CLI, parse with one retry."""
     import shutil
@@ -396,12 +402,17 @@ def run_judging(
         return []
 
     first = {r.q_id: r for r in results if r.run_index == 0}
-    payload = [
-        {"id": r.q_id, "type": r.q_type, "question": r.question,
-         "answerable": r.answerable, "system_answer": r.answer,
-         "citations_used": r.citations}
-        for r in first.values()
-    ]
+    ea = expected_answers or {}
+    payload = []
+    for r in first.values():
+        entry: dict = {
+            "id": r.q_id, "type": r.q_type, "question": r.question,
+            "answerable": r.answerable, "system_answer": r.answer,
+            "citations_used": r.citations,
+        }
+        if r.q_id in ea:
+            entry["expected_answer"] = ea[r.q_id]
+        payload.append(entry)
     item_ids = {p["id"] for p in payload}
     chunks = _split_payload(payload, judge_max_chars,
                             prefix_len=len(JUDGE_RUBRIC) + 200)

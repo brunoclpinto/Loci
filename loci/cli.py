@@ -20,11 +20,13 @@ entities_app = typer.Typer(help="Entity management.")
 pack_app = typer.Typer(help="Knowledge-pack management.")
 synonyms_app = typer.Typer(help="Predicate synonym management.")
 bench_app = typer.Typer(help="Benchmark and evaluation suite.")
+facts_app = typer.Typer(help="Fact index management.")
 app.add_typer(config_app, name="config")
 app.add_typer(entities_app, name="entities")
 app.add_typer(pack_app, name="pack")
 app.add_typer(synonyms_app, name="synonyms")
 app.add_typer(bench_app, name="bench")
+app.add_typer(facts_app, name="facts")
 
 console = Console()
 
@@ -899,11 +901,29 @@ def bench_query_cmd(
                     sampler = threading.Thread(target=_sample, daemon=True)
                     sampler.start()
 
+                    # HyDE-lite: generate a hypothetical answer for richer vec query
+                    hyde_emb = None
+                    if cfg.retrieval.hyde_query and embedder is not None:
+                        try:
+                            from loci.generate import generate_response
+                            from loci.models import embed_batch as _eb
+                            _hyde_msgs = [
+                                {"role": "system", "content": "Answer the question in one short factual sentence. No hedging."},
+                                {"role": "user", "content": item.question},
+                            ]
+                            _hypo = generate_response(llm, _hyde_msgs, max_tokens=40, temperature=0.0)
+                            _h_vecs = _eb(embedder, [_hypo], normalize=True)
+                            if _h_vecs:
+                                hyde_emb = _h_vecs[0]
+                        except Exception:
+                            pass
+
                     result = retrieve(
                         item.question,
                         conn=conn, cfg=cfg,
                         embedder=embedder, nlp=nlp,
                         pack_schemas=p_schemas, timings=timings,
+                        hyde_embedding=hyde_emb,
                     )
                     messages = build_messages(item.question, result.context_text, [])
 
@@ -958,6 +978,8 @@ def bench_query_cmd(
         conn.close()
 
     # Judging
+    ea_map = {item.id: item.expected_answer for item in qna_items
+              if item.expected_answer is not None}
     judge_scores = run_judging(
         all_results,
         judge=judge if judge != "claude" or cfg.bench.judge != "none" else cfg.bench.judge,
@@ -965,6 +987,7 @@ def bench_query_cmd(
         judge_max_chars=cfg.bench.judge_max_chars,
         log_dir=cfg_exp.paths.bench_logs_dir,
         run_label=label or "query",
+        expected_answers=ea_map,
     )
     score_map = {s["id"]: s for s in judge_scores}
     for r in all_results:
@@ -1138,10 +1161,15 @@ def _question_template(subject: str, predicate: str, obj: str) -> str:
 @app.command("enhance")
 def enhance_cmd(
     limit: Optional[int] = typer.Option(None, "--limit", help="Max chunks to process."),
+    all_chunks: bool = typer.Option(False, "--all", help="Re-run on ALL chunks (reset extracted_v first). Needed for the P1 taxonomy re-extraction pass."),
+    passes: Optional[str] = typer.Option(None, "--passes", help="Comma-separated P2 passes: entity,implied. Omit for P1 chunk pass."),
     config_path: Optional[Path] = typer.Option(None, "--config", "-c"),
     low_mem: bool = typer.Option(False, "--low-mem"),
 ) -> None:
-    """LLM-assisted extraction pass: finds passives, copulas, and possessives."""
+    """LLM-assisted extraction pass: finds passives, copulas, and possessives.
+
+    --passes entity,implied  runs P2 cross-chunk and implication passes instead of the P1 chunk pass.
+    """
     try:
         cfg = cfg_module.load(config_path)
     except ValueError as exc:
@@ -1150,31 +1178,32 @@ def enhance_cmd(
 
     from loci.config import expanded
     from loci.store import open_db, get_unextracted_chunks
-    from loci.enhance import run_enhance
+    from loci.enhance import run_enhance, run_entity_pass, run_implied_pass, run_closure_pass, run_prune_pass
 
     cfg_exp = expanded(cfg)
 
-    if not _chat_model_exists(cfg_exp):
-        console.print(
-            f"[red]Chat model not found:[/red] {cfg_exp.paths.models_dir / cfg_exp.models.chat}\n"
-            "Run: loci models pull"
-        )
-        raise typer.Exit(1)
+    requested_passes = {p.strip() for p in passes.split(",")} if passes else set()
+    llm_passes = requested_passes - {"closure", "prune"}
 
-    try:
-        from loci.models import load_chat
-    except ImportError:
-        console.print("[red]llama-cpp-python not installed.[/red]")
-        raise typer.Exit(1)
+    # Prune and closure passes need no LLM — validate model only when LLM passes are requested.
+    if not requested_passes or llm_passes:
+        if not _chat_model_exists(cfg_exp):
+            console.print(
+                f"[red]Chat model not found:[/red] {cfg_exp.paths.models_dir / cfg_exp.models.chat}\n"
+                "Run: loci models pull"
+            )
+            raise typer.Exit(1)
+        try:
+            from loci.models import load_chat
+        except ImportError:
+            console.print("[red]llama-cpp-python not installed.[/red]")
+            raise typer.Exit(1)
 
     try:
         conn = open_db(cfg_exp.paths.knowledge_db, vec_dim=cfg_exp.models.vec_dim)
     except Exception as exc:
         console.print(f"[red]Cannot open DB:[/red] {exc}")
         raise typer.Exit(1)
-
-    pending = len(get_unextracted_chunks(conn, limit=limit))
-    console.print(f"[bold]Enhancing[/bold] {pending} chunks with LLM extraction…")
 
     embedder = None
     _emb_ctx = None
@@ -1186,11 +1215,85 @@ def enhance_cmd(
         except Exception:
             pass
 
+    combined_stats: dict = {}
     try:
-        with load_chat(cfg_exp, low_mem=low_mem) as llm:
-            with measure("enhance", log_dir=cfg_exp.paths.runtime_logs_dir) as counters:
-                stats = run_enhance(conn, llm=llm, cfg=cfg, embedder=embedder, limit=limit)
+        if not requested_passes or llm_passes:
+            # Load LLM for P1 or LLM-based P2 passes
+            with load_chat(cfg_exp, low_mem=low_mem) as llm:
+                if not requested_passes:
+                    # P1 chunk pass (original behaviour)
+                    pending = len(get_unextracted_chunks(conn, limit=limit))
+                    console.print(f"[bold]Enhancing[/bold] {pending} chunks with LLM extraction…")
+                    with measure("enhance", log_dir=cfg_exp.paths.runtime_logs_dir) as counters:
+                        stats = run_enhance(conn, llm=llm, cfg=cfg, embedder=embedder,
+                                            limit=limit, force_all=all_chunks)
+                        counters.update(stats)
+                    combined_stats = stats
+                else:
+                    if "entity" in requested_passes:
+                        console.print("[bold]P2 entity pass[/bold] — cross-chunk entity-centric extraction…")
+                        with measure("enhance_entity", log_dir=cfg_exp.paths.runtime_logs_dir) as counters:
+                            stats = run_entity_pass(conn, llm=llm, cfg=cfg, embedder=embedder)
+                            counters.update(stats)
+                        console.print(
+                            f"  entities: {stats.get('entities_processed', 0)}"
+                            f"  new facts: {stats.get('facts_added', 0)}"
+                            + (" [dim](skipped — already done)[/dim]" if stats.get("skipped") else "")
+                        )
+                        combined_stats.update(stats)
+                    if "implied" in requested_passes:
+                        console.print("[bold]P2 implied pass[/bold] — implication/archaic-vocab extraction…")
+                        with measure("enhance_implied", log_dir=cfg_exp.paths.runtime_logs_dir) as counters:
+                            stats = run_implied_pass(conn, llm=llm, cfg=cfg, embedder=embedder)
+                            counters.update(stats)
+                        console.print(
+                            f"  chunks: {stats.get('chunks_processed', 0)}"
+                            f"  new facts: {stats.get('facts_added', 0)}"
+                            + (" [dim](skipped — already done)[/dim]" if stats.get("skipped") else "")
+                        )
+                        combined_stats.update(stats)
+
+                    # Rebuild full FTS after LLM P2 passes
+                    from loci.store import rebuild_fact_fts
+                    n_fts = rebuild_fact_fts(conn)
+                    conn.execute("INSERT OR REPLACE INTO db_meta(key,value) VALUES ('fact_fts_v','1')")
+                    conn.commit()
+                    console.print(f"[green]FTS rebuilt[/green] ({n_fts} facts indexed)")
+
+        # Prune pass — removes misattributed llm/closure facts, resets closure_v
+        if "prune" in requested_passes:
+            console.print("[bold]Prune pass[/bold] — removing misattributed occupation facts…")
+            with measure("enhance_prune", log_dir=cfg_exp.paths.runtime_logs_dir) as counters:
+                stats = run_prune_pass(conn)
                 counters.update(stats)
+            console.print(
+                f"  removed llm: {stats.get('pruned_llm', 0)}"
+                f"  removed closure: {stats.get('pruned_closure', 0)}"
+            )
+            # Rebuild both FTS tables after pruning
+            from loci.store import rebuild_fact_fts, rebuild_fact_fts_llm, _FACT_FTS_LLM_VERSION
+            rebuild_fact_fts(conn)
+            conn.execute("INSERT OR REPLACE INTO db_meta(key,value) VALUES ('fact_fts_v','1')")
+            rebuild_fact_fts_llm(conn)
+            conn.execute(
+                "INSERT OR REPLACE INTO db_meta(key,value) VALUES ('fact_fts_llm_v',?)",
+                [_FACT_FTS_LLM_VERSION],
+            )
+            conn.commit()
+            combined_stats.update(stats)
+
+        # Closure pass — no LLM required; runs after any LLM passes or standalone
+        if "closure" in requested_passes:
+            console.print("[bold]Closure pass[/bold] — materialising vocabulary synonym chains…")
+            with measure("enhance_closure", log_dir=cfg_exp.paths.runtime_logs_dir) as counters:
+                stats = run_closure_pass(conn, cfg=cfg, embedder=embedder)
+                counters.update(stats)
+            console.print(
+                f"  chains found: {stats.get('chains_found', 0)}"
+                f"  new facts: {stats.get('facts_added', 0)}"
+                + (" [dim](skipped — already done)[/dim]" if stats.get("skipped") else "")
+            )
+            combined_stats.update(stats)
     finally:
         if _emb_ctx is not None:
             try:
@@ -1199,10 +1302,14 @@ def enhance_cmd(
                 pass
         conn.close()
 
-    console.print(
-        f"[green]Done.[/green]  chunks processed: {stats['chunks_processed']}"
-        f"  new facts: {stats['facts_added']}"
-    )
+    if not requested_passes:
+        stats = combined_stats
+        console.print(
+            f"[green]Done.[/green]  chunks processed: {stats['chunks_processed']}"
+            f"  new facts: {stats['facts_added']}"
+        )
+    else:
+        console.print(f"[green]Passes complete.[/green] Total new facts: {combined_stats.get('facts_added', 0)}")
 
 
 # ---------------------------------------------------------------------------
@@ -1293,6 +1400,103 @@ def synonyms_learn_cmd(
             console.print(
                 f"\nRun with [bold]--auto[/bold] to write these {len(suggestions)} pairs."
             )
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# loci facts reindex-vec / reindex-fts
+# ---------------------------------------------------------------------------
+
+@facts_app.command("reindex-vec")
+def facts_reindex_vec_cmd(
+    also_fts: bool = typer.Option(False, "--fts", help="Also rebuild fts_facts."),
+    config_path: Optional[Path] = typer.Option(None, "--config", "-c"),
+) -> None:
+    """Embed all facts into vec_facts (and optionally rebuild fts_facts)."""
+    try:
+        cfg = cfg_module.load(config_path)
+    except ValueError as exc:
+        console.print(f"[red]Config error:[/red] {exc}")
+        raise typer.Exit(1)
+
+    from loci.config import expanded
+    from loci.store import open_db, rebuild_fact_vec, rebuild_fact_fts, _FACT_VEC_VERSION
+
+    cfg_exp = expanded(cfg)
+
+    if not _embedder_model_exists(cfg_exp):
+        console.print(
+            f"[red]Embedder model not found:[/red] {cfg_exp.paths.models_dir / cfg_exp.models.embedder}\n"
+            "Run: loci models pull"
+        )
+        raise typer.Exit(1)
+
+    try:
+        from loci.models import load_embedder
+    except ImportError:
+        console.print("[red]llama-cpp-python not installed.[/red]")
+        raise typer.Exit(1)
+
+    try:
+        conn = open_db(cfg_exp.paths.knowledge_db, vec_dim=cfg_exp.models.vec_dim)
+    except Exception as exc:
+        console.print(f"[red]Cannot open DB:[/red] {exc}")
+        raise typer.Exit(1)
+
+    try:
+        if also_fts:
+            console.print("Rebuilding fts_facts…", end=" ")
+            n_fts = rebuild_fact_fts(conn)
+            conn.execute("INSERT OR REPLACE INTO db_meta(key,value) VALUES ('fact_fts_v','1')")
+            conn.commit()
+            console.print(f"[green]{n_fts} facts indexed[/green]")
+
+        console.print("Embedding facts into vec_facts…")
+        with load_embedder(cfg_exp) as embedder:
+            n_vec = rebuild_fact_vec(conn, embedder)
+        conn.execute(
+            "INSERT OR REPLACE INTO db_meta(key,value) VALUES ('fact_vec_v',?)",
+            [_FACT_VEC_VERSION],
+        )
+        conn.commit()
+        console.print(f"[green]Done.[/green] {n_vec} facts embedded.")
+    finally:
+        conn.close()
+
+
+@facts_app.command("reindex-fts-llm")
+def facts_reindex_fts_llm_cmd(
+    config_path: Optional[Path] = typer.Option(None, "--config", "-c"),
+) -> None:
+    """Rebuild the llm-only fact FTS index (fts_facts_llm)."""
+    try:
+        cfg = cfg_module.load(config_path)
+    except ValueError as exc:
+        console.print(f"[red]Config error:[/red] {exc}")
+        raise typer.Exit(1)
+
+    from loci.config import expanded
+    from loci.store import open_db, rebuild_fact_fts_llm, _FACT_FTS_LLM_VERSION
+
+    cfg_exp = expanded(cfg)
+
+    try:
+        conn = open_db(cfg_exp.paths.knowledge_db, vec_dim=cfg_exp.models.vec_dim)
+    except Exception as exc:
+        console.print(f"[red]Cannot open DB:[/red] {exc}")
+        raise typer.Exit(1)
+
+    try:
+        n = rebuild_fact_fts_llm(conn)
+        conn.execute(
+            "INSERT OR REPLACE INTO db_meta(key,value) VALUES ('fact_fts_llm_v',?)",
+            [_FACT_FTS_LLM_VERSION],
+        )
+        conn.commit()
+        console.print(
+            f"[green]fts_facts_llm rebuilt[/green] ({n} answer-shaped facts indexed)"
+        )
     finally:
         conn.close()
 

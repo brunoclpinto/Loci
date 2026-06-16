@@ -125,6 +125,11 @@ _DDL: list[str] = [
         VALUES ('delete', old.id, old.text);
       INSERT INTO fts_chunks(rowid, text) VALUES (new.id, new.text);
     END""",
+    # Standalone (non-content) FTS5 over fact triples + source sentences.
+    # rowid == facts.id so search results map back directly.
+    """CREATE VIRTUAL TABLE IF NOT EXISTS fts_facts USING fts5(text)""",
+    # LLM-only FTS index (source IN ('llm','closure')) for high-precision minted injection.
+    """CREATE VIRTUAL TABLE IF NOT EXISTS fts_facts_llm USING fts5(text)""",
 ]
 
 
@@ -148,9 +153,62 @@ def _migrate(conn: sqlite3.Connection, vec_dim: int = 384) -> None:
             "INSERT OR REPLACE INTO db_meta(key,value) VALUES ('vec_dim',?)",
             [str(vec_dim)],
         )
+    # vec_facts: created lazily (may not exist in older DBs)
+    vec_facts_exists = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='vec_facts'"
+    ).fetchone()
+    if not vec_facts_exists:
+        conn.execute(
+            f"CREATE VIRTUAL TABLE vec_facts USING vec0("
+            f"fact_id INTEGER PRIMARY KEY, embedding FLOAT[{vec_dim}])"
+        )
+        fact_n = conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0]
+        if fact_n > 0:
+            import warnings
+            warnings.warn(
+                f"vec_facts created but not populated ({fact_n} facts exist). "
+                "Run: loci facts reindex-vec"
+            )
     # Schema evolution — add columns that were not in the original DDL
     _ensure_column(conn, "chunks", "extracted_v", "INTEGER DEFAULT 0")
+    _ensure_column(conn, "facts", "source", "TEXT")
     conn.commit()
+
+    # Backfill source column from confidence values (one-time migration).
+    source_v = conn.execute(
+        "SELECT value FROM db_meta WHERE key='fact_source_v'"
+    ).fetchone()
+    if source_v is None:
+        conn.execute("UPDATE facts SET source='svo'   WHERE source IS NULL AND confidence=1.0")
+        conn.execute("UPDATE facts SET source='coref' WHERE source IS NULL AND confidence=0.6")
+        conn.execute("UPDATE facts SET source='llm'   WHERE source IS NULL AND confidence=0.7")
+        conn.execute("INSERT OR REPLACE INTO db_meta(key,value) VALUES ('fact_source_v','1')")
+        conn.commit()
+
+    # Backfill/upgrade fact FTS when DB is missing or on an older version.
+    fts_v = conn.execute(
+        "SELECT value FROM db_meta WHERE key='fact_fts_v'"
+    ).fetchone()
+    fact_n = conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0]
+    if (fts_v is None or fts_v[0] != _FACT_FTS_VERSION) and fact_n > 0:
+        rebuild_fact_fts(conn)
+        conn.execute(
+            "INSERT OR REPLACE INTO db_meta(key,value) VALUES ('fact_fts_v',?)",
+            [_FACT_FTS_VERSION],
+        )
+        conn.commit()
+
+    # Build/upgrade the llm-only FTS index.
+    fts_llm_v = conn.execute(
+        "SELECT value FROM db_meta WHERE key='fact_fts_llm_v'"
+    ).fetchone()
+    if (fts_llm_v is None or fts_llm_v[0] != _FACT_FTS_LLM_VERSION) and fact_n > 0:
+        rebuild_fact_fts_llm(conn)
+        conn.execute(
+            "INSERT OR REPLACE INTO db_meta(key,value) VALUES ('fact_fts_llm_v',?)",
+            [_FACT_FTS_LLM_VERSION],
+        )
+        conn.commit()
 
 
 def _ensure_column(conn: sqlite3.Connection, table: str, col: str, col_def: str) -> None:
@@ -244,6 +302,7 @@ def insert_fact(
     qualifiers: dict | None = None,
     negated: bool = False,
     confidence: float = 1.0,
+    source: str = "svo",
 ) -> int | None:
     """Insert fact; returns new id, or None if it duplicates an existing fact."""
     q_json = json.dumps(qualifiers, sort_keys=True) if qualifiers else None
@@ -258,10 +317,10 @@ def insert_fact(
     cur = conn.execute(
         """INSERT INTO facts
              (chunk_id, sentence, subject_id, predicate, object_id,
-              object_text, qualifiers, negated, confidence)
-           VALUES (?,?,?,?,?,?,?,?,?)""",
+              object_text, qualifiers, negated, confidence, source)
+           VALUES (?,?,?,?,?,?,?,?,?,?)""",
         [chunk_id, sentence, subject_id, predicate, object_id,
-         object_text, q_json, int(negated), confidence],
+         object_text, q_json, int(negated), confidence, source],
     )
     conn.commit()
     return cur.lastrowid
@@ -330,6 +389,157 @@ def fts_search_chunks(
             f" WHERE fts MATCH ? ORDER BY fts.rank LIMIT ?",
             [query, k],
         ).fetchall()
+    return [dict(r) for r in rows]
+
+
+_FACT_FTS_VERSION = "1"
+_FACT_FTS_LLM_VERSION = "2"
+_FACT_VEC_VERSION = "1"
+
+# Question-mapped predicates only — keeps fts_facts_llm high-precision.
+# Excludes generic copulas/verbs (be, call, say, have, take, …) that distract
+# the model as [F#] injections without answering questions.
+_ANSWER_SHAPED_PREDICATES: frozenset[str] = frozenset([
+    "profession", "occupation", "role", "identity", "alias_of", "title",
+    "means", "mean",
+    "located_at", "resides_at", "reside_at",
+    "relationship_to", "affiliation", "leader_of",
+    "introduce", "murder", "cause_of", "named_after",
+    "work_as",
+])
+
+
+def rebuild_fact_fts(conn: sqlite3.Connection) -> int:
+    """(Re)build the fts_facts index from the current facts table.
+
+    Indexed document per fact = subject name + predicate + object + source sentence.
+    Returns number of facts indexed.
+    """
+    conn.execute("DELETE FROM fts_facts")
+    rows = conn.execute(
+        """
+        SELECT f.id AS fid,
+               e.canonical_name AS subj,
+               f.predicate AS pred,
+               COALESCE(oe.canonical_name, f.object_text, '') AS obj,
+               f.sentence AS sent
+        FROM facts f
+        JOIN entities e  ON f.subject_id = e.id
+        LEFT JOIN entities oe ON f.object_id = oe.id
+        """
+    ).fetchall()
+    n = 0
+    for r in rows:
+        pred = (r["pred"] or "").replace("_", " ")
+        doc = f"{r['subj']} {pred} {r['obj']} {r['sent']}"
+        conn.execute("INSERT INTO fts_facts(rowid, text) VALUES (?, ?)",
+                     [r["fid"], doc])
+        n += 1
+    conn.commit()
+    return n
+
+
+def rebuild_fact_fts_llm(conn: sqlite3.Connection) -> int:
+    """(Re)build fts_facts_llm — indexes only llm and closure facts.
+
+    Same document format as rebuild_fact_fts. Used for high-precision retrieval
+    when fact_sources=minted so SVO noise doesn't dilute rankings.
+    Returns number of facts indexed.
+    """
+    conn.execute("DELETE FROM fts_facts_llm")
+    placeholders = ",".join("?" * len(_ANSWER_SHAPED_PREDICATES))
+    rows = conn.execute(
+        f"""
+        SELECT f.id AS fid,
+               e.canonical_name AS subj,
+               f.predicate AS pred,
+               COALESCE(oe.canonical_name, f.object_text, '') AS obj,
+               f.sentence AS sent
+        FROM facts f
+        JOIN entities e  ON f.subject_id = e.id
+        LEFT JOIN entities oe ON f.object_id = oe.id
+        WHERE f.source IN ('llm', 'closure')
+          AND f.predicate IN ({placeholders})
+        """,
+        list(_ANSWER_SHAPED_PREDICATES),
+    ).fetchall()
+    n = 0
+    for r in rows:
+        pred = (r["pred"] or "").replace("_", " ")
+        doc = f"{r['subj']} {pred} {r['obj']} {r['sent']}"
+        conn.execute("INSERT INTO fts_facts_llm(rowid, text) VALUES (?, ?)",
+                     [r["fid"], doc])
+        n += 1
+    conn.commit()
+    return n
+
+
+def fts_search_facts(
+    conn: sqlite3.Connection, *, query: str, k: int = 10, schema: str = "main"
+) -> list[dict]:
+    if schema == "main":
+        rows = conn.execute(
+            "SELECT rowid AS fact_id, rank FROM fts_facts"
+            " WHERE text MATCH ? ORDER BY rank LIMIT ?",
+            [query, k],
+        ).fetchall()
+    else:
+        sp = f"{schema}."
+        rows = conn.execute(
+            f"SELECT fts.rowid AS fact_id, fts.rank"
+            f" FROM {sp}fts_facts fts WHERE fts MATCH ? ORDER BY fts.rank LIMIT ?",
+            [query, k],
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def rebuild_fact_vec(conn: sqlite3.Connection, embedder: object) -> int:
+    """(Re)build vec_facts by embedding each fact's document string.
+
+    Doc text = same string rebuild_fact_fts builds: '{subj} {pred} {obj} {sentence}'.
+    Returns number of facts embedded.
+    """
+    from loci.models import embed_batch
+    rows = conn.execute(
+        """SELECT f.id AS fid,
+                  e.canonical_name AS subj,
+                  f.predicate AS pred,
+                  COALESCE(oe.canonical_name, f.object_text, '') AS obj,
+                  f.sentence AS sent
+           FROM facts f
+           JOIN entities e ON f.subject_id = e.id
+           LEFT JOIN entities oe ON f.object_id = oe.id"""
+    ).fetchall()
+    if not rows:
+        return 0
+    docs = [
+        f"{r['subj']} {(r['pred'] or '').replace('_', ' ')} {r['obj']} {r['sent']}"
+        for r in rows
+    ]
+    conn.execute("DELETE FROM vec_facts")
+    embs = embed_batch(embedder, docs, normalize=True)
+    for r, emb in zip(rows, embs):
+        conn.execute(
+            "INSERT INTO vec_facts(fact_id, embedding) VALUES (?,?)",
+            [r["fid"], _ser(emb)],
+        )
+    conn.commit()
+    return len(rows)
+
+
+def vec_search_facts(
+    conn: sqlite3.Connection, *, embedding: list[float], k: int = 10, schema: str = "main"
+) -> list[dict]:
+    """Return top-k facts by vector similarity. Returns [{fact_id, distance}]."""
+    sp = f"{schema}." if schema != "main" else ""
+    try:
+        rows = conn.execute(
+            f"SELECT fact_id, distance FROM {sp}vec_facts"
+            f" WHERE embedding MATCH ? ORDER BY distance LIMIT ?",
+            [_ser(embedding), k],
+        ).fetchall()
+    except Exception:
+        return []
     return [dict(r) for r in rows]
 
 
