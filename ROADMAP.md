@@ -37,13 +37,15 @@ plan file (linked below) with full implementation detail, tests, bench, and succ
 > and jarvey|mean|cab driver minted. Bench: minted-4 runs=1=65.25 (+0.90, noise); runs=3=61.70 (−2.65), halluc=2
 > — same 3B bound as Phase Q. Data improvements are real but 3B model can't handle injection. Injection stays OFF.
 >
-> **Phase N (2026-06-16):** All 3B-footprint candidates tested (runs=3 each, qna_scarlet 100-Q):
-> Llama-3.2-3B=63.55 (halluc=3, para=35.5 −11.5, RSS=2594 MB — disqualified);
+> **Phase N (2026-06-16):** All 3B-footprint and Phi-4-mini candidates tested (runs=3 each, qna_scarlet 100-Q):
+> Llama-3.2-3B=63.55 (halluc=3, para=35.5 −11.5, RSS=2594 MB);
 > Qwen3.5-2B=52.55 (halluc=5, neg=86.5 — too small to follow citation rules);
-> Qwen3-1.7B Q8_0=46.30 (thinking mode active despite /no_think, over-refuses, fact=11.6);
-> Gemma3-1B=41.0 (halluc=18, neg=64.9 — 1B can't suppress training knowledge).
-> No candidate beats Qwen2.5-3B. **Incumbent stays.** Phi-4-mini-instruct (3.8B, on SSD) and
-> Qwen2.5-7B (on SSD, 4.4 GB) remain untested options if a future upgrade is needed.
+> Qwen3-1.7B Q8_0=46.30 (thinking mode fires despite /no_think, over-refuses fact+para, fact=11.6);
+> Gemma3-1B=41.0 (halluc=18, neg=64.9 — 1B can't suppress training knowledge);
+> Phi-4-mini-instruct=53.15 with simple prompt (multi=0, RSS=3607 MB; verbose prompt causes 93% refusals;
+> simple prompt collapses multi-hop and bloats RSS; also tested Qwen2.5-3B+simple=52.70 → verbose prompt
+> is load-bearing for Qwen2.5-3B). No candidate beats Qwen2.5-3B. **Incumbent stays (verbose prompt kept).**
+> Qwen2.5-7B (4.4 GB, on SSD) remains the only untested upgrade path.
 
 ---
 
@@ -58,7 +60,7 @@ plan file (linked below) with full implementation detail, tests, bench, and succ
 | 4 | **C** — rerank, don't pre-truncate (P2) | [planC_rerank.md](planC_rerank.md) | `DONE (F2=off; pool=62.80 -1.55 vs M; wider pool floods RRF with mediocre overlap → para -22)` | — (independent) | yes |
 | 5 | **E** — paraphrase / multi-hop (P3) | [planE_paraphrase.md](planE_paraphrase.md) | `DONE (F2=off; HyDE=62.65 -1.70, halluc 1→3 violates guardrail; hyde_query=false)` | — | yes |
 | 6 | **Q** — SVO quarantine + fact provenance | [planQ_quarantine.md](planQ_quarantine.md) | `DONE (🛑 FAIL; best arm=minted-4+fix=63.20, −1.15 vs M; halluc=2 persists; 3B bound; escalate to 4-5B)` | P1 | no (🛑 gate) |
-| 7 | **N** — base model selection | [planN_modelbench.md](planN_modelbench.md) | `DONE (🛑 no winner; Qwen2.5-3B stays incumbent; all 3B-footprint candidates failed: Llama-3.2-3B=63.55 halluc=3, Qwen3.5-2B=52.55 halluc=5, Qwen3-1.7B=46.30 over-refuses, Gemma3-1B=41.0 halluc=18)` | Q | yes |
+| 7 | **N** — base model selection | [planN_modelbench.md](planN_modelbench.md) | `DONE (🛑 no winner; Qwen2.5-3B stays incumbent; all candidates failed: Llama-3.2-3B=63.55 halluc=3, Qwen3.5-2B=52.55 halluc=5, Qwen3-1.7B=46.30 over-refuses, Gemma3-1B=41.0 halluc=18, Phi-4-mini=53.15 multi=0 RSS=3.6GB)` | Q | yes |
 | 8 | **P2** — multi-pass ingest | [planP2_multipass.md](planP2_multipass.md) | `DONE (🛑 FAIL on injection; ran ahead of N; entity+implied passes minted 285 new llm facts (380→665, 1739→2024 total); RACHE+Hope cab driver now correct; but minted-4 runs=3=61.70 −2.65 vs M, halluc=2 — same 3B bound as Q; injection off; data in DB ready for N winner)` | N (needs winning model first) | yes |
 
 > **Keep this table current.** When a phase finishes, set its `Status` to `DONE (overall=NN.N, fact=NN.N)`
