@@ -486,3 +486,23 @@ class TestFtsFactsLLM:
         n2 = rebuild_fact_fts_llm(tmp_db)
         assert n1 == n2
         assert tmp_db.execute("SELECT COUNT(*) FROM fts_facts_llm").fetchone()[0] == n1
+
+    def test_excludes_generic_predicate(self, tmp_db):
+        src_id = insert_source(tmp_db, sha256=sha("gp_src"), title="GP")
+        chunk_id = insert_chunk(tmp_db, source_id=src_id, ordinal=0,
+                                text="Holmes said something.", sha256=sha("gp_chunk"))
+        eid = insert_entity(tmp_db, canonical_name="Holmes", kind="person")
+        generic_id = insert_fact(tmp_db, chunk_id=chunk_id,
+                                 sentence="Holmes said something.",
+                                 subject_id=eid, predicate="be",
+                                 object_text="something", source="llm")
+        shaped_id = insert_fact(tmp_db, chunk_id=chunk_id,
+                                sentence="Holmes works as a detective.",
+                                subject_id=eid, predicate="work_as",
+                                object_text="detective", source="llm")
+        n = rebuild_fact_fts_llm(tmp_db)
+        assert n == 1
+        rows = tmp_db.execute("SELECT rowid FROM fts_facts_llm").fetchall()
+        ids = {r[0] for r in rows}
+        assert shaped_id in ids
+        assert generic_id not in ids

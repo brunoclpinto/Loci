@@ -1465,6 +1465,42 @@ def facts_reindex_vec_cmd(
         conn.close()
 
 
+@facts_app.command("reindex-fts-llm")
+def facts_reindex_fts_llm_cmd(
+    config_path: Optional[Path] = typer.Option(None, "--config", "-c"),
+) -> None:
+    """Rebuild the llm-only fact FTS index (fts_facts_llm)."""
+    try:
+        cfg = cfg_module.load(config_path)
+    except ValueError as exc:
+        console.print(f"[red]Config error:[/red] {exc}")
+        raise typer.Exit(1)
+
+    from loci.config import expanded
+    from loci.store import open_db, rebuild_fact_fts_llm, _FACT_FTS_LLM_VERSION
+
+    cfg_exp = expanded(cfg)
+
+    try:
+        conn = open_db(cfg_exp.paths.knowledge_db, vec_dim=cfg_exp.models.vec_dim)
+    except Exception as exc:
+        console.print(f"[red]Cannot open DB:[/red] {exc}")
+        raise typer.Exit(1)
+
+    try:
+        n = rebuild_fact_fts_llm(conn)
+        conn.execute(
+            "INSERT OR REPLACE INTO db_meta(key,value) VALUES ('fact_fts_llm_v',?)",
+            [_FACT_FTS_LLM_VERSION],
+        )
+        conn.commit()
+        console.print(
+            f"[green]fts_facts_llm rebuilt[/green] ({n} answer-shaped facts indexed)"
+        )
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

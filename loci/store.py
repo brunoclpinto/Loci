@@ -393,8 +393,20 @@ def fts_search_chunks(
 
 
 _FACT_FTS_VERSION = "1"
-_FACT_FTS_LLM_VERSION = "1"
+_FACT_FTS_LLM_VERSION = "2"
 _FACT_VEC_VERSION = "1"
+
+# Question-mapped predicates only — keeps fts_facts_llm high-precision.
+# Excludes generic copulas/verbs (be, call, say, have, take, …) that distract
+# the model as [F#] injections without answering questions.
+_ANSWER_SHAPED_PREDICATES: frozenset[str] = frozenset([
+    "profession", "occupation", "role", "identity", "alias_of", "title",
+    "means", "mean",
+    "located_at", "resides_at", "reside_at",
+    "relationship_to", "affiliation", "leader_of",
+    "introduce", "murder", "cause_of", "named_after",
+    "work_as",
+])
 
 
 def rebuild_fact_fts(conn: sqlite3.Connection) -> int:
@@ -435,8 +447,9 @@ def rebuild_fact_fts_llm(conn: sqlite3.Connection) -> int:
     Returns number of facts indexed.
     """
     conn.execute("DELETE FROM fts_facts_llm")
+    placeholders = ",".join("?" * len(_ANSWER_SHAPED_PREDICATES))
     rows = conn.execute(
-        """
+        f"""
         SELECT f.id AS fid,
                e.canonical_name AS subj,
                f.predicate AS pred,
@@ -446,7 +459,9 @@ def rebuild_fact_fts_llm(conn: sqlite3.Connection) -> int:
         JOIN entities e  ON f.subject_id = e.id
         LEFT JOIN entities oe ON f.object_id = oe.id
         WHERE f.source IN ('llm', 'closure')
-        """
+          AND f.predicate IN ({placeholders})
+        """,
+        list(_ANSWER_SHAPED_PREDICATES),
     ).fetchall()
     n = 0
     for r in rows:
