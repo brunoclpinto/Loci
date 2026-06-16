@@ -9,7 +9,8 @@ class TestDefaults:
     def test_returns_config_instance(self):
         assert isinstance(load(), Config)
 
-    def test_default_values(self):
+    def test_default_values(self, monkeypatch):
+        monkeypatch.setattr("loci.config._find_config_file", lambda _: None)
         cfg = load()
         assert cfg.models.n_ctx == 4096
         assert cfg.retrieval.vec_top_k == 12
