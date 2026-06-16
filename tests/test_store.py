@@ -15,6 +15,7 @@ from loci.store import (
     insert_source,
     open_db,
     rebuild_fact_fts,
+    rebuild_fact_fts_llm,
     rebuild_fact_vec,
     upsert_vec_chunk,
     upsert_vec_entity,
@@ -428,3 +429,60 @@ class TestFactSourceColumn:
         ).fetchone()
         conn2.close()
         assert row["source"] == "svo"
+
+
+# ---------------------------------------------------------------------------
+# fts_facts_llm — llm+closure only index
+# ---------------------------------------------------------------------------
+
+def _seed_mixed_sources(conn):
+    """Insert one svo fact and one llm fact into the same DB."""
+    src_id = insert_source(conn, sha256=sha("mix_src"), title="Mix")
+    chunk_id = insert_chunk(conn, source_id=src_id, ordinal=0,
+                            text="Holmes took a cab.", sha256=sha("mix_chunk"))
+    eid = insert_entity(conn, canonical_name="Holmes", kind="person")
+    svo_id = insert_fact(conn, chunk_id=chunk_id,
+                         sentence="Holmes took a cab.",
+                         subject_id=eid, predicate="take",
+                         object_text="cab", source="svo")
+    llm_id = insert_fact(conn, chunk_id=chunk_id,
+                         sentence="Holmes is a consulting detective.",
+                         subject_id=eid, predicate="profession",
+                         object_text="consulting detective", source="llm")
+    return svo_id, llm_id, eid
+
+
+class TestFtsFactsLLM:
+    def test_table_exists(self, tmp_db):
+        names = {r[0] for r in tmp_db.execute("SELECT name FROM sqlite_master")}
+        assert "fts_facts_llm" in names
+
+    def test_rebuild_excludes_svo(self, tmp_db):
+        svo_id, llm_id, _ = _seed_mixed_sources(tmp_db)
+        n = rebuild_fact_fts_llm(tmp_db)
+        assert n == 1  # only the llm fact
+        rows = tmp_db.execute("SELECT rowid FROM fts_facts_llm").fetchall()
+        ids = {r[0] for r in rows}
+        assert llm_id in ids
+        assert svo_id not in ids
+
+    def test_rebuild_includes_closure(self, tmp_db):
+        _, _, eid = _seed_mixed_sources(tmp_db)
+        src_id = insert_source(tmp_db, sha256=sha("cl_src"), title="Cl")
+        chunk_id = insert_chunk(tmp_db, source_id=src_id, ordinal=0,
+                                text="Derived.", sha256=sha("cl_chunk"))
+        cl_id = insert_fact(tmp_db, chunk_id=chunk_id,
+                            sentence="Derived: Holmes profession detective.",
+                            subject_id=eid, predicate="profession",
+                            object_text="detective", source="closure")
+        rebuild_fact_fts_llm(tmp_db)
+        rows = tmp_db.execute("SELECT rowid FROM fts_facts_llm").fetchall()
+        ids = {r[0] for r in rows}
+        assert cl_id in ids
+
+    def test_idempotent_rebuild(self, tmp_db):
+        _seed_mixed_sources(tmp_db)
+        n1 = rebuild_fact_fts_llm(tmp_db)
+        n2 = rebuild_fact_fts_llm(tmp_db)
+        assert n1 == n2
+        assert tmp_db.execute("SELECT COUNT(*) FROM fts_facts_llm").fetchone()[0] == n1

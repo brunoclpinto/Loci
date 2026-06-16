@@ -128,6 +128,8 @@ _DDL: list[str] = [
     # Standalone (non-content) FTS5 over fact triples + source sentences.
     # rowid == facts.id so search results map back directly.
     """CREATE VIRTUAL TABLE IF NOT EXISTS fts_facts USING fts5(text)""",
+    # LLM-only FTS index (source IN ('llm','closure')) for high-precision minted injection.
+    """CREATE VIRTUAL TABLE IF NOT EXISTS fts_facts_llm USING fts5(text)""",
 ]
 
 
@@ -193,6 +195,18 @@ def _migrate(conn: sqlite3.Connection, vec_dim: int = 384) -> None:
         conn.execute(
             "INSERT OR REPLACE INTO db_meta(key,value) VALUES ('fact_fts_v',?)",
             [_FACT_FTS_VERSION],
+        )
+        conn.commit()
+
+    # Build/upgrade the llm-only FTS index.
+    fts_llm_v = conn.execute(
+        "SELECT value FROM db_meta WHERE key='fact_fts_llm_v'"
+    ).fetchone()
+    if (fts_llm_v is None or fts_llm_v[0] != _FACT_FTS_LLM_VERSION) and fact_n > 0:
+        rebuild_fact_fts_llm(conn)
+        conn.execute(
+            "INSERT OR REPLACE INTO db_meta(key,value) VALUES ('fact_fts_llm_v',?)",
+            [_FACT_FTS_LLM_VERSION],
         )
         conn.commit()
 
@@ -379,6 +393,7 @@ def fts_search_chunks(
 
 
 _FACT_FTS_VERSION = "1"
+_FACT_FTS_LLM_VERSION = "1"
 _FACT_VEC_VERSION = "1"
 
 
@@ -406,6 +421,38 @@ def rebuild_fact_fts(conn: sqlite3.Connection) -> int:
         pred = (r["pred"] or "").replace("_", " ")
         doc = f"{r['subj']} {pred} {r['obj']} {r['sent']}"
         conn.execute("INSERT INTO fts_facts(rowid, text) VALUES (?, ?)",
+                     [r["fid"], doc])
+        n += 1
+    conn.commit()
+    return n
+
+
+def rebuild_fact_fts_llm(conn: sqlite3.Connection) -> int:
+    """(Re)build fts_facts_llm — indexes only llm and closure facts.
+
+    Same document format as rebuild_fact_fts. Used for high-precision retrieval
+    when fact_sources=minted so SVO noise doesn't dilute rankings.
+    Returns number of facts indexed.
+    """
+    conn.execute("DELETE FROM fts_facts_llm")
+    rows = conn.execute(
+        """
+        SELECT f.id AS fid,
+               e.canonical_name AS subj,
+               f.predicate AS pred,
+               COALESCE(oe.canonical_name, f.object_text, '') AS obj,
+               f.sentence AS sent
+        FROM facts f
+        JOIN entities e  ON f.subject_id = e.id
+        LEFT JOIN entities oe ON f.object_id = oe.id
+        WHERE f.source IN ('llm', 'closure')
+        """
+    ).fetchall()
+    n = 0
+    for r in rows:
+        pred = (r["pred"] or "").replace("_", " ")
+        doc = f"{r['subj']} {pred} {r['obj']} {r['sent']}"
+        conn.execute("INSERT INTO fts_facts_llm(rowid, text) VALUES (?, ?)",
                      [r["fid"], doc])
         n += 1
     conn.commit()

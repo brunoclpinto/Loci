@@ -468,17 +468,43 @@ def fts_search_question(
 
 
 def fact_fts_search_question(
-    conn: sqlite3.Connection, question: str, k: int, schema: str = "main"
+    conn: sqlite3.Connection,
+    question: str,
+    k: int,
+    schema: str = "main",
+    *,
+    source_filter: set | None = None,
 ) -> list[int]:
-    """Stopword-stripped OR query over fts_facts → ranked fact_ids."""
-    from loci.store import fts_search_facts
+    """Stopword-stripped OR query over fts_facts → ranked fact_ids.
+
+    When source_filter contains 'llm', queries fts_facts_llm (llm+closure only)
+    instead of fts_facts (all sources). This eliminates SVO noise from rankings
+    when minted injection is active.
+    """
     words = _NONWORD.sub(" ", question.lower()).split()
     content = [w for w in words if w and w not in _FTS_STOPWORDS and len(w) > 2]
     if not content:
         return []
     query = " OR ".join(content)
+
+    use_llm_table = source_filter is not None and "llm" in source_filter
+    table = "fts_facts_llm" if use_llm_table else "fts_facts"
+
     try:
-        return [r["fact_id"] for r in fts_search_facts(conn, query=query, k=k, schema=schema)]
+        if schema == "main":
+            rows = conn.execute(
+                f"SELECT rowid AS fact_id, rank FROM {table}"
+                f" WHERE text MATCH ? ORDER BY rank LIMIT ?",
+                [query, k],
+            ).fetchall()
+        else:
+            sp = f"{schema}."
+            rows = conn.execute(
+                f"SELECT fts.rowid AS fact_id, fts.rank"
+                f" FROM {sp}{table} fts WHERE fts MATCH ? ORDER BY fts.rank LIMIT ?",
+                [query, k],
+            ).fetchall()
+        return [r["fact_id"] for r in rows]
     except Exception:
         return []
 
@@ -733,12 +759,18 @@ def retrieve(
         timings["fact_ms"] = fact_ms
 
     # Fact FTS (additive): keyword recall over fact triples + source sentences.
-    # Over-pull by 4× when source_filter is active so quarantining doesn't starve the pool.
-    _fts_fact_k = cfg.retrieval.fact_fts_top_k * (4 if source_filter else 1)
+    # When source_filter includes 'llm', routes to fts_facts_llm (no SVO noise)
+    # so no over-pull is needed. Otherwise over-pull 4× to compensate for dilution.
+    _use_llm_fts = source_filter is not None and "llm" in source_filter
+    _fts_fact_k = cfg.retrieval.fact_fts_top_k if _use_llm_fts else (
+        cfg.retrieval.fact_fts_top_k * (4 if source_filter else 1)
+    )
     all_fact_fts_ids: list[int] = []
     seen_fids = {h.fact_id for h in all_fact_hits}
     for schema in schemas:
-        fids = fact_fts_search_question(conn, question, _fts_fact_k, schema=schema)
+        fids = fact_fts_search_question(
+            conn, question, _fts_fact_k, schema=schema, source_filter=source_filter
+        )
         fids = [fid for fid in fids if fid not in seen_fids]
         if fids:
             all_fact_hits.extend(load_fact_hits_by_ids(conn, fids, schema=schema,

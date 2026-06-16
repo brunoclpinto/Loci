@@ -10,6 +10,7 @@ from loci.enhance import (
     build_implied_messages,
     enhance_chunk,
     parse_llm_facts,
+    run_closure_pass,
     run_enhance,
     run_entity_pass,
     run_implied_pass,
@@ -594,4 +595,85 @@ class TestRunImpliedPass:
         llm = FakeExtractLLM("[]")
         stats = run_implied_pass(conn, llm=llm, cfg=default_cfg)
         assert stats["chunks_processed"] == 3
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Closure pass
+# ---------------------------------------------------------------------------
+
+def _make_closure_db(tmp_path):
+    """DB with Hope|work_as|jarvey + jarvey|means|cab driver ready for closure."""
+    from loci.store import open_db, insert_source, insert_chunk, insert_entity, insert_alias, insert_fact
+    conn = open_db(tmp_path / "closure.db")
+    src_id = insert_source(conn, path="c.txt", sha256="xcl")
+    chunk_id = insert_chunk(conn, source_id=src_id, ordinal=0,
+                            text="Hope drove a jarvey.", sha256="ccl")
+    hope_id = insert_entity(conn, canonical_name="Jefferson Hope", kind="person")
+    insert_alias(conn, entity_id=hope_id, alias="jefferson hope")
+    jarvey_id = insert_entity(conn, canonical_name="jarvey", kind="concept")
+    insert_alias(conn, entity_id=jarvey_id, alias="jarvey")
+    # Hope|work_as|jarvey (object_text, not object_id)
+    insert_fact(conn, chunk_id=chunk_id, sentence="Hope drove a jarvey.",
+                subject_id=hope_id, predicate="work_as", object_text="jarvey",
+                confidence=0.75, source="llm")
+    # jarvey|means|cab driver
+    insert_fact(conn, chunk_id=chunk_id, sentence="A jarvey means a cab driver.",
+                subject_id=jarvey_id, predicate="means", object_text="cab driver",
+                confidence=0.9, source="llm")
+    conn.commit()
+    return conn, hope_id, jarvey_id
+
+
+class TestRunClosurePass:
+    def test_basic(self, tmp_path, default_cfg):
+        conn, hope_id, _ = _make_closure_db(tmp_path)
+        stats = run_closure_pass(conn, cfg=default_cfg)
+        assert stats["facts_added"] >= 1
+        assert stats["chains_found"] >= 1
+        row = conn.execute(
+            "SELECT source, object_text FROM facts WHERE subject_id=? AND predicate='work_as' AND object_text='cab driver'",
+            [hope_id],
+        ).fetchone()
+        assert row is not None
+        assert row["source"] == "closure"
+        conn.close()
+
+    def test_idempotent(self, tmp_path, default_cfg):
+        conn, _, _ = _make_closure_db(tmp_path / "idem_cl")
+        run_closure_pass(conn, cfg=default_cfg)
+        stats2 = run_closure_pass(conn, cfg=default_cfg)
+        assert stats2.get("skipped") is True
+        assert stats2["facts_added"] == 0
+        conn.close()
+
+    def test_skips_means_facts(self, tmp_path, default_cfg):
+        conn, _, jarvey_id = _make_closure_db(tmp_path / "nomeans")
+        run_closure_pass(conn, cfg=default_cfg)
+        # jarvey|means|cab driver should not spawn jarvey|means|<something else>
+        rows = conn.execute(
+            "SELECT * FROM facts WHERE subject_id=? AND predicate='means' AND source='closure'",
+            [jarvey_id],
+        ).fetchall()
+        assert len(rows) == 0
+        conn.close()
+
+    def test_skips_negated(self, tmp_path, default_cfg):
+        from loci.store import open_db, insert_source, insert_chunk, insert_entity, insert_alias, insert_fact
+        conn = open_db(tmp_path / "neg_cl.db")
+        src_id = insert_source(conn, path="n.txt", sha256="xneg")
+        cid = insert_chunk(conn, source_id=src_id, ordinal=0, text="Not a jarvey.", sha256="cneg")
+        eid = insert_entity(conn, canonical_name="Holmes", kind="person")
+        insert_alias(conn, entity_id=eid, alias="holmes")
+        jid = insert_entity(conn, canonical_name="jarvey", kind="concept")
+        # negated source fact
+        insert_fact(conn, chunk_id=cid, sentence="Holmes was not a jarvey.",
+                    subject_id=eid, predicate="work_as", object_text="jarvey",
+                    negated=True, confidence=0.75, source="llm")
+        insert_fact(conn, chunk_id=cid, sentence="A jarvey means a cab driver.",
+                    subject_id=jid, predicate="means", object_text="cab driver",
+                    confidence=0.9, source="llm")
+        conn.commit()
+        stats = run_closure_pass(conn, cfg=default_cfg)
+        assert stats["facts_added"] == 0
         conn.close()

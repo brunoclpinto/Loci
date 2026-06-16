@@ -8,8 +8,10 @@ from typing import Any
 # db_meta keys for idempotency guards
 _P2_ENTITY_META_KEY = "p2_entity_v"
 _P2_IMPLIED_META_KEY = "p2_implied_v"
+_CLOSURE_META_KEY = "closure_v"
 _P2_ENTITY_VERSION = "1"
 _P2_IMPLIED_VERSION = "1"
+_CLOSURE_VERSION = "1"
 
 # ---------------------------------------------------------------------------
 # P1 relation taxonomy — predicates that match question vocabulary
@@ -548,6 +550,132 @@ def run_implied_pass(
     return {"chunks_processed": len(rows), "facts_added": n_facts, "skipped": False}
 
 
+def run_closure_pass(
+    conn: Any,
+    *,
+    cfg: Any,
+    embedder: Any = None,
+) -> dict:
+    """Graph closure: for every X--[pred]-->Y + Y--[means]-->Z, mint X--[pred]-->Z.
+
+    Materialises vocabulary bridges at ingest time so FTS can find them with a
+    single slot. E.g.: Hope|work_as|jarvey + jarvey|means|cab driver
+    → Hope|work_as|cab driver (source='closure').
+    No LLM calls — pure graph traversal over existing facts.
+    """
+    from loci.store import insert_fact, rebuild_fact_fts_llm, _FACT_FTS_LLM_VERSION
+
+    done = conn.execute(
+        "SELECT value FROM db_meta WHERE key=?", [_CLOSURE_META_KEY]
+    ).fetchone()
+    if done and done[0] == _CLOSURE_VERSION:
+        return {"facts_added": 0, "chains_found": 0, "skipped": True}
+
+    # Build means map: entity_id → [synonyms] and surface text → [synonyms]
+    means_rows = conn.execute(
+        """SELECT f.subject_id, e.canonical_name, f.object_text
+           FROM facts f
+           JOIN entities e ON f.subject_id = e.id
+           WHERE f.predicate IN ('means', 'mean')
+             AND f.object_text IS NOT NULL
+             AND NOT f.negated"""
+    ).fetchall()
+
+    means_by_entity_id: dict[int, list[str]] = {}
+    means_by_surface: dict[str, list[str]] = {}
+    for r in means_rows:
+        eid = r[0] if isinstance(r, (list, tuple)) else r["subject_id"]
+        name = (r[1] if isinstance(r, (list, tuple)) else r["canonical_name"]).lower()
+        syn = r[2] if isinstance(r, (list, tuple)) else r["object_text"]
+        means_by_entity_id.setdefault(eid, []).append(syn)
+        means_by_surface.setdefault(name, []).append(syn)
+
+    if not means_by_entity_id and not means_by_surface:
+        conn.execute(
+            "INSERT OR REPLACE INTO db_meta(key,value) VALUES (?,?)",
+            [_CLOSURE_META_KEY, _CLOSURE_VERSION],
+        )
+        conn.commit()
+        return {"facts_added": 0, "chains_found": 0, "skipped": False}
+
+    # Scan all non-means facts and look for object → means chain
+    fact_rows = conn.execute(
+        """SELECT f.subject_id, f.predicate, f.object_id, f.object_text,
+                  f.sentence, f.chunk_id, f.confidence,
+                  e.canonical_name AS subj
+           FROM facts f
+           JOIN entities e ON f.subject_id = e.id
+           WHERE f.predicate NOT IN ('means', 'mean') AND NOT f.negated"""
+    ).fetchall()
+
+    n_facts = 0
+    n_chains = 0
+    for r in fact_rows:
+        if isinstance(r, (list, tuple)):
+            subj_id, pred, obj_id, obj_text, sent, chunk_id, conf, subj = r
+        else:
+            subj_id = r["subject_id"]
+            pred = r["predicate"]
+            obj_id = r["object_id"]
+            obj_text = r["object_text"]
+            sent = r["sentence"]
+            chunk_id = r["chunk_id"]
+            conf = r["confidence"]
+            subj = r["subj"]
+
+        synonyms: list[str] = []
+        via: str = ""
+
+        if obj_id is not None and obj_id in means_by_entity_id:
+            synonyms = means_by_entity_id[obj_id]
+            via = str(obj_id)  # entity id; sentence will clarify
+        elif obj_text:
+            surface = obj_text.lower().strip()
+            if surface in means_by_surface:
+                synonyms = means_by_surface[surface]
+                via = obj_text
+
+        if not synonyms:
+            continue
+
+        n_chains += 1
+        for syn in synonyms:
+            if syn == obj_text:
+                continue  # already the same text
+            # Pre-check: skip if this closure triple already exists (any chunk)
+            if conn.execute(
+                "SELECT 1 FROM facts WHERE subject_id=? AND predicate=? AND object_text=?",
+                [subj_id, pred, syn],
+            ).fetchone():
+                continue
+            closure_sentence = f"Derived: {subj} {pred} {syn} (via {via or obj_text})"
+            fid = insert_fact(
+                conn,
+                chunk_id=chunk_id,  # inherit source fact's chunk (valid FK)
+                sentence=closure_sentence,
+                subject_id=subj_id,
+                predicate=pred,
+                object_text=syn,
+                confidence=round((conf or 1.0) * 0.9, 3),
+                source="closure",
+            )
+            if fid is not None:
+                n_facts += 1
+
+    # Rebuild llm-only FTS so closure facts are immediately searchable
+    rebuild_fact_fts_llm(conn)
+    conn.execute(
+        "INSERT OR REPLACE INTO db_meta(key,value) VALUES ('fact_fts_llm_v',?)",
+        [_FACT_FTS_LLM_VERSION],
+    )
+    conn.execute(
+        "INSERT OR REPLACE INTO db_meta(key,value) VALUES (?,?)",
+        [_CLOSURE_META_KEY, _CLOSURE_VERSION],
+    )
+    conn.commit()
+    return {"facts_added": n_facts, "chains_found": n_chains, "skipped": False}
+
+
 def run_enhance(
     conn: Any,
     *,
@@ -582,9 +710,17 @@ def run_enhance(
         )
 
     try:
-        from loci.store import rebuild_fact_fts, rebuild_fact_vec, _FACT_VEC_VERSION
-        n_fts = rebuild_fact_fts(conn)
+        from loci.store import (
+            rebuild_fact_fts, rebuild_fact_fts_llm,
+            rebuild_fact_vec, _FACT_VEC_VERSION, _FACT_FTS_LLM_VERSION,
+        )
+        rebuild_fact_fts(conn)
         conn.execute("INSERT OR REPLACE INTO db_meta(key,value) VALUES ('fact_fts_v','1')")
+        rebuild_fact_fts_llm(conn)
+        conn.execute(
+            "INSERT OR REPLACE INTO db_meta(key,value) VALUES ('fact_fts_llm_v',?)",
+            [_FACT_FTS_LLM_VERSION],
+        )
         conn.commit()
         if embedder is not None:
             rebuild_fact_vec(conn, embedder)

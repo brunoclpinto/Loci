@@ -380,6 +380,7 @@ from loci.store import (
     insert_alias as _insert_alias,
     insert_fact as _insert_fact,
     rebuild_fact_fts as _rebuild_fact_fts,
+    rebuild_fact_fts_llm as _rebuild_fact_fts_llm,
 )
 
 
@@ -467,6 +468,51 @@ class TestFactFts:
         )
         scores = [h.score for h in result.fact_hits]
         assert scores == sorted(scores, reverse=True)
+
+
+# ---------------------------------------------------------------------------
+# LLM-only FTS routing (closure phase)
+# ---------------------------------------------------------------------------
+
+class TestFactFtsLLMRouting:
+    def test_source_filter_routes_to_llm_table(self, tmp_path):
+        """With source_filter={'llm'}, only facts in fts_facts_llm are returned."""
+        import hashlib as _hl
+        from loci.retrieve import fact_fts_search_question
+        conn = _open_db(tmp_path / "llm_route.db")
+        src_id = _insert_source(conn, sha256=_hl.sha256(b"lr_s").hexdigest(), title="T")
+        cid = _insert_chunk(conn, source_id=src_id, ordinal=0,
+                            text="Hope worked as a jarvey.", sha256=_hl.sha256(b"lr_c").hexdigest())
+        eid = _insert_entity(conn, canonical_name="Jefferson Hope", kind="person")
+        _insert_alias(conn, entity_id=eid, alias="jefferson hope")
+        svo_id = _insert_fact(conn, chunk_id=cid,
+                              sentence="Hope worked as a jarvey.",
+                              subject_id=eid, predicate="work",
+                              object_text="jarvey", source="svo")
+        llm_id = _insert_fact(conn, chunk_id=cid,
+                              sentence="Hope drove a cab as a jarvey.",
+                              subject_id=eid, predicate="work_as",
+                              object_text="jarvey", source="llm")
+        _rebuild_fact_fts(conn)
+        _rebuild_fact_fts_llm(conn)
+
+        # Without filter: both should be findable
+        all_ids = fact_fts_search_question(conn, "jarvey work hope", k=10)
+        assert svo_id in all_ids or llm_id in all_ids
+
+        # With llm filter: only llm fact, not svo
+        llm_ids = fact_fts_search_question(conn, "jarvey work hope", k=10,
+                                           source_filter={"llm"})
+        assert llm_id in llm_ids
+        assert svo_id not in llm_ids
+        conn.close()
+
+    def test_no_filter_uses_full_table(self, landlady_db):
+        """Without source_filter, fts_facts (all sources) is queried."""
+        from loci.retrieve import fact_fts_search_question
+        ids = fact_fts_search_question(landlady_db, "landlady role", k=5,
+                                       source_filter=None)
+        assert len(ids) > 0
 
 
 # ---------------------------------------------------------------------------
