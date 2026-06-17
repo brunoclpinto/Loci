@@ -952,21 +952,11 @@ def bench_query_cmd(
                             first_tok_t.append(gen_start)
                         gen_end = time.perf_counter()
                         timings["prop_path"] = 1
-                    elif prop and prop_hit is None:
-                        # Proposition path: no match → explicit abstention (no LLM call)
-                        from loci.generate import _PROP_ABSTAIN
-                        result = retrieve(
-                            item.question,
-                            conn=conn, cfg=cfg,
-                            embedder=embedder, nlp=nlp,
-                            pack_schemas=p_schemas, timings=timings,
-                        )
-                        full_text = _PROP_ABSTAIN
-                        first_tok_t = [time.perf_counter()]
-                        gen_start = gen_end = time.perf_counter()
-                        timings["prop_path"] = 0
-                    else:
-                        # Standard chunk-retrieval path
+                    if (not prop) or (prop and prop_hit is None):
+                        # Standard chunk-retrieval path (also used as fallback when --prop
+                        # finds no matching proposition — fulfils the help-text contract)
+                        if prop and prop_hit is None:
+                            timings["prop_path"] = 0
                         result = retrieve(
                             item.question,
                             conn=conn, cfg=cfg,
