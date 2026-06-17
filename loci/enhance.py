@@ -152,7 +152,7 @@ OUTPUT: A JSON array. Each element MUST have exactly these fields:
 # ---------------------------------------------------------------------------
 
 _PROP_MINT_META_KEY = "prop_mint_v"
-_PROP_MINT_VERSION = "1"
+_PROP_MINT_VERSION = "2"
 
 _PROP_TAXONOMY: frozenset[str] = frozenset([
     "introduce",      # A introduced B to C
@@ -178,27 +178,39 @@ _PROP_SYSTEM_PROMPT = """\
 You are a structured proposition extractor for a knowledge graph.
 Extract meaningful propositions from the text passage below.
 
-A proposition is an event or state involving identifiable participants:
-  - Who did what to whom (events)
-  - What someone is / does / has (states)
+PREDICATE TAXONOMY with EXAMPLES — use ONLY these exact strings (lowercase):
 
-PREDICATE TAXONOMY — use ONLY these exact strings (lowercase):
-  introduce, reside_at, work_as, murder, possess, relationship_to,
-  leader_of, call, be, means, located_at, travel_to, find, use,
-  married_to, killed_by, employed_by
+  introduce     "Stamford introduced Watson to Holmes" → agent=Stamford, themes=[Watson, Holmes]
+  work_as       "Holmes is a consulting detective" → agent=Holmes, themes=[consulting detective]
+  reside_at     "They lived at 221B Baker Street" → agent=Holmes, themes=[], location=221B Baker Street
+  murder        "Hope killed Drebber" → agent=Hope, themes=[Drebber]
+  killed_by     "Drebber was killed by Hope" → agent=Drebber, themes=[Jefferson Hope]
+  married_to    "Lucy was forced to marry Drebber" → agent=Lucy Ferrier, themes=[Drebber]
+  relationship_to "John Ferrier was Lucy's adopted father" → agent=John Ferrier, themes=[Lucy Ferrier]
+  leader_of     "Brigham Young led the Mormon settlers" → agent=Brigham Young, themes=[Mormon settlers]
+  means         "'RACHE' is German for revenge" → agent=RACHE, themes=[revenge]
+  call          "Holmes called Lecoq a bungler" → agent=Holmes, themes=[Lecoq, bungler]
+  located_at    "The body was found at Lauriston Gardens" → agent=body, location=Lauriston Gardens
+  travel_to     "Hope journeyed to Salt Lake City" → agent=Jefferson Hope, themes=[], location=Salt Lake City
+  possess       "Holmes had a gold watch" → agent=Holmes, themes=[gold watch]
+  find          "Lestrade found the body" → agent=Lestrade, themes=[body]
+  use           "Holmes used a magnifying glass" → agent=Holmes, themes=[magnifying glass]
+  employed_by   "Gregson works for Scotland Yard" → agent=Tobias Gregson, themes=[Scotland Yard]
+  be            "Holmes was a student of chemistry" → agent=Holmes, themes=[student of chemistry]
 
-COREFERENCE: If the text uses "our landlady", "the leader", "her father" and also names the person
-(e.g. "Mrs Hudson", "Brigham Young", "John Ferrier"), use the CANONICAL NAME — not the description.
+COREFERENCE: When a description ("our landlady", "the leader", "her adopted father") co-occurs with
+a proper name in the same passage, use the CANONICAL NAME as agent/theme.
 
-STATEMENT: Write a self-contained declarative sentence. Use entity names, not pronouns.
+STATEMENT: Write a self-contained NL sentence. Use entity names, not pronouns.
 EVIDENCE: Copy the shortest verbatim span from the text that supports the proposition.
 
 OUTPUT: A JSON array. Each element MUST have exactly these fields:
   {"predicate": "...", "agent": "...", "themes": ["..."], "location": null, "statement": "...", "evidence": "..."}
-- "agent": the subject / doer (canonical name, PERSON)
-- "themes": list of objects / recipients (canonical names) — empty list if none
-- "location": location name if relevant, else null
+- "agent": the subject (canonical name — person, place, or word as appropriate for the predicate)
+- "themes": list of objects/recipients (canonical names), empty list if none
+- "location": location string if relevant, else null
 - "predicate": must be from the taxonomy — reject anything outside it
+- Skip propositions where agent is a pronoun (I, he, she, it, we, they) or a generic description
 - Never infer beyond what the text says. If nothing fits: []"""
 
 

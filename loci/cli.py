@@ -809,8 +809,8 @@ def bench_query_cmd(
     config_path: Optional[Path] = typer.Option(None, "--config", "-c"),
     low_mem: bool = typer.Option(False, "--low-mem"),
     prop: bool = typer.Option(
-        False, "--prop",
-        help="Try proposition path first; fall back to chunk retrieval when no prop match.",
+        True, "--prop/--no-prop",
+        help="Proposition-first path with chunk-retrieval fallback (default on). --no-prop for pure chunk baseline.",
     ),
 ) -> None:
     """Full eval: retrieve + generate for every QnA item; mechanical + judge scoring."""
@@ -1201,6 +1201,7 @@ def enhance_cmd(
     limit: Optional[int] = typer.Option(None, "--limit", help="Max chunks to process."),
     all_chunks: bool = typer.Option(False, "--all", help="Re-run on ALL chunks (reset extracted_v first). Needed for the P1 taxonomy re-extraction pass."),
     passes: Optional[str] = typer.Option(None, "--passes", help="Comma-separated passes: entity,implied,prop. Omit for P1 chunk pass."),
+    force_prop: bool = typer.Option(False, "--force-prop", help="Re-run prop mint even if already done (clears prop_mint_v guard)."),
     config_path: Optional[Path] = typer.Option(None, "--config", "-c"),
     low_mem: bool = typer.Option(False, "--low-mem"),
 ) -> None:
@@ -1294,7 +1295,7 @@ def enhance_cmd(
                     if "prop" in requested_passes:
                         console.print("[bold]Proposition mint pass[/bold] — LLM-based proposition extraction…")
                         with measure("enhance_prop", log_dir=cfg_exp.paths.runtime_logs_dir) as counters:
-                            stats = run_proposition_mint(conn, llm=llm, cfg=cfg, embedder=embedder)
+                            stats = run_proposition_mint(conn, llm=llm, cfg=cfg, embedder=embedder, force=force_prop)
                             counters.update(stats)
                         console.print(
                             f"  chunks: {stats.get('chunks_processed', 0)}"
