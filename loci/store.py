@@ -839,6 +839,67 @@ def upsert_vec_proposition(
     conn.commit()
 
 
+def sync_prop_entity_aliases_from_facts(conn: sqlite3.Connection) -> dict:
+    """Import rich aliases from the facts entity system into prop_entity_aliases.
+
+    For each prop_entity whose canonical name matches a canonical_name in the
+    entities table, pull all aliases from the aliases table and register them
+    in prop_entity_aliases.  Safe to run multiple times (INSERT OR IGNORE).
+
+    Also removes junk prop_entities: pronouns, short tokens, and multi-word
+    phrases that don't look like proper names (no title-case word).
+    """
+    from loci.resolve import normalize_mention
+
+    _PRONOUNS = frozenset([
+        "i", "he", "she", "it", "we", "they", "him", "her", "us", "them",
+        "his", "its", "our", "their", "you", "your", "me",
+    ])
+
+    # 1. Remove junk prop_entities (pronouns, length < 3, no uppercase letter)
+    prop_ents = conn.execute("SELECT id, canonical FROM prop_entities").fetchall()
+    removed = 0
+    for row in prop_ents:
+        eid, canonical = row[0], row[1]
+        tokens = canonical.strip().split()
+        # Junk: single-token pronoun or lowercase, or length < 3, or no uppercase anywhere
+        if (
+            (len(tokens) == 1 and tokens[0].lower() in _PRONOUNS)
+            or len(canonical.strip()) < 3
+            or canonical == canonical.lower()  # all lowercase → likely not a proper noun
+        ):
+            # Cascade delete: proposition_entities + prop_entity_aliases, then entity
+            conn.execute("DELETE FROM proposition_entities WHERE prop_entity_id=?", [eid])
+            conn.execute("DELETE FROM prop_entity_aliases WHERE prop_entity_id=?", [eid])
+            conn.execute("DELETE FROM prop_entities WHERE id=?", [eid])
+            removed += 1
+
+    # 2. For remaining prop_entities, pull fact-system aliases
+    prop_ents = conn.execute("SELECT id, canonical FROM prop_entities").fetchall()
+    aliases_added = 0
+    for row in prop_ents:
+        eid, canonical = row[0], row[1]
+        fact_rows = conn.execute(
+            """SELECT a.alias FROM aliases a
+               JOIN entities e ON e.id = a.entity_id
+               WHERE LOWER(e.canonical_name) = LOWER(?)""",
+            [canonical],
+        ).fetchall()
+        for fr in fact_rows:
+            raw = fr[0]
+            for alias in {raw.lower(), normalize_mention(raw)}:
+                if alias and len(alias) > 1:
+                    cur = conn.execute(
+                        "INSERT OR IGNORE INTO prop_entity_aliases"
+                        " (prop_entity_id, alias) VALUES (?,?)",
+                        [eid, alias],
+                    )
+                    aliases_added += cur.rowcount
+
+    conn.commit()
+    return {"prop_entities_removed": removed, "aliases_added": aliases_added}
+
+
 def fts_search_propositions(
     conn: sqlite3.Connection, *, query: str, k: int = 10
 ) -> list[dict]:
@@ -874,8 +935,13 @@ def get_props_for_entities_and_predicate(
                 GROUP BY prop_id
                 HAVING COUNT(DISTINCT prop_entity_id) >= ?
               )
-            ORDER BY p.confidence DESC, p.id ASC""",
-        [predicate] + prop_entity_ids + [n],
+            ORDER BY
+              (SELECT 1 FROM proposition_entities
+               WHERE prop_id=p.id AND prop_entity_id IN ({id_ph}) AND role='agent'
+               LIMIT 1) DESC,
+              p.confidence DESC,
+              p.id ASC""",
+        [predicate] + prop_entity_ids + [n] + prop_entity_ids,
     ).fetchall()
     return [dict(r) for r in rows]
 

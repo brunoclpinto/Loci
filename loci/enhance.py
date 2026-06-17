@@ -374,12 +374,22 @@ def run_proposition_mint(
             known_entities=known_entities,
         )
 
+    # Clean up junk prop_entities and import rich aliases from the fact system
+    from loci.store import sync_prop_entity_aliases_from_facts
+    sync_stats = sync_prop_entity_aliases_from_facts(conn)
+
     conn.execute(
         "INSERT OR REPLACE INTO db_meta(key,value) VALUES (?,?)",
         [_PROP_MINT_META_KEY, _PROP_MINT_VERSION],
     )
     conn.commit()
-    return {"chunks_processed": len(rows), "propositions_added": n_props, "skipped": False}
+    return {
+        "chunks_processed": len(rows),
+        "propositions_added": n_props,
+        "prop_entities_removed": sync_stats["prop_entities_removed"],
+        "aliases_added": sync_stats["aliases_added"],
+        "skipped": False,
+    }
 
 
 def build_extraction_messages(

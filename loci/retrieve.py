@@ -1085,8 +1085,13 @@ def retrieve_propositions(
     # + predicate-synonym filter to avoid semantically wrong hits.
     words = _NONWORD.sub(" ", question.lower()).split()
     content = [w for w in words if w and w not in _PROP_FTS_STOPWORDS and len(w) > 2]
+    # Also add the predicate names as FTS terms ("murder" finds "murdered", etc.)
+    for pred in predicates_to_try:
+        for pw in pred.replace("_", " ").split():
+            if len(pw) > 2 and pw not in _PROP_FTS_STOPWORDS:
+                content.append(pw)
     if content:
-        fts_query = " OR ".join(content)
+        fts_query = " OR ".join(set(content))
         for hit in fts_search_propositions(conn, query=fts_query, k=20):
             prop = get_proposition(conn, hit["prop_id"])
             if prop and prop["predicate"] in predicates_to_try:
