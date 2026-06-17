@@ -14,6 +14,72 @@ from loci.config import Config
 _WH_WORDS = frozenset(["what", "who", "where", "when", "which", "how", "whom", "whose"])
 _AUX_LEMMAS = frozenset(["be", "do", "have", "will", "would", "could", "should",
                           "may", "might", "shall", "can", "must"])
+
+# For proposition FTS we use a narrower stopword set — character names are kept
+# so FTS can discriminate between Holmes/Watson/Hope propositions.
+_PROP_FTS_STOPWORDS = frozenset([
+    "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
+    "have", "has", "had", "do", "does", "did", "will", "would", "could",
+    "should", "may", "might", "shall", "can", "must", "of", "in", "on",
+    "at", "by", "to", "for", "with", "from", "and", "or", "but", "not",
+    "no", "it", "its", "this", "that", "their", "there", "they", "them",
+    "he", "she", "his", "her", "we", "our", "you", "your", "i", "my",
+    "what", "who", "where", "when", "which", "how", "whom", "whose",
+])
+
+# Maps question NOUNS → proposition predicates for "What is X's [noun]?" questions
+# where spaCy finds no main verb (e.g. "What is Holmes's profession?").
+_NOUN_TO_PRED: dict[str, list[str]] = {
+    "profession":   ["work_as"],
+    "occupation":   ["work_as"],
+    "job":          ["work_as"],
+    "career":       ["work_as"],
+    "role":         ["work_as"],
+    "address":      ["reside_at", "located_at"],
+    "home":         ["reside_at"],
+    "residence":    ["reside_at"],
+    "location":     ["located_at", "reside_at"],
+    "name":         ["call", "named_after"],
+    "alias":        ["call"],
+    "meaning":      ["means"],
+    "leader":       ["leader_of"],
+    "killer":       ["murder", "killed_by"],
+    "murderer":     ["murder"],
+    "victim":       ["murder", "killed_by"],
+    "relationship": ["relationship_to"],
+    "weapon":       ["use"],
+}
+
+# Maps question verb lemmas → proposition predicates that semantically match.
+# Enables "What is Holmes's profession?" to find "work_as" propositions, etc.
+_VERB_TO_PRED: dict[str, list[str]] = {
+    "profession":   ["work_as"],
+    "occupation":   ["work_as"],
+    "job":          ["work_as"],
+    "work":         ["work_as", "employed_by"],
+    "employ":       ["employed_by", "work_as"],
+    "live":         ["reside_at", "located_at"],
+    "reside":       ["reside_at"],
+    "stay":         ["reside_at"],
+    "locate":       ["located_at"],
+    "meet":         ["introduce"],
+    "introduce":    ["introduce"],
+    "kill":         ["murder", "killed_by"],
+    "die":          ["killed_by", "murder"],
+    "murder":       ["murder"],
+    "possess":      ["possess"],
+    "own":          ["possess"],
+    "call":         ["call"],
+    "name":         ["call", "named_after"],
+    "mean":         ["means"],
+    "travel":       ["travel_to"],
+    "go":           ["travel_to"],
+    "find":         ["find"],
+    "marry":        ["married_to"],
+    "lead":         ["leader_of"],
+    "command":      ["leader_of"],
+    "use":          ["use"],
+}
 _CHARS_PER_TOKEN = 4
 _NONWORD = re.compile(r"[^\w\s]")
 
@@ -978,41 +1044,52 @@ def retrieve_propositions(
 
     parse = parse_question(question, nlp=nlp)
     predicate = parse.verb_lemma
-    if not predicate:
-        return None
 
-    # Primary path: entity-postings ∩ predicate
+    # When spaCy finds no main verb (e.g. "What is X's profession?"), extract
+    # the key noun from the question and map it to a proposition predicate set.
+    if not predicate:
+        words = _NONWORD.sub(" ", question.lower()).split()
+        for w in words:
+            cw = w.strip("?.,!;:'\"")
+            if cw in _NOUN_TO_PRED:
+                predicates_to_try = set(_NOUN_TO_PRED[cw])
+                break
+        else:
+            return None
+    else:
+        # Expand predicate to semantic synonyms so "live" finds "reside_at", etc.
+        predicates_to_try = {predicate} | set(_VERB_TO_PRED.get(predicate, []))
+
+    def _make_hit(p: dict) -> "PropositionHit":
+        roles = json.loads(p["roles"]) if isinstance(p["roles"], str) else p["roles"]
+        return PropositionHit(
+            prop_id=p["id"],
+            predicate=p["predicate"],
+            statement=p["statement"],
+            roles=roles,
+            chunk_id=p["chunk_id"],
+            agent_canonical=get_prop_agent_canonical(conn, p["id"]),
+        )
+
+    # Primary path: entity-postings ∩ predicate (tries all synonym predicates)
     prop_entity_ids = find_prop_entity_ids(conn, question)
     if prop_entity_ids:
-        matches = get_props_for_entities_and_predicate(
-            conn, predicate=predicate, prop_entity_ids=prop_entity_ids
-        )
-        if matches:
-            best = matches[0]
-            return PropositionHit(
-                prop_id=best["id"],
-                predicate=best["predicate"],
-                statement=best["statement"],
-                roles=json.loads(best["roles"]) if isinstance(best["roles"], str) else best["roles"],
-                chunk_id=best["chunk_id"],
-                agent_canonical=get_prop_agent_canonical(conn, best["id"]),
+        for pred in predicates_to_try:
+            matches = get_props_for_entities_and_predicate(
+                conn, predicate=pred, prop_entity_ids=prop_entity_ids
             )
+            if matches:
+                return _make_hit(matches[0])
 
-    # Fallback: FTS on statement + predicate filter (handles paraphrase / alias miss)
+    # Fallback: FTS on statement (uses narrow prop stopwords so character names pass)
+    # + predicate-synonym filter to avoid semantically wrong hits.
     words = _NONWORD.sub(" ", question.lower()).split()
-    content = [w for w in words if w and w not in _FTS_STOPWORDS and len(w) > 2]
+    content = [w for w in words if w and w not in _PROP_FTS_STOPWORDS and len(w) > 2]
     if content:
         fts_query = " OR ".join(content)
-        for hit in fts_search_propositions(conn, query=fts_query, k=10):
+        for hit in fts_search_propositions(conn, query=fts_query, k=20):
             prop = get_proposition(conn, hit["prop_id"])
-            if prop and prop["predicate"] == predicate:
-                return PropositionHit(
-                    prop_id=prop["id"],
-                    predicate=prop["predicate"],
-                    statement=prop["statement"],
-                    roles=prop["roles"],
-                    chunk_id=prop["chunk_id"],
-                    agent_canonical=get_prop_agent_canonical(conn, prop["id"]),
-                )
+            if prop and prop["predicate"] in predicates_to_try:
+                return _make_hit(prop)
 
     return None

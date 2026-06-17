@@ -147,6 +147,240 @@ OUTPUT: A JSON array. Each element MUST have exactly these fields:
 - "subject" and "object": use canonical proper names when you can identify them.
 - Only output high-confidence implications (0.8+). If nothing fits: []"""
 
+# ---------------------------------------------------------------------------
+# Proposition minting pass
+# ---------------------------------------------------------------------------
+
+_PROP_MINT_META_KEY = "prop_mint_v"
+_PROP_MINT_VERSION = "1"
+
+_PROP_TAXONOMY: frozenset[str] = frozenset([
+    "introduce",      # A introduced B to C
+    "reside_at",      # X lives/resides at Y
+    "work_as",        # X works as / is a Y
+    "murder",         # X murdered Y
+    "possess",        # X has/owns Y
+    "relationship_to", # X is the [role] of Y
+    "leader_of",      # X leads/commands Y
+    "call",           # X is called Y / referred to as Y
+    "be",             # X is/was Y (broad copula)
+    "means",          # X means Y (translation)
+    "located_at",     # place X is at location Y
+    "travel_to",      # X travelled/went to Y
+    "find",           # X found/discovered Y
+    "use",            # X used Y
+    "married_to",     # X married Y
+    "killed_by",      # X was killed by Y
+    "employed_by",    # X is employed by Y
+])
+
+_PROP_SYSTEM_PROMPT = """\
+You are a structured proposition extractor for a knowledge graph.
+Extract meaningful propositions from the text passage below.
+
+A proposition is an event or state involving identifiable participants:
+  - Who did what to whom (events)
+  - What someone is / does / has (states)
+
+PREDICATE TAXONOMY — use ONLY these exact strings (lowercase):
+  introduce, reside_at, work_as, murder, possess, relationship_to,
+  leader_of, call, be, means, located_at, travel_to, find, use,
+  married_to, killed_by, employed_by
+
+COREFERENCE: If the text uses "our landlady", "the leader", "her father" and also names the person
+(e.g. "Mrs Hudson", "Brigham Young", "John Ferrier"), use the CANONICAL NAME — not the description.
+
+STATEMENT: Write a self-contained declarative sentence. Use entity names, not pronouns.
+EVIDENCE: Copy the shortest verbatim span from the text that supports the proposition.
+
+OUTPUT: A JSON array. Each element MUST have exactly these fields:
+  {"predicate": "...", "agent": "...", "themes": ["..."], "location": null, "statement": "...", "evidence": "..."}
+- "agent": the subject / doer (canonical name, PERSON)
+- "themes": list of objects / recipients (canonical names) — empty list if none
+- "location": location name if relevant, else null
+- "predicate": must be from the taxonomy — reject anything outside it
+- Never infer beyond what the text says. If nothing fits: []"""
+
+
+def _build_prop_messages(
+    chunk_text: str,
+    known_entities: list[str] | None = None,
+) -> list[dict]:
+    user = ""
+    if known_entities:
+        user = (
+            "Known entities in this corpus (prefer these canonical names):\n"
+            + ", ".join(known_entities[:25])
+            + "\n\n"
+        )
+    user += f"Text:\n{chunk_text}"
+    return [
+        {"role": "system", "content": _PROP_SYSTEM_PROMPT},
+        {"role": "user", "content": user},
+    ]
+
+
+def parse_llm_propositions(response_text: str) -> list[dict]:
+    """Parse LLM JSON response into validated proposition dicts."""
+    text = response_text.strip()
+    m = _FENCE_RE.search(text)
+    if m:
+        text = m.group(1).strip()
+    try:
+        data = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return []
+    if not isinstance(data, list):
+        return []
+    result = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        pred = str(item.get("predicate", "")).strip().lower()
+        if pred not in _PROP_TAXONOMY:
+            continue
+        agent = str(item.get("agent", "")).strip()
+        if not agent:
+            continue
+        themes_raw = item.get("themes", [])
+        if isinstance(themes_raw, str):
+            themes_raw = [themes_raw]
+        themes = [str(t).strip() for t in themes_raw if str(t).strip()]
+        location = str(item.get("location") or "").strip() or None
+        statement = str(item.get("statement", "")).strip()
+        evidence = str(item.get("evidence") or "").strip() or None
+        if not statement:
+            continue
+        result.append({
+            "predicate": pred,
+            "agent": agent,
+            "themes": themes,
+            "location": location,
+            "statement": statement,
+            "evidence": evidence,
+        })
+    return result
+
+
+def mint_propositions_chunk(
+    conn: Any,
+    chunk_id: int,
+    chunk_text: str,
+    llm: Any,
+    *,
+    cfg: Any,
+    embedder: Any = None,
+    known_entities: list[str] | None = None,
+) -> int:
+    """LLM-based proposition extraction for one chunk. Returns new proposition count."""
+    from loci.generate import generate_response
+    from loci.store import (
+        ensure_prop_entity, insert_proposition,
+        insert_proposition_entity, upsert_vec_proposition,
+    )
+
+    messages = _build_prop_messages(chunk_text, known_entities=known_entities)
+    try:
+        response = generate_response(llm, messages, max_tokens=1024, temperature=0.0)
+    except Exception:
+        return 0
+
+    raw_props = parse_llm_propositions(response)
+    n = 0
+    for rp in raw_props[:8]:  # cap per chunk to avoid flooding
+        agent_str = rp["agent"]
+        themes = rp["themes"]
+        location_str = rp.get("location")
+        predicate = rp["predicate"]
+        statement = rp["statement"]
+        evidence = rp.get("evidence")
+
+        agent_eid = ensure_prop_entity(conn, canonical=agent_str, kind="PERSON", aliases=[agent_str])
+        theme_eids = [
+            ensure_prop_entity(conn, canonical=t, kind="PERSON", aliases=[t])
+            for t in themes
+        ]
+        loc_eid = (
+            ensure_prop_entity(conn, canonical=location_str, kind="LOCATION", aliases=[location_str])
+            if location_str else None
+        )
+
+        roles: dict = {"agent": agent_eid}
+        if theme_eids:
+            roles["theme"] = theme_eids if len(theme_eids) > 1 else theme_eids[0]
+        if loc_eid is not None:
+            roles["location"] = loc_eid
+
+        prop_id = insert_proposition(
+            conn,
+            chunk_id=chunk_id,
+            predicate=predicate,
+            roles=roles,
+            statement=statement,
+            confidence=0.8,
+            evidence=evidence,
+        )
+        if prop_id is None:
+            continue  # duplicate
+
+        insert_proposition_entity(conn, prop_id=prop_id, prop_entity_id=agent_eid, role="agent")
+        for tid in theme_eids:
+            insert_proposition_entity(conn, prop_id=prop_id, prop_entity_id=tid, role="theme")
+        if loc_eid is not None:
+            insert_proposition_entity(conn, prop_id=prop_id, prop_entity_id=loc_eid, role="location")
+
+        if embedder is not None:
+            try:
+                emb = embedder.encode(statement)
+                upsert_vec_proposition(conn, prop_id=prop_id, embedding=emb.tolist())
+            except Exception:
+                pass
+
+        n += 1
+    return n
+
+
+def run_proposition_mint(
+    conn: Any,
+    *,
+    llm: Any,
+    cfg: Any,
+    embedder: Any = None,
+    limit: int | None = None,
+    force: bool = False,
+) -> dict:
+    """Run LLM-based proposition minting across all chunks.
+
+    Idempotency-guarded via db_meta['prop_mint_v']; use force=True to re-run.
+    """
+    row = conn.execute(
+        "SELECT value FROM db_meta WHERE key=?", [_PROP_MINT_META_KEY]
+    ).fetchone()
+    if row and not force:
+        return {"skipped": True, "propositions_added": 0, "chunks_processed": 0}
+
+    rows = conn.execute("SELECT id, text FROM chunks ORDER BY id").fetchall()
+    if limit is not None:
+        rows = rows[:limit]
+
+    known_entities = _get_entity_names(conn)
+    n_props = 0
+    for row in rows:
+        cid = row[0] if isinstance(row, (list, tuple)) else row["id"]
+        ctext = row[1] if isinstance(row, (list, tuple)) else row["text"]
+        n_props += mint_propositions_chunk(
+            conn, cid, ctext, llm,
+            cfg=cfg, embedder=embedder,
+            known_entities=known_entities,
+        )
+
+    conn.execute(
+        "INSERT OR REPLACE INTO db_meta(key,value) VALUES (?,?)",
+        [_PROP_MINT_META_KEY, _PROP_MINT_VERSION],
+    )
+    conn.commit()
+    return {"chunks_processed": len(rows), "propositions_added": n_props, "skipped": False}
+
 
 def build_extraction_messages(
     chunk_text: str,

@@ -1210,7 +1210,7 @@ def _question_template(subject: str, predicate: str, obj: str) -> str:
 def enhance_cmd(
     limit: Optional[int] = typer.Option(None, "--limit", help="Max chunks to process."),
     all_chunks: bool = typer.Option(False, "--all", help="Re-run on ALL chunks (reset extracted_v first). Needed for the P1 taxonomy re-extraction pass."),
-    passes: Optional[str] = typer.Option(None, "--passes", help="Comma-separated P2 passes: entity,implied. Omit for P1 chunk pass."),
+    passes: Optional[str] = typer.Option(None, "--passes", help="Comma-separated passes: entity,implied,prop. Omit for P1 chunk pass."),
     config_path: Optional[Path] = typer.Option(None, "--config", "-c"),
     low_mem: bool = typer.Option(False, "--low-mem"),
 ) -> None:
@@ -1226,7 +1226,7 @@ def enhance_cmd(
 
     from loci.config import expanded
     from loci.store import open_db, get_unextracted_chunks
-    from loci.enhance import run_enhance, run_entity_pass, run_implied_pass, run_closure_pass, run_prune_pass
+    from loci.enhance import run_enhance, run_entity_pass, run_implied_pass, run_closure_pass, run_prune_pass, run_proposition_mint
 
     cfg_exp = expanded(cfg)
 
@@ -1301,12 +1301,25 @@ def enhance_cmd(
                         )
                         combined_stats.update(stats)
 
-                    # Rebuild full FTS after LLM P2 passes
-                    from loci.store import rebuild_fact_fts
-                    n_fts = rebuild_fact_fts(conn)
-                    conn.execute("INSERT OR REPLACE INTO db_meta(key,value) VALUES ('fact_fts_v','1')")
-                    conn.commit()
-                    console.print(f"[green]FTS rebuilt[/green] ({n_fts} facts indexed)")
+                    if "prop" in requested_passes:
+                        console.print("[bold]Proposition mint pass[/bold] — LLM-based proposition extraction…")
+                        with measure("enhance_prop", log_dir=cfg_exp.paths.runtime_logs_dir) as counters:
+                            stats = run_proposition_mint(conn, llm=llm, cfg=cfg, embedder=embedder)
+                            counters.update(stats)
+                        console.print(
+                            f"  chunks: {stats.get('chunks_processed', 0)}"
+                            f"  new propositions: {stats.get('propositions_added', 0)}"
+                            + (" [dim](skipped — already done)[/dim]" if stats.get("skipped") else "")
+                        )
+                        combined_stats.update(stats)
+
+                    # Rebuild full FTS after LLM P2 fact passes (fts_propositions is trigger-maintained)
+                    if "entity" in requested_passes or "implied" in requested_passes:
+                        from loci.store import rebuild_fact_fts
+                        n_fts = rebuild_fact_fts(conn)
+                        conn.execute("INSERT OR REPLACE INTO db_meta(key,value) VALUES ('fact_fts_v','1')")
+                        conn.commit()
+                        console.print(f"[green]FTS rebuilt[/green] ({n_fts} facts indexed)")
 
         # Prune pass — removes misattributed llm/closure facts, resets closure_v
         if "prune" in requested_passes:
@@ -1357,7 +1370,11 @@ def enhance_cmd(
             f"  new facts: {stats['facts_added']}"
         )
     else:
-        console.print(f"[green]Passes complete.[/green] Total new facts: {combined_stats.get('facts_added', 0)}")
+        console.print(
+            f"[green]Passes complete.[/green]"
+            f"  facts: {combined_stats.get('facts_added', 0)}"
+            f"  propositions: {combined_stats.get('propositions_added', 0)}"
+        )
 
 
 # ---------------------------------------------------------------------------

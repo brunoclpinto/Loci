@@ -873,7 +873,8 @@ def get_props_for_entities_and_predicate(
                 WHERE prop_entity_id IN ({id_ph})
                 GROUP BY prop_id
                 HAVING COUNT(DISTINCT prop_entity_id) >= ?
-              )""",
+              )
+            ORDER BY p.confidence DESC, p.id ASC""",
         [predicate] + prop_entity_ids + [n],
     ).fetchall()
     return [dict(r) for r in rows]
