@@ -194,12 +194,51 @@ _REFUSAL_PHRASES = (
     "not provided in",
     "cannot find",
     "not found in",
+    "not stated in the source",  # proposition-path abstention phrase
 )
 
 def is_refusal(text: str) -> bool:
     """Return True if the response is a knowledge-base refusal."""
     lower = text.strip().lower()
     return any(phrase in lower for phrase in _REFUSAL_PHRASES)
+
+
+# ---------------------------------------------------------------------------
+# Proposition-path generation (design-v1)
+# ---------------------------------------------------------------------------
+
+_PROP_ABSTAIN = "Not stated in the source."
+
+_PROP_WITH_FACT = (
+    "Fact: {statement}\n"
+    "Question: {question}\n"
+    "Answer using only the fact above, as briefly as possible. "
+    f"If the fact does not answer the question, reply exactly: {_PROP_ABSTAIN}"
+)
+
+_PROP_NO_FACT = (
+    "Question: {question}\n"
+    f"There is no relevant fact available. Reply exactly: {_PROP_ABSTAIN}"
+)
+
+
+def build_proposition_messages(
+    question: str,
+    prop_hit: "Any | None",  # PropositionHit or None
+) -> list[dict]:
+    """Build the minimal proposition-path prompt (design-v1 spec contract).
+
+    The model receives ONLY the matched proposition statement + question (or
+    just the question with an explicit abstention instruction when no match).
+    No chunk text, no other propositions, no scores are included.
+    """
+    if prop_hit is None:
+        prompt = _PROP_NO_FACT.format(question=question)
+    else:
+        prompt = _PROP_WITH_FACT.format(
+            statement=prop_hit.statement, question=question
+        )
+    return [{"role": "user", "content": prompt}]
 
 
 # ---------------------------------------------------------------------------

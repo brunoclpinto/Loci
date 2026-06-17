@@ -8,7 +8,11 @@ from typing import Any
 from loci.config import Config, expanded
 from loci.extract import extract_facts_from_sent
 from loci.resolve import resolve_entity
-from loci.store import insert_chunk, insert_fact, insert_source, upsert_vec_chunk
+from loci.store import (
+    insert_chunk, insert_fact, insert_source, upsert_vec_chunk,
+    ensure_prop_entity, insert_proposition, insert_proposition_entity,
+    upsert_vec_proposition,
+)
 
 _SUPPORTED_EXTENSIONS = {".txt", ".md", ".pdf", ".epub"}
 _CHARS_PER_TOKEN = 4  # heuristic: 1 token ≈ 4 characters
@@ -329,6 +333,11 @@ def _run_pipeline(
         import warnings
         warnings.warn(f"fts_facts/vec_facts rebuild failed after ingest: {_fts_err}")
 
+    # Proposition extraction (additive — runs after fact extraction)
+    n_props = 0
+    for chunk_id, chunk_text, _ in chunk_records:
+        n_props += _ingest_propositions(conn, chunk_id, chunk_text, embedder)
+
     return {
         "skipped": False,
         "chunks": len(chunk_records),
@@ -337,4 +346,82 @@ def _run_pipeline(
         "linked_entities": (linked_after - linked_before) - (entities_after - entities_before),
         "sentences_total": n_sentences,
         "sentences_skipped": n_skipped,
+        "propositions": n_props,
     }
+
+
+def _ingest_propositions(
+    conn,
+    chunk_id: int,
+    chunk_text: str,
+    embedder,
+) -> int:
+    """Extract and store propositions for one chunk. Returns number of new propositions."""
+    from loci.extract import extract_propositions_for_chunk
+
+    raw_props = extract_propositions_for_chunk(chunk_text)
+    n_stored = 0
+    for rp in raw_props:
+        # Register all entities with their full alias sets (spec FIX2)
+        entity_ids: dict[str, int] = {}  # role → prop_entity_id (for roles JSON)
+        role_entity_ids: list[tuple[int, str]] = []  # (prop_entity_id, role)
+
+        if rp.agent:
+            eid = ensure_prop_entity(
+                conn,
+                canonical=rp.agent.canonical,
+                kind=rp.agent.kind,
+                aliases=rp.agent.aliases,
+            )
+            entity_ids["agent"] = eid
+            role_entity_ids.append((eid, "agent"))
+
+        theme_ids: list[int] = []
+        for pe in rp.themes:
+            eid = ensure_prop_entity(
+                conn,
+                canonical=pe.canonical,
+                kind=pe.kind,
+                aliases=pe.aliases,
+            )
+            theme_ids.append(eid)
+            role_entity_ids.append((eid, "theme"))
+        if theme_ids:
+            entity_ids["theme"] = theme_ids
+
+        if rp.location:
+            eid = ensure_prop_entity(
+                conn,
+                canonical=rp.location.canonical,
+                kind=rp.location.kind,
+                aliases=rp.location.aliases,
+            )
+            entity_ids["location"] = eid
+            role_entity_ids.append((eid, "location"))
+
+        prop_id = insert_proposition(
+            conn,
+            chunk_id=chunk_id,
+            predicate=rp.predicate,
+            roles=entity_ids,
+            statement=rp.statement,
+            polarity=rp.polarity,
+            evidence=rp.evidence,
+            char_span=list(rp.char_span),
+        )
+        if prop_id is None:
+            continue  # duplicate
+
+        for eid, role in role_entity_ids:
+            insert_proposition_entity(
+                conn, prop_id=prop_id, prop_entity_id=eid, role=role
+            )
+
+        if embedder is not None:
+            from loci.models import embed_batch
+            vecs = embed_batch(embedder, [rp.statement], normalize=True)
+            if vecs:
+                upsert_vec_proposition(conn, prop_id=prop_id, embedding=vecs[0])
+
+        n_stored += 1
+    return n_stored

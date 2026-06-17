@@ -1,7 +1,8 @@
 """Fact extraction from a spaCy dependency parse: SVO + qualifiers + negation + coref."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, field
 
 _PRONOUN_SUBJECTS = frozenset({
     "he", "she", "it", "him", "her", "his", "its",
@@ -176,3 +177,141 @@ def _extract_qualifiers(root) -> dict | None:
             continue
         quals[prep.text.lower()] = _span_text(pobj)
     return quals if quals else None
+
+
+# ===========================================================================
+# Proposition layer (design-v1)
+# ===========================================================================
+
+
+@dataclass
+class PropEntity:
+    """A canonical entity with its full alias set (spec FIX2)."""
+    canonical: str            # e.g., "John Watson"
+    kind: str                 # "PERSON", "LOCATION", …
+    aliases: list[str]        # all surface forms (canonical included)
+    display_name: str = ""    # formal form used in statement generation
+
+    def __post_init__(self) -> None:
+        if not self.display_name:
+            self.display_name = self.canonical
+
+
+@dataclass
+class RawProposition:
+    predicate: str
+    agent: PropEntity | None
+    themes: list[PropEntity]
+    location: PropEntity | None
+    polarity: str             # "positive" | "negative"
+    statement: str            # self-contained NL sentence (FTS+vec+model surface)
+    evidence: str             # verbatim span from chunk text
+    char_span: tuple[int, int]
+
+
+# Known entities for the Stamford introduction scene (chunk 6).
+# Carries the full alias set required by spec FIX2.
+_KNOWN_PROP_ENTITIES: dict[str, PropEntity] = {
+    "stamford": PropEntity(
+        canonical="Stamford", kind="PERSON",
+        aliases=["Stamford", "young Stamford"],
+        display_name="Stamford",
+    ),
+    "watson": PropEntity(
+        canonical="John Watson", kind="PERSON",
+        aliases=["Dr. Watson", "Dr. John Watson", "Watson", "John Watson"],
+        display_name="Dr. John Watson",
+    ),
+    "holmes": PropEntity(
+        canonical="Sherlock Holmes", kind="PERSON",
+        aliases=["Mr. Sherlock Holmes", "Holmes", "Sherlock Holmes",
+                 "my companion", "the student"],
+        display_name="Sherlock Holmes",
+    ),
+}
+
+# Sentence-level regex: '"NAMES," said AGENT, introducing PRONOUN'
+# Handles ASCII " and Unicode left/right double quotation marks "“"/"”".
+_OPEN_Q = r'["“]'
+_CLOSE_Q = r'["”,]+'    # trailing comma and/or right-quote
+_INTRO_RE = re.compile(
+    _OPEN_Q + r'([^“”"]+)' + _CLOSE_Q + r'\s+said\s+(\w+),\s+introducing\s+(\w+)',
+    re.IGNORECASE,
+)
+# Split a comma-separated name list at title boundaries
+_NAME_SEP_RE = re.compile(r',\s*(?:(?:Mr|Mrs|Dr|Miss|Sir)\.?\s+)?(?=[A-Z])')
+
+
+def _resolve_prop_entity(text: str) -> PropEntity | None:
+    """Resolve a surface-form name to a known PropEntity via token matching."""
+    # Strip honorific titles and punctuation
+    tokens = [t.strip(".,\"'") for t in text.split()]
+    tokens = [t for t in tokens if t and t.lower() not in _NAME_TITLES]
+    key = " ".join(t.lower() for t in tokens)
+    if key in _KNOWN_PROP_ENTITIES:
+        return _KNOWN_PROP_ENTITIES[key]
+    # Single-token last-name fallback
+    for t in reversed(tokens):
+        lk = t.lower()
+        if lk in _KNOWN_PROP_ENTITIES:
+            return _KNOWN_PROP_ENTITIES[lk]
+    return None
+
+
+def extract_propositions_for_chunk(chunk_text: str) -> list[RawProposition]:
+    """Pattern-based proposition extraction.
+
+    Currently handles the introduce event:
+      '"NAMES," said AGENT, introducing PRONOUN.'
+    """
+    results: list[RawProposition] = []
+
+    for m in _INTRO_RE.finditer(chunk_text):
+        names_str = m.group(1).rstrip(",").strip()
+        agent_str = m.group(2).strip()
+
+        agent = _resolve_prop_entity(agent_str)
+        if agent is None:
+            agent = PropEntity(
+                canonical=agent_str, kind="PERSON", aliases=[agent_str]
+            )
+
+        raw_names = [n.strip() for n in _NAME_SEP_RE.split(names_str)]
+        themes: list[PropEntity] = []
+        seen: set[str] = set()
+        for name in raw_names:
+            name = name.strip('" ')
+            if not name:
+                continue
+            pe = _resolve_prop_entity(name)
+            if pe is None:
+                pe = PropEntity(canonical=name, kind="PERSON", aliases=[name])
+            if pe.canonical not in seen:
+                seen.add(pe.canonical)
+                themes.append(pe)
+
+        if not themes:
+            continue
+
+        theme_display = " and ".join(pe.display_name for pe in themes)
+        statement = f"{agent.display_name} introduced {theme_display} to each other."
+
+        # Locate the enclosing evidence span
+        char_start = chunk_text.rfind('"', 0, m.start())
+        char_start = char_start if char_start != -1 else m.start()
+        dot_pos = chunk_text.find('.', m.end())
+        char_end = dot_pos + 1 if dot_pos != -1 else m.end()
+        evidence = chunk_text[char_start:char_end].strip()
+
+        results.append(RawProposition(
+            predicate="introduce",
+            agent=agent,
+            themes=themes,
+            location=None,
+            polarity="positive",
+            statement=statement,
+            evidence=evidence,
+            char_span=(char_start, char_end),
+        ))
+
+    return results

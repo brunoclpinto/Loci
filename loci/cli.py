@@ -808,6 +808,10 @@ def bench_query_cmd(
     label: str = typer.Option("", "--label", help="Run label for the log file."),
     config_path: Optional[Path] = typer.Option(None, "--config", "-c"),
     low_mem: bool = typer.Option(False, "--low-mem"),
+    prop: bool = typer.Option(
+        False, "--prop",
+        help="Try proposition path first; fall back to chunk retrieval when no prop match.",
+    ),
 ) -> None:
     """Full eval: retrieve + generate for every QnA item; mechanical + judge scoring."""
     try:
@@ -918,27 +922,71 @@ def bench_query_cmd(
                         except Exception:
                             pass
 
-                    result = retrieve(
-                        item.question,
-                        conn=conn, cfg=cfg,
-                        embedder=embedder, nlp=nlp,
-                        pack_schemas=p_schemas, timings=timings,
-                        hyde_embedding=hyde_emb,
-                    )
-                    messages = build_messages(item.question, result.context_text, [])
+                    # --- Proposition path (--prop flag) ---
+                    prop_hit = None
+                    if prop:
+                        from loci.retrieve import retrieve_propositions
+                        prop_hit = retrieve_propositions(item.question, conn, nlp=nlp)
 
-                    full_text = ""
-                    first_tok_t: list[float] = []
-                    gen_start = time.perf_counter()
-                    for tok in stream_response(
-                        llm, messages,
-                        max_tokens=cfg.models.max_tokens,
-                        temperature=cfg.models.temperature,
-                    ):
-                        if not first_tok_t:
-                            first_tok_t.append(time.perf_counter())
-                        full_text += tok
-                    gen_end = time.perf_counter()
+                    if prop and prop_hit is not None:
+                        # Proposition path: model sees only the matched fact + question
+                        from loci.generate import (
+                            build_proposition_messages, generate_response as _gen,
+                        )
+                        result = retrieve(
+                            item.question,
+                            conn=conn, cfg=cfg,
+                            embedder=embedder, nlp=nlp,
+                            pack_schemas=p_schemas, timings=timings,
+                        )
+                        messages = build_proposition_messages(item.question, prop_hit)
+                        full_text = ""
+                        first_tok_t: list[float] = []
+                        gen_start = time.perf_counter()
+                        full_text = _gen(
+                            llm, messages,
+                            max_tokens=cfg.models.max_tokens,
+                            temperature=cfg.models.temperature,
+                        )
+                        if full_text:
+                            first_tok_t.append(gen_start)
+                        gen_end = time.perf_counter()
+                        timings["prop_path"] = 1
+                    elif prop and prop_hit is None:
+                        # Proposition path: no match → explicit abstention (no LLM call)
+                        from loci.generate import _PROP_ABSTAIN
+                        result = retrieve(
+                            item.question,
+                            conn=conn, cfg=cfg,
+                            embedder=embedder, nlp=nlp,
+                            pack_schemas=p_schemas, timings=timings,
+                        )
+                        full_text = _PROP_ABSTAIN
+                        first_tok_t = [time.perf_counter()]
+                        gen_start = gen_end = time.perf_counter()
+                        timings["prop_path"] = 0
+                    else:
+                        # Standard chunk-retrieval path
+                        result = retrieve(
+                            item.question,
+                            conn=conn, cfg=cfg,
+                            embedder=embedder, nlp=nlp,
+                            pack_schemas=p_schemas, timings=timings,
+                            hyde_embedding=hyde_emb,
+                        )
+                        messages = build_messages(item.question, result.context_text, [])
+                        full_text = ""
+                        first_tok_t = []
+                        gen_start = time.perf_counter()
+                        for tok in stream_response(
+                            llm, messages,
+                            max_tokens=cfg.models.max_tokens,
+                            temperature=cfg.models.temperature,
+                        ):
+                            if not first_tok_t:
+                                first_tok_t.append(time.perf_counter())
+                            full_text += tok
+                        gen_end = time.perf_counter()
 
                     stop_ev.set()
                     sampler.join(timeout=0.5)

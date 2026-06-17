@@ -130,6 +130,58 @@ _DDL: list[str] = [
     """CREATE VIRTUAL TABLE IF NOT EXISTS fts_facts USING fts5(text)""",
     # LLM-only FTS index (source IN ('llm','closure')) for high-precision minted injection.
     """CREATE VIRTUAL TABLE IF NOT EXISTS fts_facts_llm USING fts5(text)""",
+    # -------------------------------------------------------------------------
+    # Proposition layer — clean entity + event representation (design-v1)
+    # Kept separate from the legacy entities/aliases tables to avoid alias
+    # collisions from FIX1 garbage and to enforce spec-compliant alias sets.
+    # -------------------------------------------------------------------------
+    """CREATE TABLE IF NOT EXISTS prop_entities (
+      id        INTEGER PRIMARY KEY,
+      canonical TEXT NOT NULL UNIQUE,
+      kind      TEXT DEFAULT 'PERSON'
+    )""",
+    """CREATE TABLE IF NOT EXISTS prop_entity_aliases (
+      prop_entity_id INTEGER REFERENCES prop_entities(id),
+      alias          TEXT NOT NULL,
+      PRIMARY KEY (prop_entity_id, alias)
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_prop_entity_aliases ON prop_entity_aliases(alias)",
+    """CREATE TABLE IF NOT EXISTS propositions (
+      id         INTEGER PRIMARY KEY,
+      prop_ref   TEXT,
+      chunk_id   INTEGER REFERENCES chunks(id),
+      predicate  TEXT NOT NULL,
+      roles      JSON NOT NULL,
+      polarity   TEXT DEFAULT 'positive',
+      salience   TEXT DEFAULT 'medium',
+      confidence REAL DEFAULT 1.0,
+      statement  TEXT NOT NULL,
+      evidence   TEXT,
+      char_span  JSON
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_propositions_predicate ON propositions(predicate)",
+    """CREATE TABLE IF NOT EXISTS proposition_entities (
+      prop_id        INTEGER REFERENCES propositions(id),
+      prop_entity_id INTEGER REFERENCES prop_entities(id),
+      role           TEXT NOT NULL,
+      PRIMARY KEY (prop_id, prop_entity_id, role)
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_proposition_entities_entity ON proposition_entities(prop_entity_id)",
+    # FTS5 content table over proposition statements (same pattern as fts_chunks).
+    """CREATE VIRTUAL TABLE IF NOT EXISTS fts_propositions
+       USING fts5(statement, content='propositions', content_rowid='id')""",
+    """CREATE TRIGGER IF NOT EXISTS propositions_ai AFTER INSERT ON propositions BEGIN
+      INSERT INTO fts_propositions(rowid, statement) VALUES (new.id, new.statement);
+    END""",
+    """CREATE TRIGGER IF NOT EXISTS propositions_ad AFTER DELETE ON propositions BEGIN
+      INSERT INTO fts_propositions(fts_propositions, rowid, statement)
+        VALUES ('delete', old.id, old.statement);
+    END""",
+    """CREATE TRIGGER IF NOT EXISTS propositions_au AFTER UPDATE ON propositions BEGIN
+      INSERT INTO fts_propositions(fts_propositions, rowid, statement)
+        VALUES ('delete', old.id, old.statement);
+      INSERT INTO fts_propositions(rowid, statement) VALUES (new.id, new.statement);
+    END""",
 ]
 
 
@@ -153,6 +205,16 @@ def _migrate(conn: sqlite3.Connection, vec_dim: int = 384) -> None:
             "INSERT OR REPLACE INTO db_meta(key,value) VALUES ('vec_dim',?)",
             [str(vec_dim)],
         )
+    # vec_propositions: created lazily alongside vec_facts
+    vec_props_exists = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='vec_propositions'"
+    ).fetchone()
+    if not vec_props_exists:
+        conn.execute(
+            f"CREATE VIRTUAL TABLE vec_propositions USING vec0("
+            f"prop_id INTEGER PRIMARY KEY, embedding FLOAT[{vec_dim}])"
+        )
+
     # vec_facts: created lazily (may not exist in older DBs)
     vec_facts_exists = conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='vec_facts'"
@@ -674,3 +736,171 @@ def mark_chunk_extracted(
         "UPDATE chunks SET extracted_v=? WHERE id=?", [version, chunk_id]
     )
     conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Proposition layer CRUD
+# ---------------------------------------------------------------------------
+
+def ensure_prop_entity(
+    conn: sqlite3.Connection,
+    *,
+    canonical: str,
+    kind: str = "PERSON",
+    aliases: list[str] | None = None,
+) -> int:
+    """Find or create a prop_entity by canonical name; register all aliases.
+
+    Uses its own prop_entity_aliases table so there's no collision with the
+    legacy aliases table (which may contain FIX1 garbage multi-name blobs).
+    """
+    from loci.resolve import normalize_mention
+    row = conn.execute(
+        "SELECT id FROM prop_entities WHERE canonical=?", [canonical]
+    ).fetchone()
+    if row:
+        eid = row["id"]
+    else:
+        cur = conn.execute(
+            "INSERT INTO prop_entities (canonical, kind) VALUES (?,?)",
+            [canonical, kind],
+        )
+        eid = cur.lastrowid
+    if aliases:
+        for raw in aliases:
+            for a in {raw.lower(), normalize_mention(raw)}:
+                if a:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO prop_entity_aliases"
+                        " (prop_entity_id, alias) VALUES (?,?)",
+                        [eid, a],
+                    )
+    conn.commit()
+    return eid
+
+
+def insert_proposition(
+    conn: sqlite3.Connection,
+    *,
+    chunk_id: int,
+    predicate: str,
+    roles: dict,
+    statement: str,
+    prop_ref: str | None = None,
+    polarity: str = "positive",
+    salience: str = "medium",
+    confidence: float = 1.0,
+    evidence: str | None = None,
+    char_span: list | None = None,
+) -> int | None:
+    """Insert a proposition row; returns new id, or None if already stored."""
+    existing = conn.execute(
+        "SELECT id FROM propositions WHERE chunk_id=? AND predicate=? AND statement=?",
+        [chunk_id, predicate, statement],
+    ).fetchone()
+    if existing:
+        return None
+    cur = conn.execute(
+        """INSERT INTO propositions
+             (prop_ref, chunk_id, predicate, roles, polarity, salience, confidence,
+              statement, evidence, char_span)
+           VALUES (?,?,?,?,?,?,?,?,?,?)""",
+        [prop_ref, chunk_id, predicate, json.dumps(roles), polarity, salience,
+         confidence, statement, evidence,
+         json.dumps(char_span) if char_span else None],
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+def insert_proposition_entity(
+    conn: sqlite3.Connection,
+    *,
+    prop_id: int,
+    prop_entity_id: int,
+    role: str,
+) -> None:
+    conn.execute(
+        "INSERT OR IGNORE INTO proposition_entities"
+        " (prop_id, prop_entity_id, role) VALUES (?,?,?)",
+        [prop_id, prop_entity_id, role],
+    )
+    conn.commit()
+
+
+def upsert_vec_proposition(
+    conn: sqlite3.Connection, *, prop_id: int, embedding: list[float]
+) -> None:
+    conn.execute("DELETE FROM vec_propositions WHERE prop_id=?", [prop_id])
+    conn.execute(
+        "INSERT INTO vec_propositions (prop_id, embedding) VALUES (?,?)",
+        [prop_id, _ser(embedding)],
+    )
+    conn.commit()
+
+
+def fts_search_propositions(
+    conn: sqlite3.Connection, *, query: str, k: int = 10
+) -> list[dict]:
+    try:
+        rows = conn.execute(
+            "SELECT rowid AS prop_id, rank FROM fts_propositions"
+            " WHERE statement MATCH ? ORDER BY rank LIMIT ?",
+            [query, k],
+        ).fetchall()
+    except Exception:
+        return []
+    return [dict(r) for r in rows]
+
+
+def get_props_for_entities_and_predicate(
+    conn: sqlite3.Connection,
+    *,
+    predicate: str,
+    prop_entity_ids: list[int],
+) -> list[dict]:
+    """Find propositions whose predicate matches and that contain ALL given entities."""
+    if not prop_entity_ids or not predicate:
+        return []
+    n = len(prop_entity_ids)
+    id_ph = ",".join("?" * n)
+    rows = conn.execute(
+        f"""SELECT p.id, p.predicate, p.statement, p.roles, p.chunk_id, p.prop_ref
+            FROM propositions p
+            WHERE p.predicate = ?
+              AND p.id IN (
+                SELECT prop_id FROM proposition_entities
+                WHERE prop_entity_id IN ({id_ph})
+                GROUP BY prop_id
+                HAVING COUNT(DISTINCT prop_entity_id) >= ?
+              )""",
+        [predicate] + prop_entity_ids + [n],
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_proposition(conn: sqlite3.Connection, prop_id: int) -> dict | None:
+    row = conn.execute(
+        """SELECT id, prop_ref, chunk_id, predicate, roles, polarity,
+                  salience, confidence, statement, evidence, char_span
+           FROM propositions WHERE id=?""",
+        [prop_id],
+    ).fetchone()
+    if row is None:
+        return None
+    d = dict(row)
+    if d.get("roles"):
+        d["roles"] = json.loads(d["roles"])
+    return d
+
+
+def get_prop_agent_canonical(conn: sqlite3.Connection, prop_id: int) -> str | None:
+    """Return the canonical name of the agent entity for a proposition."""
+    row = conn.execute(
+        """SELECT pe.canonical
+           FROM proposition_entities pie
+           JOIN prop_entities pe ON pie.prop_entity_id = pe.id
+           WHERE pie.prop_id=? AND pie.role='agent'""",
+        [prop_id],
+    ).fetchone()
+    return row["canonical"] if row else None

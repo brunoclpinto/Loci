@@ -81,6 +81,16 @@ class RetrievalResult:
     explain_text: str | None = None
 
 
+@dataclass
+class PropositionHit:
+    prop_id: int
+    predicate: str
+    statement: str             # the NL sentence given to the model
+    roles: dict                # {agent: id, theme: [id, ...]}
+    chunk_id: int
+    agent_canonical: str | None = None   # filled in by retrieve_propositions
+
+
 # ---------------------------------------------------------------------------
 # Question parsing
 # ---------------------------------------------------------------------------
@@ -917,3 +927,92 @@ def retrieve(
         context_text=context,
         explain_text=explain_text,
     )
+
+
+# ---------------------------------------------------------------------------
+# Proposition-path retrieval (design-v1)
+# ---------------------------------------------------------------------------
+
+def find_prop_entity_ids(
+    conn: sqlite3.Connection, question: str
+) -> list[int]:
+    """Scan 1-3 word spans from the question against prop_entity_aliases.
+
+    Uses the same span-scanning logic as find_mentioned_entity_ids but
+    queries prop_entity_aliases (clean, FIX2-compliant) instead of aliases.
+    """
+    words = _NONWORD.sub(" ", question.lower()).split()
+    n = len(words)
+    seen: set[int] = set()
+    result: list[int] = []
+    for length in range(min(3, n), 0, -1):
+        for start in range(n - length + 1):
+            span = " ".join(words[start : start + length])
+            if not span:
+                continue
+            row = conn.execute(
+                "SELECT prop_entity_id FROM prop_entity_aliases WHERE alias=?", [span]
+            ).fetchone()
+            if row and row[0] not in seen:
+                seen.add(row[0])
+                result.append(row[0])
+    return result
+
+
+def retrieve_propositions(
+    question: str,
+    conn: sqlite3.Connection,
+    nlp: Any = None,
+) -> PropositionHit | None:
+    """Proposition-path retrieval: question → predicate + entities → prop match.
+
+    Returns None when no proposition matches the question's predicate + entities.
+    Callers must produce an abstention answer in that case (negative_contract).
+    """
+    from loci.store import (
+        get_props_for_entities_and_predicate,
+        get_proposition,
+        get_prop_agent_canonical,
+        fts_search_propositions,
+    )
+
+    parse = parse_question(question, nlp=nlp)
+    predicate = parse.verb_lemma
+    if not predicate:
+        return None
+
+    # Primary path: entity-postings ∩ predicate
+    prop_entity_ids = find_prop_entity_ids(conn, question)
+    if prop_entity_ids:
+        matches = get_props_for_entities_and_predicate(
+            conn, predicate=predicate, prop_entity_ids=prop_entity_ids
+        )
+        if matches:
+            best = matches[0]
+            return PropositionHit(
+                prop_id=best["id"],
+                predicate=best["predicate"],
+                statement=best["statement"],
+                roles=json.loads(best["roles"]) if isinstance(best["roles"], str) else best["roles"],
+                chunk_id=best["chunk_id"],
+                agent_canonical=get_prop_agent_canonical(conn, best["id"]),
+            )
+
+    # Fallback: FTS on statement + predicate filter (handles paraphrase / alias miss)
+    words = _NONWORD.sub(" ", question.lower()).split()
+    content = [w for w in words if w and w not in _FTS_STOPWORDS and len(w) > 2]
+    if content:
+        fts_query = " OR ".join(content)
+        for hit in fts_search_propositions(conn, query=fts_query, k=10):
+            prop = get_proposition(conn, hit["prop_id"])
+            if prop and prop["predicate"] == predicate:
+                return PropositionHit(
+                    prop_id=prop["id"],
+                    predicate=prop["predicate"],
+                    statement=prop["statement"],
+                    roles=prop["roles"],
+                    chunk_id=prop["chunk_id"],
+                    agent_canonical=get_prop_agent_canonical(conn, prop["id"]),
+                )
+
+    return None
