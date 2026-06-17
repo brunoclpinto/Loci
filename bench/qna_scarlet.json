@@ -1,0 +1,1313 @@
+[
+  {
+    "id": "q0001",
+    "book": "a_study_in_scarlet",
+    "type": "fact",
+    "question": "Who introduced Dr. Watson to Sherlock Holmes?",
+    "expected_keywords": [
+      "Stamford"
+    ],
+    "expected_facts": [
+      {
+        "subject": "stamford",
+        "predicate": "introduce"
+      }
+    ],
+    "expected_sources": [],
+    "answerable": true,
+    "expected_answer": "Stamford"
+  },
+  {
+    "id": "q0002",
+    "book": "a_study_in_scarlet",
+    "type": "fact",
+    "question": "At which London hospital did Watson first meet Holmes?",
+    "expected_keywords": [
+      "Barts",
+      "Bartholomew"
+    ],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": true,
+    "expected_answer": "St. Bartholomew's Hospital (Barts)"
+  },
+  {
+    "id": "q0003",
+    "book": "a_study_in_scarlet",
+    "type": "fact",
+    "question": "What is the exact street address where Holmes and Watson shared rooms?",
+    "expected_keywords": [
+      "221B",
+      "Baker Street"
+    ],
+    "expected_facts": [
+      {
+        "subject": "holmes",
+        "predicate": "live"
+      }
+    ],
+    "expected_sources": [],
+    "answerable": true,
+    "expected_answer": "221B Baker Street"
+  },
+  {
+    "id": "q0004",
+    "book": "a_study_in_scarlet",
+    "type": "fact",
+    "question": "Who is the landlady at 221B Baker Street?",
+    "expected_keywords": [
+      "Hudson",
+      "Mrs. Hudson"
+    ],
+    "expected_facts": [
+      {
+        "subject": "hudson",
+        "predicate": "keep"
+      }
+    ],
+    "expected_sources": [],
+    "answerable": true,
+    "expected_answer": "Mrs. Hudson"
+  },
+  {
+    "id": "q0005",
+    "book": "a_study_in_scarlet",
+    "type": "fact",
+    "question": "What word was written in blood on the wall of the first murder scene?",
+    "expected_keywords": [
+      "RACHE"
+    ],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": true,
+    "expected_answer": "RACHE"
+  },
+  {
+    "id": "q0006",
+    "book": "a_study_in_scarlet",
+    "type": "fact",
+    "question": "What does the word 'RACHE' mean in German?",
+    "expected_keywords": [
+      "revenge"
+    ],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": true,
+    "expected_answer": "Revenge"
+  },
+  {
+    "id": "q0007",
+    "book": "a_study_in_scarlet",
+    "type": "fact",
+    "question": "In which battle was Dr. Watson wounded before returning to England?",
+    "expected_keywords": [
+      "Maiwand"
+    ],
+    "expected_facts": [
+      {
+        "subject": "watson",
+        "predicate": "wound"
+      }
+    ],
+    "expected_sources": [],
+    "answerable": true,
+    "expected_answer": "The Battle of Maiwand"
+  },
+  {
+    "id": "q0008",
+    "book": "a_study_in_scarlet",
+    "type": "fact",
+    "question": "Who is the murderer in A Study in Scarlet?",
+    "expected_keywords": [
+      "Jefferson Hope",
+      "Hope"
+    ],
+    "expected_facts": [
+      {
+        "subject": "hope",
+        "predicate": "murder"
+      }
+    ],
+    "expected_sources": [],
+    "answerable": true,
+    "expected_answer": "Jefferson Hope"
+  },
+  {
+    "id": "q0009",
+    "book": "a_study_in_scarlet",
+    "type": "fact",
+    "question": "What occupation was Jefferson Hope working in when Holmes caught him?",
+    "expected_keywords": [
+      "cab driver",
+      "cabman"
+    ],
+    "expected_facts": [
+      {
+        "subject": "hope",
+        "predicate": "drive"
+      }
+    ],
+    "expected_sources": [],
+    "answerable": true,
+    "expected_answer": "Cab driver (cabman)"
+  },
+  {
+    "id": "q0010",
+    "book": "a_study_in_scarlet",
+    "type": "fact",
+    "question": "What was the name of the woman Jefferson Hope loved and sought to avenge?",
+    "expected_keywords": [
+      "Lucy",
+      "Lucy Ferrier"
+    ],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": true,
+    "expected_answer": "Lucy Ferrier"
+  },
+  {
+    "id": "q0011",
+    "book": "a_study_in_scarlet",
+    "type": "fact",
+    "question": "Who adopted Lucy and raised her in the Utah desert?",
+    "expected_keywords": [
+      "John Ferrier",
+      "Ferrier"
+    ],
+    "expected_facts": [
+      {
+        "subject": "ferrier",
+        "predicate": "adopt"
+      }
+    ],
+    "expected_sources": [],
+    "answerable": true,
+    "expected_answer": "John Ferrier"
+  },
+  {
+    "id": "q0012",
+    "book": "a_study_in_scarlet",
+    "type": "fact",
+    "question": "Name the two Scotland Yard inspectors investigating the murders in A Study in Scarlet.",
+    "expected_keywords": [
+      "Lestrade",
+      "Gregson"
+    ],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": true,
+    "expected_answer": "Lestrade and Gregson"
+  },
+  {
+    "id": "q0013",
+    "book": "a_study_in_scarlet",
+    "type": "fact",
+    "question": "Who was the first victim found dead at Lauriston Gardens?",
+    "expected_keywords": [
+      "Drebber",
+      "Enoch Drebber"
+    ],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": true,
+    "expected_answer": "Enoch Drebber"
+  },
+  {
+    "id": "q0014",
+    "book": "a_study_in_scarlet",
+    "type": "fact",
+    "question": "Who was the second murder victim in A Study in Scarlet?",
+    "expected_keywords": [
+      "Stangerson",
+      "Joseph Stangerson"
+    ],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": true,
+    "expected_answer": "Joseph Stangerson"
+  },
+  {
+    "id": "q0015",
+    "book": "a_study_in_scarlet",
+    "type": "fact",
+    "question": "How did Jefferson Hope die after his arrest?",
+    "expected_keywords": [
+      "aneurysm",
+      "aortic"
+    ],
+    "expected_facts": [
+      {
+        "subject": "hope",
+        "predicate": "die"
+      }
+    ],
+    "expected_sources": [],
+    "answerable": true,
+    "expected_answer": "He died of an aortic aneurysm the night after his arrest"
+  },
+  {
+    "id": "q0016",
+    "book": "a_study_in_scarlet",
+    "type": "fact",
+    "question": "What religion did the Utah settlers in A Study in Scarlet practise?",
+    "expected_keywords": [
+      "Mormon",
+      "Latter-day Saints"
+    ],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": true,
+    "expected_answer": "Mormon (Latter-day Saints)"
+  },
+  {
+    "id": "q0017",
+    "book": "a_study_in_scarlet",
+    "type": "fact",
+    "question": "Who was Lucy Ferrier forced to marry?",
+    "expected_keywords": [
+      "Drebber",
+      "Enoch Drebber"
+    ],
+    "expected_facts": [
+      {
+        "subject": "lucy",
+        "predicate": "marry"
+      }
+    ],
+    "expected_sources": [],
+    "answerable": true,
+    "expected_answer": "Enoch Drebber"
+  },
+  {
+    "id": "q0018",
+    "book": "a_study_in_scarlet",
+    "type": "fact",
+    "question": "What musical instrument does Sherlock Holmes play?",
+    "expected_keywords": [
+      "violin"
+    ],
+    "expected_facts": [
+      {
+        "subject": "holmes",
+        "predicate": "play"
+      }
+    ],
+    "expected_sources": [],
+    "answerable": true,
+    "expected_answer": "Violin"
+  },
+  {
+    "id": "q0019",
+    "book": "a_study_in_scarlet",
+    "type": "fact",
+    "question": "What is Holmes's network of street-child informants called?",
+    "expected_keywords": [
+      "Baker Street Irregulars",
+      "Irregulars"
+    ],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": true,
+    "expected_answer": "The Baker Street Irregulars"
+  },
+  {
+    "id": "q0020",
+    "book": "a_study_in_scarlet",
+    "type": "fact",
+    "question": "Who led the Mormon wagon train that rescued John Ferrier in the desert?",
+    "expected_keywords": [
+      "Brigham Young"
+    ],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": true,
+    "expected_answer": "Brigham Young"
+  },
+  {
+    "id": "q0021",
+    "book": "a_study_in_scarlet",
+    "type": "fact",
+    "question": "What method did Jefferson Hope use to decide which victim would die?",
+    "expected_keywords": [
+      "pill",
+      "pills"
+    ],
+    "expected_facts": [
+      {
+        "subject": "hope",
+        "predicate": "use"
+      }
+    ],
+    "expected_sources": [],
+    "answerable": true,
+    "expected_answer": "He offered each victim a choice of two pills \u2014 one poisonous, one harmless \u2014 and forced them to take one, leaving the outcome to chance (Providence)"
+  },
+  {
+    "id": "q0022",
+    "book": "a_study_in_scarlet",
+    "type": "fact",
+    "question": "What are Watson's full first name and initial as given in A Study in Scarlet?",
+    "expected_keywords": [
+      "John",
+      "H."
+    ],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": true,
+    "expected_answer": "John H. Watson"
+  },
+  {
+    "id": "q0023",
+    "book": "a_study_in_scarlet",
+    "type": "fact",
+    "question": "What deduction did Holmes make about Watson at their very first meeting?",
+    "expected_keywords": [
+      "Afghanistan"
+    ],
+    "expected_facts": [
+      {
+        "subject": "holmes",
+        "predicate": "deduce"
+      }
+    ],
+    "expected_sources": [],
+    "answerable": true,
+    "expected_answer": "That Watson had been in Afghanistan"
+  },
+  {
+    "id": "q0024",
+    "book": "a_study_in_scarlet",
+    "type": "fact",
+    "question": "What term does Holmes use to describe his unique profession?",
+    "expected_keywords": [
+      "consulting detective"
+    ],
+    "expected_facts": [
+      {
+        "subject": "holmes",
+        "predicate": "describe"
+      }
+    ],
+    "expected_sources": [],
+    "answerable": true,
+    "expected_answer": "Consulting detective"
+  },
+  {
+    "id": "q0025",
+    "book": "a_study_in_scarlet",
+    "type": "fact",
+    "question": "In which country is Part Two of A Study in Scarlet set?",
+    "expected_keywords": [
+      "America",
+      "United States",
+      "Utah"
+    ],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": true,
+    "expected_answer": "America (Utah, United States)"
+  },
+  {
+    "id": "q0026",
+    "book": "a_study_in_scarlet",
+    "type": "fact",
+    "question": "What was Jefferson Hope's motive for killing Drebber and Stangerson?",
+    "expected_keywords": [
+      "revenge",
+      "avenge",
+      "Lucy"
+    ],
+    "expected_facts": [
+      {
+        "subject": "hope",
+        "predicate": "avenge"
+      }
+    ],
+    "expected_sources": [],
+    "answerable": true,
+    "expected_answer": "To avenge Lucy Ferrier and John Ferrier \u2014 Drebber and Stangerson had caused Lucy to be forced into marriage and both Ferriers to die"
+  },
+  {
+    "id": "q0027",
+    "book": "a_study_in_scarlet",
+    "type": "fact",
+    "question": "What name did Gregson and Lestrade mistakenly believe RACHE referred to?",
+    "expected_keywords": [
+      "Rachel"
+    ],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": true,
+    "expected_answer": "Rachel"
+  },
+  {
+    "id": "q0028",
+    "book": "a_study_in_scarlet",
+    "type": "fact",
+    "question": "What was the orderly's name who carried Watson off the Maiwand battlefield?",
+    "expected_keywords": [
+      "Murray"
+    ],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": true,
+    "expected_answer": "Murray"
+  },
+  {
+    "id": "q0029",
+    "book": "a_study_in_scarlet",
+    "type": "fact",
+    "question": "What was Stangerson's role relative to Drebber?",
+    "expected_keywords": [
+      "secretary",
+      "companion"
+    ],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": true,
+    "expected_answer": "Secretary (Stangerson was Drebber's secretary and companion)"
+  },
+  {
+    "id": "q0030",
+    "book": "a_study_in_scarlet",
+    "type": "fact",
+    "question": "What ring found at the murder scene did Holmes use to set his trap for Hope?",
+    "expected_keywords": [
+      "ring",
+      "wedding ring"
+    ],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": true,
+    "expected_answer": "A wedding ring"
+  },
+  {
+    "id": "q0031",
+    "book": "a_study_in_scarlet",
+    "type": "fact",
+    "question": "What did Holmes use to test the two pills taken from Jefferson Hope?",
+    "expected_keywords": [
+      "dog"
+    ],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": true,
+    "expected_answer": "A sick terrier dog (he gave one pill to the dog; it died, proving the pill was poisonous)"
+  },
+  {
+    "id": "q0032",
+    "book": "a_study_in_scarlet",
+    "type": "fact",
+    "question": "What regiment was Watson attached to in Afghanistan?",
+    "expected_keywords": [
+      "Berkshire",
+      "Northumberland"
+    ],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": true,
+    "expected_answer": "The Fifth Northumberland Fusiliers (and later attached to the Berkshire Regiment at Maiwand)"
+  },
+  {
+    "id": "q0033",
+    "book": "a_study_in_scarlet",
+    "type": "fact",
+    "question": "Where had Drebber and Stangerson been living before arriving in London?",
+    "expected_keywords": [
+      "Europe",
+      "Cleveland",
+      "continent"
+    ],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": true,
+    "expected_answer": "They had been living on the Continent (Europe), fleeing Jefferson Hope who had tracked them there"
+  },
+  {
+    "id": "q0034",
+    "book": "a_study_in_scarlet",
+    "type": "fact",
+    "question": "How did Holmes trap Jefferson Hope\u2014what ruse did he employ?",
+    "expected_keywords": [
+      "advertisement",
+      "advert"
+    ],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": true,
+    "expected_answer": "He placed a newspaper advertisement claiming to have found a ring; Hope came to collect it and was captured"
+  },
+  {
+    "id": "q0035",
+    "book": "a_study_in_scarlet",
+    "type": "fact",
+    "question": "What name was given to the Mormon territory where the Ferriers settled?",
+    "expected_keywords": [
+      "Utah",
+      "Salt Lake",
+      "Deseret"
+    ],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": true,
+    "expected_answer": "Utah (the Territory of Utah / Salt Lake Valley)"
+  },
+  {
+    "id": "q0036",
+    "book": "a_study_in_scarlet",
+    "type": "paraphrase",
+    "question": "Which intermediary figure arranged the first encounter between Holmes and Watson?",
+    "expected_keywords": [
+      "Stamford"
+    ],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": true,
+    "expected_answer": "Stamford"
+  },
+  {
+    "id": "q0037",
+    "book": "a_study_in_scarlet",
+    "type": "paraphrase",
+    "question": "What address became the most famous lodgings in detective fiction?",
+    "expected_keywords": [
+      "221B",
+      "Baker Street"
+    ],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": true,
+    "expected_answer": "221B Baker Street"
+  },
+  {
+    "id": "q0038",
+    "book": "a_study_in_scarlet",
+    "type": "paraphrase",
+    "question": "What fatal medical condition ended Jefferson Hope's life before trial?",
+    "expected_keywords": [
+      "aneurysm",
+      "aortic"
+    ],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": true,
+    "expected_answer": "An aortic aneurysm"
+  },
+  {
+    "id": "q0039",
+    "book": "a_study_in_scarlet",
+    "type": "paraphrase",
+    "question": "What religious sect compelled John Ferrier to surrender Lucy as a bride?",
+    "expected_keywords": [
+      "Mormon",
+      "Latter-day Saints"
+    ],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": true,
+    "expected_answer": "The Mormons (Latter-day Saints)"
+  },
+  {
+    "id": "q0040",
+    "book": "a_study_in_scarlet",
+    "type": "paraphrase",
+    "question": "Which work is widely recognised as the first Sherlock Holmes story?",
+    "expected_keywords": [
+      "A Study in Scarlet"
+    ],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": true,
+    "expected_answer": "A Study in Scarlet"
+  },
+  {
+    "id": "q0041",
+    "book": "a_study_in_scarlet",
+    "type": "paraphrase",
+    "question": "What was written in blood at the Brixton Road crime scene?",
+    "expected_keywords": [
+      "RACHE"
+    ],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": true,
+    "expected_answer": "RACHE"
+  },
+  {
+    "id": "q0042",
+    "book": "a_study_in_scarlet",
+    "type": "paraphrase",
+    "question": "Which two senior Scotland Yard officers appear in A Study in Scarlet?",
+    "expected_keywords": [
+      "Lestrade",
+      "Gregson"
+    ],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": true,
+    "expected_answer": "Lestrade and Gregson"
+  },
+  {
+    "id": "q0043",
+    "book": "a_study_in_scarlet",
+    "type": "paraphrase",
+    "question": "What disguised occupation allowed Jefferson Hope to tail his victims?",
+    "expected_keywords": [
+      "cab",
+      "cabman",
+      "driver"
+    ],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": true,
+    "expected_answer": "Cab driver (cabman)"
+  },
+  {
+    "id": "q0044",
+    "book": "a_study_in_scarlet",
+    "type": "paraphrase",
+    "question": "Where did Watson stay in London after being invalided home, before meeting Holmes?",
+    "expected_keywords": [
+      "hotel",
+      "Strand",
+      "private hotel"
+    ],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": true,
+    "expected_answer": "A private hotel in the Strand"
+  },
+  {
+    "id": "q0045",
+    "book": "a_study_in_scarlet",
+    "type": "paraphrase",
+    "question": "What deduction showed Holmes had already guessed Watson's military background?",
+    "expected_keywords": [
+      "Afghanistan"
+    ],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": true,
+    "expected_answer": "Holmes immediately deduced Watson had been in Afghanistan (from his tan, bearing, and injured arm)"
+  },
+  {
+    "id": "q0046",
+    "book": "a_study_in_scarlet",
+    "type": "multi_hop",
+    "question": "How do RACHE and Jefferson Hope's motive connect?",
+    "expected_keywords": [
+      "revenge",
+      "RACHE",
+      "Lucy"
+    ],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": true,
+    "expected_answer": "RACHE is German for revenge; Jefferson Hope wrote it to signal that the murders were acts of vengeance for the deaths of Lucy Ferrier and John Ferrier"
+  },
+  {
+    "id": "q0047",
+    "book": "a_study_in_scarlet",
+    "type": "multi_hop",
+    "question": "Why did Hope give his victims a choice of pills rather than just poisoning them?",
+    "expected_keywords": [
+      "Providence",
+      "chance",
+      "fair",
+      "God"
+    ],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": true,
+    "expected_answer": "Hope believed in Providence (divine justice) \u2014 giving victims a fair choice let God decide who would die; he did not want to murder in cold blood"
+  },
+  {
+    "id": "q0048",
+    "book": "a_study_in_scarlet",
+    "type": "multi_hop",
+    "question": "What chain of Mormon-enforced events led directly to Lucy Ferrier's death?",
+    "expected_keywords": [
+      "Drebber",
+      "marry",
+      "hope",
+      "heartbreak"
+    ],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": true,
+    "expected_answer": "The Mormons (under Brigham Young) ordered Ferrier to give Lucy in marriage to either Drebber or Stangerson; Ferrier refused and was killed; Lucy was forced to marry Drebber and died of a broken heart shortly after"
+  },
+  {
+    "id": "q0049",
+    "book": "a_study_in_scarlet",
+    "type": "multi_hop",
+    "question": "How did Watson's Afghan wound affect his finances and his decision to share lodgings?",
+    "expected_keywords": [
+      "pension",
+      "invalid",
+      "share",
+      "cheap"
+    ],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": true,
+    "expected_answer": "Watson's wound left him on a small army pension (eleven shillings and sixpence a day), insufficient for comfortable London lodgings; Stamford suggested sharing rooms with Holmes as an affordable solution"
+  },
+  {
+    "id": "q0050",
+    "book": "a_study_in_scarlet",
+    "type": "multi_hop",
+    "question": "What two-step method did Holmes use to identify and then physically capture Hope?",
+    "expected_keywords": [
+      "advertisement",
+      "ring",
+      "cab"
+    ],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": true,
+    "expected_answer": "First, Holmes placed an advertisement saying a ring had been found, luring Hope to Baker Street; second, when Hope arrived posing as a cab driver's messenger, Holmes and Watson physically seized him"
+  },
+  {
+    "id": "q0051",
+    "book": "a_study_in_scarlet",
+    "type": "fact",
+    "question": "What was the name of the place in Utah where the Ferriers farmed?",
+    "expected_keywords": [
+      "Salt Lake",
+      "Great Alkali Plain"
+    ],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": true,
+    "expected_answer": "The fertile valley near Salt Lake City (the Great Alkali Plain region / Utah valley)"
+  },
+  {
+    "id": "q0052",
+    "book": "a_study_in_scarlet",
+    "type": "fact",
+    "question": "Who narrates A Study in Scarlet?",
+    "expected_keywords": [
+      "Watson",
+      "Dr. Watson"
+    ],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": true,
+    "expected_answer": "Dr. Watson (John H. Watson)"
+  },
+  {
+    "id": "q0053",
+    "book": "a_study_in_scarlet",
+    "type": "fact",
+    "question": "What animal did Watson use to describe the state of Holmes's knowledge of literature?",
+    "expected_keywords": [
+      "nil",
+      "nil",
+      "immense",
+      "nil"
+    ],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": true,
+    "expected_answer": "Watson rated Holmes's knowledge of literature as nil (giving it the lowest grade in his assessment list)"
+  },
+  {
+    "id": "q0054",
+    "book": "a_study_in_scarlet",
+    "type": "fact",
+    "question": "What does Holmes say when Watson first asks if he is a doctor or a detective?",
+    "expected_keywords": [
+      "consulting detective"
+    ],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": true,
+    "expected_answer": "I am a consulting detective (Holmes says he is the only one in the world and calls himself a consulting detective)"
+  },
+  {
+    "id": "q0055",
+    "book": "a_study_in_scarlet",
+    "type": "fact",
+    "question": "In which year was Watson wounded at Maiwand?",
+    "expected_keywords": [
+      "1880"
+    ],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": true,
+    "expected_answer": "1880"
+  },
+  {
+    "id": "q0056",
+    "book": "a_study_in_scarlet",
+    "type": "fact",
+    "question": "What is Holmes's full name?",
+    "expected_keywords": [
+      "Sherlock Holmes"
+    ],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": true,
+    "expected_answer": "Sherlock Holmes"
+  },
+  {
+    "id": "q0057",
+    "book": "a_study_in_scarlet",
+    "type": "fact",
+    "question": "Who was the second Mormon suitor proposed for Lucy after Drebber?",
+    "expected_keywords": [
+      "Stangerson",
+      "Joseph Stangerson"
+    ],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": true,
+    "expected_answer": "Joseph Stangerson"
+  },
+  {
+    "id": "q0058",
+    "book": "a_study_in_scarlet",
+    "type": "fact",
+    "question": "What ultimately happened to Jefferson Hope after his arrest \u2014 before any trial?",
+    "expected_keywords": [
+      "died",
+      "aneurysm"
+    ],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": true,
+    "expected_answer": "He died of an aortic aneurysm the night before his scheduled trial"
+  },
+  {
+    "id": "q0059",
+    "book": "a_study_in_scarlet",
+    "type": "fact",
+    "question": "What colour was the lettering of RACHE on the wall?",
+    "expected_keywords": [
+      "red",
+      "crimson",
+      "blood"
+    ],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": true,
+    "expected_answer": "Red (written in blood / crimson)"
+  },
+  {
+    "id": "q0060",
+    "book": "a_study_in_scarlet",
+    "type": "fact",
+    "question": "What message did Hope's pill method convey about his view of divine justice?",
+    "expected_keywords": [
+      "Providence",
+      "God",
+      "Heaven",
+      "fair"
+    ],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": true,
+    "expected_answer": "Hope believed in Providence \u2014 that Heaven (God) would decide which victim was guilty; the choice of pills was his way of leaving divine justice to determine the outcome"
+  },
+  {
+    "id": "q0061",
+    "book": "a_study_in_scarlet",
+    "type": "negative",
+    "question": "What was the name of the dog Holmes used to track the Agra treasure in A Study in Scarlet?",
+    "expected_keywords": [],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": false
+  },
+  {
+    "id": "q0062",
+    "book": "a_study_in_scarlet",
+    "type": "negative",
+    "question": "Who is referred to as the Napoleon of Crime in A Study in Scarlet?",
+    "expected_keywords": [],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": false
+  },
+  {
+    "id": "q0063",
+    "book": "a_study_in_scarlet",
+    "type": "negative",
+    "question": "In A Study in Scarlet, which waterfall is the scene of Holmes's apparent death?",
+    "expected_keywords": [],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": false
+  },
+  {
+    "id": "q0064",
+    "book": "a_study_in_scarlet",
+    "type": "negative",
+    "question": "What is the name of Holmes's older brother who appears in A Study in Scarlet?",
+    "expected_keywords": [],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": false
+  },
+  {
+    "id": "q0065",
+    "book": "a_study_in_scarlet",
+    "type": "negative",
+    "question": "In A Study in Scarlet, which opera singer does Holmes impersonate as a disguise?",
+    "expected_keywords": [],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": false
+  },
+  {
+    "id": "q0066",
+    "book": "a_study_in_scarlet",
+    "type": "negative",
+    "question": "What Agra treasure map is central to the plot of A Study in Scarlet?",
+    "expected_keywords": [],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": false
+  },
+  {
+    "id": "q0067",
+    "book": "a_study_in_scarlet",
+    "type": "negative",
+    "question": "Which ghostly hound terrorises a Devonshire family in A Study in Scarlet?",
+    "expected_keywords": [],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": false
+  },
+  {
+    "id": "q0068",
+    "book": "a_study_in_scarlet",
+    "type": "negative",
+    "question": "Who is Watson's future wife introduced in A Study in Scarlet?",
+    "expected_keywords": [],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": false
+  },
+  {
+    "id": "q0069",
+    "book": "a_study_in_scarlet",
+    "type": "negative",
+    "question": "What club does Mycroft Holmes found in A Study in Scarlet?",
+    "expected_keywords": [],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": false
+  },
+  {
+    "id": "q0070",
+    "book": "a_study_in_scarlet",
+    "type": "negative",
+    "question": "What drug does Holmes inject himself with when bored between cases in A Study in Scarlet?",
+    "expected_keywords": [],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": false
+  },
+  {
+    "id": "q0071",
+    "book": "a_study_in_scarlet",
+    "type": "negative",
+    "question": "Which Dr. Roylott victim did Holmes save from the swamp adder in A Study in Scarlet?",
+    "expected_keywords": [],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": false
+  },
+  {
+    "id": "q0072",
+    "book": "a_study_in_scarlet",
+    "type": "negative",
+    "question": "Which professor runs Europe's most dangerous criminal organisation in A Study in Scarlet?",
+    "expected_keywords": [],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": false
+  },
+  {
+    "id": "q0073",
+    "book": "a_study_in_scarlet",
+    "type": "negative",
+    "question": "What title does the Bohemian nobleman hold who visits Holmes in A Study in Scarlet?",
+    "expected_keywords": [],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": false
+  },
+  {
+    "id": "q0074",
+    "book": "a_study_in_scarlet",
+    "type": "negative",
+    "question": "How does Holmes fake his own death in A Study in Scarlet?",
+    "expected_keywords": [],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": false
+  },
+  {
+    "id": "q0075",
+    "book": "a_study_in_scarlet",
+    "type": "negative",
+    "question": "Which air-gun assassin does Holmes expose in A Study in Scarlet?",
+    "expected_keywords": [],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": false
+  },
+  {
+    "id": "q0076",
+    "book": "a_study_in_scarlet",
+    "type": "negative",
+    "question": "Who inherits Baskerville Hall at the start of the investigation in A Study in Scarlet?",
+    "expected_keywords": [],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": false
+  },
+  {
+    "id": "q0077",
+    "book": "a_study_in_scarlet",
+    "type": "negative",
+    "question": "In A Study in Scarlet, what did Jabez Wilson copy as part of a criminal ruse?",
+    "expected_keywords": [],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": false
+  },
+  {
+    "id": "q0078",
+    "book": "a_study_in_scarlet",
+    "type": "negative",
+    "question": "What was the hidden true identity of Mr. Stapleton in A Study in Scarlet?",
+    "expected_keywords": [],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": false
+  },
+  {
+    "id": "q0079",
+    "book": "a_study_in_scarlet",
+    "type": "negative",
+    "question": "In A Study in Scarlet, what was the famous problem of the five orange pips?",
+    "expected_keywords": [],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": false
+  },
+  {
+    "id": "q0080",
+    "book": "a_study_in_scarlet",
+    "type": "negative",
+    "question": "What London opium den does Holmes frequent in A Study in Scarlet?",
+    "expected_keywords": [],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": false
+  },
+  {
+    "id": "q0081",
+    "book": "a_study_in_scarlet",
+    "type": "negative",
+    "question": "What American woman does Holmes encounter who was previously married in A Study in Scarlet?",
+    "expected_keywords": [],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": false
+  },
+  {
+    "id": "q0082",
+    "book": "a_study_in_scarlet",
+    "type": "negative",
+    "question": "In A Study in Scarlet, what is the significance of dancing-men stick figures?",
+    "expected_keywords": [],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": false
+  },
+  {
+    "id": "q0083",
+    "book": "a_study_in_scarlet",
+    "type": "negative",
+    "question": "Which Wisteria Lodge resident is a fugitive South American tyrant in A Study in Scarlet?",
+    "expected_keywords": [],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": false
+  },
+  {
+    "id": "q0084",
+    "book": "a_study_in_scarlet",
+    "type": "negative",
+    "question": "What does Holmes find in the black pearl of the Borgias case in A Study in Scarlet?",
+    "expected_keywords": [],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": false
+  },
+  {
+    "id": "q0085",
+    "book": "a_study_in_scarlet",
+    "type": "negative",
+    "question": "In A Study in Scarlet, which blackmailer does Holmes allow to be shot?",
+    "expected_keywords": [],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": false
+  },
+  {
+    "id": "q0086",
+    "book": "a_study_in_scarlet",
+    "type": "negative",
+    "question": "What stolen navy document is recovered in A Study in Scarlet?",
+    "expected_keywords": [],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": false
+  },
+  {
+    "id": "q0087",
+    "book": "a_study_in_scarlet",
+    "type": "negative",
+    "question": "What is the Musgrave Ritual treasure Holmes finds in A Study in Scarlet?",
+    "expected_keywords": [],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": false
+  },
+  {
+    "id": "q0088",
+    "book": "a_study_in_scarlet",
+    "type": "negative",
+    "question": "Who does Holmes rescue from Culverton Smith's tropical disease trap in A Study in Scarlet?",
+    "expected_keywords": [],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": false
+  },
+  {
+    "id": "q0089",
+    "book": "a_study_in_scarlet",
+    "type": "negative",
+    "question": "What is the name of the retired colourman accused of murder in A Study in Scarlet?",
+    "expected_keywords": [],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": false
+  },
+  {
+    "id": "q0090",
+    "book": "a_study_in_scarlet",
+    "type": "negative",
+    "question": "Which Sussex jellyfish kills a man in A Study in Scarlet?",
+    "expected_keywords": [],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": false
+  },
+  {
+    "id": "q0091",
+    "book": "a_study_in_scarlet",
+    "type": "negative",
+    "question": "In A Study in Scarlet, who is the Gold King accused of murdering his wife?",
+    "expected_keywords": [],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": false
+  },
+  {
+    "id": "q0092",
+    "book": "a_study_in_scarlet",
+    "type": "negative",
+    "question": "What foreign professor injects monkey-gland serum in A Study in Scarlet?",
+    "expected_keywords": [],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": false
+  },
+  {
+    "id": "q0093",
+    "book": "a_study_in_scarlet",
+    "type": "negative",
+    "question": "Which circus strongman turns out to be a murderer in A Study in Scarlet?",
+    "expected_keywords": [],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": false
+  },
+  {
+    "id": "q0094",
+    "book": "a_study_in_scarlet",
+    "type": "negative",
+    "question": "In A Study in Scarlet, which German spy does Holmes expose on the eve of WWI?",
+    "expected_keywords": [],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": false
+  },
+  {
+    "id": "q0095",
+    "book": "a_study_in_scarlet",
+    "type": "negative",
+    "question": "What stolen crown jewel is named after the Mazarin stone in A Study in Scarlet?",
+    "expected_keywords": [],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": false
+  },
+  {
+    "id": "q0096",
+    "book": "a_study_in_scarlet",
+    "type": "negative",
+    "question": "Which three students cheat in an examination investigated by Holmes in A Study in Scarlet?",
+    "expected_keywords": [],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": false
+  },
+  {
+    "id": "q0097",
+    "book": "a_study_in_scarlet",
+    "type": "negative",
+    "question": "What is the name of the Valley of Fear Scowrers leader in A Study in Scarlet?",
+    "expected_keywords": [],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": false
+  },
+  {
+    "id": "q0098",
+    "book": "a_study_in_scarlet",
+    "type": "negative",
+    "question": "Who was the Sussex vampire actually harming in A Study in Scarlet?",
+    "expected_keywords": [],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": false
+  },
+  {
+    "id": "q0099",
+    "book": "a_study_in_scarlet",
+    "type": "negative",
+    "question": "In A Study in Scarlet, which Victorian blackmailer keeps files on half of London?",
+    "expected_keywords": [],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": false
+  },
+  {
+    "id": "q0100",
+    "book": "a_study_in_scarlet",
+    "type": "negative",
+    "question": "What cipher message from Fred Porlock opens the investigation in A Study in Scarlet?",
+    "expected_keywords": [],
+    "expected_facts": [],
+    "expected_sources": [],
+    "answerable": false
+  }
+]

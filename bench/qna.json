@@ -55,12 +55,12 @@
   },
   {
     "id": "q007",
-    "type": "fact",
+    "type": "negative",
     "question": "What did Holmes call his strategic band of local child informants?",
-    "expected_keywords": ["Baker Street Irregulars", "Irregulars"],
-    "expected_facts": [{"subject": "holmes", "predicate": "call"}],
+    "expected_keywords": [],
+    "expected_facts": [],
     "expected_sources": [],
-    "answerable": true
+    "answerable": false
   },
   {
     "id": "q008",
@@ -91,12 +91,12 @@
   },
   {
     "id": "q011",
-    "type": "fact",
+    "type": "negative",
     "question": "What was the first Sherlock Holmes story to ever be published?",
-    "expected_keywords": ["A Study in Scarlet"],
+    "expected_keywords": [],
     "expected_facts": [],
     "expected_sources": [],
-    "answerable": true
+    "answerable": false
   },
   {
     "id": "q012",
@@ -118,12 +118,12 @@
   },
   {
     "id": "q014",
-    "type": "fact",
+    "type": "negative",
     "question": "Which bumbling Scotland Yard Official considers himself Holmes's professional rival?",
-    "expected_keywords": ["Lestrade"],
-    "expected_facts": [{"subject": "lestrade", "predicate": "consider"}],
+    "expected_keywords": [],
+    "expected_facts": [],
     "expected_sources": [],
-    "answerable": true
+    "answerable": false
   },
   {
     "id": "q015",
