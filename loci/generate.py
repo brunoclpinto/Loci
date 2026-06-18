@@ -24,7 +24,7 @@ _PREFILL = "Based on the provided context: "
 # Enable via: LOCI_MODELS__NO_THINK=1 (checked at build_messages time).
 _NO_THINK_PREFIX = "/no_think\n"
 
-_TAG_RE = re.compile(r"\[([FC]\d+)\]")
+_TAG_RE = re.compile(r"\[([FCP]\d+)\]")
 
 
 # ---------------------------------------------------------------------------
@@ -169,9 +169,13 @@ def strip_invalid_citations(
     text: str,
     fact_hits: list["FactHit"],
     chunk_hits: list["ChunkHit"],
+    prop_hits: "list | None" = None,
 ) -> str:
-    """Remove any [F…]/[C…] tags from text that don't appear in the context."""
+    """Remove any [F…]/[C…]/[P…] tags from text that don't appear in the context."""
     valid = {fh.tag for fh in fact_hits} | {ch.tag for ch in chunk_hits}
+    if prop_hits:
+        for i, _ in enumerate(prop_hits, 1):
+            valid.add(f"[P{i}]")
     def _replace(m: re.Match) -> str:
         tag = f"[{m.group(1)}]"
         return tag if tag in valid else ""
@@ -209,11 +213,12 @@ def is_refusal(text: str) -> bool:
 
 _PROP_ABSTAIN = "Not stated in the source."
 
-_PROP_WITH_FACT = (
-    "Fact: {statement}\n"
+_PROP_WITH_FACTS = (
+    "Facts:\n{facts}\n\n"
     "Question: {question}\n"
-    "Answer using only the fact above, as briefly as possible. "
-    f"If the fact does not answer the question, reply exactly: {_PROP_ABSTAIN}"
+    "Using ONLY the facts above, answer as briefly as possible and end your answer "
+    "with the [P#] tag (example: 'Stamford [P1].'). "
+    f"If none of the facts answer the question, reply exactly: {_PROP_ABSTAIN}"
 )
 
 _PROP_NO_FACT = (
@@ -221,23 +226,41 @@ _PROP_NO_FACT = (
     f"There is no relevant fact available. Reply exactly: {_PROP_ABSTAIN}"
 )
 
+# Token budget (chars) for the combined facts block — keeps prompt lean.
+_PROP_FACTS_CHAR_BUDGET = 800
+
 
 def build_proposition_messages(
     question: str,
-    prop_hit: "Any | None",  # PropositionHit or None
+    prop_hits: "Any",  # list[PropositionHit] | None  (None treated as empty)
 ) -> list[dict]:
-    """Build the minimal proposition-path prompt (design-v1 spec contract).
+    """Build the proposition-path prompt.
 
-    The model receives ONLY the matched proposition statement + question (or
-    just the question with an explicit abstention instruction when no match).
-    No chunk text, no other propositions, no scores are included.
+    Accepts a ranked list of PropositionHit objects.  The top hits are formatted
+    as [P1] ... [Pk] lines so the model can cite the source.  Returns an abstain
+    prompt when the list is empty or None.
     """
-    if prop_hit is None:
+    hits = prop_hits or []
+    # Flatten single hit passed by legacy callers (PropositionHit, not a list).
+    if hasattr(hits, "statement"):
+        hits = [hits]
+
+    if not hits:
         prompt = _PROP_NO_FACT.format(question=question)
-    else:
-        prompt = _PROP_WITH_FACT.format(
-            statement=prop_hit.statement, question=question
-        )
+        return [{"role": "user", "content": prompt}]
+
+    # Build [P1]...[Pk] lines, respecting the char budget.
+    lines: list[str] = []
+    total = 0
+    for i, h in enumerate(hits, 1):
+        line = f"[P{i}] {h.statement}"
+        if total + len(line) > _PROP_FACTS_CHAR_BUDGET:
+            break
+        lines.append(line)
+        total += len(line)
+
+    facts_block = "\n".join(lines)
+    prompt = _PROP_WITH_FACTS.format(facts=facts_block, question=question)
     return [{"role": "user", "content": prompt}]
 
 

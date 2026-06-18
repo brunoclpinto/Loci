@@ -242,31 +242,36 @@ class TestPropStorage:
 # ---------------------------------------------------------------------------
 
 class TestPropRetrieval:
-    def test_q001_returns_hit(self, prop_db, nlp):
+    def test_q001_returns_hits(self, prop_db, nlp):
         from loci.retrieve import retrieve_propositions
-        hit = retrieve_propositions(Q001, prop_db, nlp=nlp)
-        assert hit is not None
+        hits = retrieve_propositions(Q001, prop_db, nlp=nlp)
+        assert len(hits) >= 1
 
-    def test_q001_hit_predicate_is_introduce(self, prop_db, nlp):
+    def test_q001_top_hit_predicate_is_introduce(self, prop_db, nlp):
         from loci.retrieve import retrieve_propositions
-        hit = retrieve_propositions(Q001, prop_db, nlp=nlp)
-        assert hit.predicate == "introduce"
+        hits = retrieve_propositions(Q001, prop_db, nlp=nlp)
+        assert hits[0].predicate == "introduce"
 
-    def test_q001_agent_is_stamford(self, prop_db, nlp):
+    def test_q001_top_hit_agent_is_stamford(self, prop_db, nlp):
         from loci.retrieve import retrieve_propositions
-        hit = retrieve_propositions(Q001, prop_db, nlp=nlp)
-        assert hit is not None
-        assert hit.agent_canonical == "Stamford"
+        hits = retrieve_propositions(Q001, prop_db, nlp=nlp)
+        assert len(hits) >= 1
+        assert hits[0].agent_canonical == "Stamford"
 
-    def test_q001_statement_contains_stamford(self, prop_db, nlp):
+    def test_q001_top_hit_statement_contains_stamford(self, prop_db, nlp):
         from loci.retrieve import retrieve_propositions
-        hit = retrieve_propositions(Q001, prop_db, nlp=nlp)
-        assert "Stamford" in hit.statement
+        hits = retrieve_propositions(Q001, prop_db, nlp=nlp)
+        assert "Stamford" in hits[0].statement
 
-    def test_q003_returns_none(self, prop_db, nlp):
+    def test_q003_returns_empty(self, prop_db, nlp):
         from loci.retrieve import retrieve_propositions
-        hit = retrieve_propositions(Q003, prop_db, nlp=nlp)
-        assert hit is None
+        hits = retrieve_propositions(Q003, prop_db, nlp=nlp)
+        assert hits == []
+
+    def test_returns_list_type(self, prop_db, nlp):
+        from loci.retrieve import retrieve_propositions
+        result = retrieve_propositions(Q001, prop_db, nlp=nlp)
+        assert isinstance(result, list)
 
 
 # ---------------------------------------------------------------------------
@@ -274,36 +279,42 @@ class TestPropRetrieval:
 # ---------------------------------------------------------------------------
 
 class TestPropGeneration:
-    def test_with_hit_prompt_contains_fact_line(self, prop_db, nlp):
+    def test_with_hits_prompt_contains_facts_block(self, prop_db, nlp):
         from loci.retrieve import retrieve_propositions
-        hit = retrieve_propositions(Q001, prop_db, nlp=nlp)
-        msgs = build_proposition_messages(Q001, hit)
+        hits = retrieve_propositions(Q001, prop_db, nlp=nlp)
+        msgs = build_proposition_messages(Q001, hits)
         assert len(msgs) == 1
         content = msgs[0]["content"]
-        assert content.startswith("Fact:")
+        assert "Facts:" in content
+        assert "[P1]" in content
 
-    def test_with_hit_prompt_contains_statement(self, prop_db, nlp):
+    def test_with_hits_prompt_contains_statement(self, prop_db, nlp):
         from loci.retrieve import retrieve_propositions
-        hit = retrieve_propositions(Q001, prop_db, nlp=nlp)
-        msgs = build_proposition_messages(Q001, hit)
-        assert hit.statement in msgs[0]["content"]
+        hits = retrieve_propositions(Q001, prop_db, nlp=nlp)
+        msgs = build_proposition_messages(Q001, hits)
+        assert hits[0].statement in msgs[0]["content"]
 
-    def test_with_hit_prompt_contains_question(self, prop_db, nlp):
+    def test_with_hits_prompt_contains_question(self, prop_db, nlp):
         from loci.retrieve import retrieve_propositions
-        hit = retrieve_propositions(Q001, prop_db, nlp=nlp)
-        msgs = build_proposition_messages(Q001, hit)
+        hits = retrieve_propositions(Q001, prop_db, nlp=nlp)
+        msgs = build_proposition_messages(Q001, hits)
         assert Q001 in msgs[0]["content"]
 
-    def test_without_hit_prompt_instructs_abstention(self):
+    def test_without_hits_prompt_instructs_abstention(self):
+        msgs = build_proposition_messages(Q003, [])
+        content = msgs[0]["content"]
+        assert _PROP_ABSTAIN in content
+        assert "Facts:" not in content
+
+    def test_none_treated_as_empty(self):
         msgs = build_proposition_messages(Q003, None)
         content = msgs[0]["content"]
         assert _PROP_ABSTAIN in content
-        assert "Fact:" not in content
 
     def test_no_chunk_text_in_prop_prompt(self, prop_db, nlp):
         from loci.retrieve import retrieve_propositions
-        hit = retrieve_propositions(Q001, prop_db, nlp=nlp)
-        msgs = build_proposition_messages(Q001, hit)
+        hits = retrieve_propositions(Q001, prop_db, nlp=nlp)
+        msgs = build_proposition_messages(Q001, hits)
         content = msgs[0]["content"]
         assert "hæmoglobin" not in content  # chunk text must not appear
         assert "haemoglobin" not in content
@@ -313,14 +324,14 @@ class TestPropGeneration:
         from loci.retrieve import retrieve_propositions
         from loci.generate import generate_response
 
-        hit = retrieve_propositions(Q001, prop_db, nlp=nlp)
-        msgs = build_proposition_messages(Q001, hit)
+        hits = retrieve_propositions(Q001, prop_db, nlp=nlp)
+        msgs = build_proposition_messages(Q001, hits)
         llm = _PropFakeLLM()
         answer = generate_response(llm, msgs, max_tokens=32, temperature=0.0)
         assert "stamford" in answer.lower(), f"Expected Stamford, got: {answer!r}"
 
     def test_fake_llm_abstains_for_q003(self):
-        msgs = build_proposition_messages(Q003, None)
+        msgs = build_proposition_messages(Q003, [])
         llm = _PropFakeLLM()
         from loci.generate import generate_response
         answer = generate_response(llm, msgs, max_tokens=32, temperature=0.0)
@@ -332,18 +343,169 @@ class TestPropGeneration:
 # ---------------------------------------------------------------------------
 
 class _PropFakeLLM:
-    """Minimal LLM stub: extracts agent from 'Fact: AGENT introduced ...' or abstains."""
+    """Minimal LLM stub: extracts agent from '[P1] AGENT introduced ...' or abstains."""
 
     def create_chat_completion(self, messages, *, max_tokens, temperature, stream=False):
         user_msg = next(
             (m["content"] for m in messages if m["role"] == "user"), ""
         )
-        if "Fact:" in user_msg:
-            m = re.search(r"Fact:\s+(\w+)\s+introduced", user_msg)
-            content = m.group(1) if m else _PROP_ABSTAIN
+        if "Facts:" in user_msg:
+            m = re.search(r"\[P\d+\]\s+(\w+)\s+introduced", user_msg)
+            content = m.group(1) + " [P1]" if m else _PROP_ABSTAIN
         else:
             content = _PROP_ABSTAIN
 
         if stream:
             return iter([{"choices": [{"delta": {"content": content}}]}])
         return {"choices": [{"message": {"content": content}}]}
+
+
+# ---------------------------------------------------------------------------
+# Ranking tests — the kill/murder case and candidate deduplication
+# ---------------------------------------------------------------------------
+
+# Minimal chunk text containing two propositions:
+#   - P_KILL : Jefferson Hope killed Drebber (predicate: kill)
+#   - P_DESCEND : a man descended a ladder (predicate: descend)
+RANK_CHUNK = (
+    "Jefferson Hope killed Enoch Drebber in cold blood. "
+    "A milk boy noticed a man descend a ladder nearby."
+)
+
+# "Who is the murderer?" → predicates_to_try includes "kill" / "killed_by" (via expansion).
+# FTS query includes "killed" (from "killed_by" predicate term); kill prop statement
+# contains "killed" → FTS match. Descend predicate not in expansion → filtered.
+Q_MURDERER = "Who is the murderer?"
+
+
+@pytest.fixture(scope="module")
+def rank_db(tmp_path_factory, fake_embedder, default_cfg):
+    """DB with two propositions — the kill/murder ranking scenario."""
+    import hashlib
+    from loci.store import (
+        open_db, insert_source, insert_chunk,
+        ensure_prop_entity, insert_proposition,
+        insert_proposition_entity, upsert_vec_proposition,
+    )
+    from loci.models import embed_batch
+
+    tmp = tmp_path_factory.mktemp("rank_db")
+    conn = open_db(tmp / "rank.db")
+
+    src_id = insert_source(
+        conn,
+        sha256=hashlib.sha256(b"rank_src").hexdigest(),
+        title="Rank Test",
+    )
+    chunk_id = insert_chunk(
+        conn,
+        source_id=src_id,
+        ordinal=1,
+        text=RANK_CHUNK,
+        sha256=hashlib.sha256(RANK_CHUNK.encode()).hexdigest(),
+    )
+
+    # Insert kill proposition: Jefferson Hope kill Drebber
+    hope_id = ensure_prop_entity(
+        conn, canonical="Jefferson Hope", kind="PERSON",
+        aliases=["Jefferson Hope", "jefferson hope", "hope"],
+    )
+    drebber_id = ensure_prop_entity(
+        conn, canonical="Drebber", kind="PERSON",
+        aliases=["Drebber", "drebber", "enoch drebber"],
+    )
+    kill_stmt = "Jefferson Hope killed Enoch Drebber."
+    kill_id = insert_proposition(
+        conn, chunk_id=chunk_id, predicate="kill",
+        roles={"agent": hope_id, "theme": [drebber_id]},
+        statement=kill_stmt,
+        evidence="Jefferson Hope killed Enoch Drebber in cold blood.",
+        confidence=1.0,
+    )
+    if kill_id:
+        insert_proposition_entity(conn, prop_id=kill_id, prop_entity_id=hope_id, role="agent")
+        insert_proposition_entity(conn, prop_id=kill_id, prop_entity_id=drebber_id, role="theme")
+        embs = embed_batch(fake_embedder, [kill_stmt], normalize=True)
+        upsert_vec_proposition(conn, prop_id=kill_id, embedding=embs[0])
+
+    # Insert descend proposition: man descend ladder (noise prop)
+    man_id = ensure_prop_entity(conn, canonical="Unknown Man", kind="PERSON", aliases=["man"])
+    descend_stmt = "A man descended a ladder nearby."
+    descend_id = insert_proposition(
+        conn, chunk_id=chunk_id, predicate="descend",
+        roles={"agent": man_id},
+        statement=descend_stmt,
+        evidence="A milk boy noticed a man descend a ladder nearby.",
+        confidence=0.8,
+    )
+    if descend_id:
+        insert_proposition_entity(conn, prop_id=descend_id, prop_entity_id=man_id, role="agent")
+        embs = embed_batch(fake_embedder, [descend_stmt], normalize=True)
+        upsert_vec_proposition(conn, prop_id=descend_id, embedding=embs[0])
+
+    yield conn
+    conn.close()
+
+
+class TestPropRanking:
+    def test_kill_murder_predicate_expansion_finds_kill_prop(self, rank_db, nlp):
+        """'murderer' noun maps to predicates that include 'kill' via expansion.
+
+        The kill prop (predicate='kill', statement contains 'murdered') must be
+        found for 'Who is the murderer?' because _NOUN_TO_PRED['murderer'] now
+        includes 'kill'.  The descend prop (predicate='descend') is filtered.
+        """
+        from loci.retrieve import retrieve_propositions
+        hits = retrieve_propositions(Q_MURDERER, rank_db, nlp=nlp)
+        statements = [h.statement for h in hits]
+        assert any("Hope" in s or "killed" in s or "Drebber" in s for s in statements), (
+            f"Kill prop not in hits; got: {statements}"
+        )
+
+    def test_descend_prop_not_returned_for_murderer_question(self, rank_db, nlp):
+        """'descend' predicate is not in the synonym set for 'murderer' → filtered."""
+        from loci.retrieve import retrieve_propositions
+        hits = retrieve_propositions(Q_MURDERER, rank_db, nlp=nlp)
+        assert not any(h.predicate == "descend" for h in hits), (
+            f"Descend prop should be filtered out; got: {[h.predicate for h in hits]}"
+        )
+
+    def test_no_duplicate_prop_ids(self, rank_db, nlp):
+        """Candidate union must deduplicate — same prop_id should not appear twice."""
+        from loci.retrieve import retrieve_propositions
+        hits = retrieve_propositions(Q_MURDERER, rank_db, nlp=nlp)
+        ids = [h.prop_id for h in hits]
+        assert len(ids) == len(set(ids)), f"Duplicate prop_ids: {ids}"
+
+    def test_returns_at_most_k(self, rank_db, nlp):
+        from loci.retrieve import retrieve_propositions
+        hits = retrieve_propositions(Q_MURDERER, rank_db, nlp=nlp, k=2)
+        assert len(hits) <= 2
+
+    def test_prop_tag_re_matches_p_tags(self):
+        from loci.generate import _TAG_RE
+        assert _TAG_RE.search("[P1]") is not None
+        assert _TAG_RE.search("[P12]") is not None
+        assert _TAG_RE.search("[F3]") is not None  # still matches F/C
+
+    def test_strip_keeps_valid_p_tags(self):
+        from loci.retrieve import PropositionHit
+        from loci.generate import strip_invalid_citations
+        hit = PropositionHit(
+            prop_id=1, predicate="kill", statement="Jefferson Hope killed Drebber.",
+            roles={}, chunk_id=1, agent_canonical="Jefferson Hope"
+        )
+        text = "Jefferson Hope killed Drebber [P1]."
+        result = strip_invalid_citations(text, [], [], prop_hits=[hit])
+        assert "[P1]" in result
+
+    def test_strip_removes_invalid_p_tags(self):
+        from loci.generate import strip_invalid_citations
+        text = "Something [P5] happened."
+        # prop_hits has only 1 hit → [P1] valid, [P5] not
+        from loci.retrieve import PropositionHit
+        hit = PropositionHit(
+            prop_id=1, predicate="kill", statement="s.", roles={}, chunk_id=1
+        )
+        result = strip_invalid_citations(text, [], [], prop_hits=[hit])
+        assert "[P5]" not in result

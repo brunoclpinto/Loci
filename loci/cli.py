@@ -923,13 +923,15 @@ def bench_query_cmd(
                             pass
 
                     # --- Proposition path (--prop flag) ---
-                    prop_hit = None
+                    prop_hits: list = []
                     if prop:
                         from loci.retrieve import retrieve_propositions
-                        prop_hit = retrieve_propositions(item.question, conn, nlp=nlp)
+                        prop_hits = retrieve_propositions(
+                            item.question, conn, nlp=nlp, embedder=embedder
+                        )
 
-                    if prop and prop_hit is not None:
-                        # Proposition path: model sees only the matched fact + question
+                    if prop and prop_hits:
+                        # Proposition path: model sees only the ranked facts + question
                         from loci.generate import (
                             build_proposition_messages, generate_response as _gen,
                         )
@@ -939,7 +941,7 @@ def bench_query_cmd(
                             embedder=embedder, nlp=nlp,
                             pack_schemas=p_schemas, timings=timings,
                         )
-                        messages = build_proposition_messages(item.question, prop_hit)
+                        messages = build_proposition_messages(item.question, prop_hits)
                         full_text = ""
                         first_tok_t: list[float] = []
                         gen_start = time.perf_counter()
@@ -952,10 +954,10 @@ def bench_query_cmd(
                             first_tok_t.append(gen_start)
                         gen_end = time.perf_counter()
                         timings["prop_path"] = 1
-                    if (not prop) or (prop and prop_hit is None):
+                    if (not prop) or (prop and not prop_hits):
                         # Standard chunk-retrieval path (also used as fallback when --prop
-                        # finds no matching proposition — fulfils the help-text contract)
-                        if prop and prop_hit is None:
+                        # finds no matching propositions — fulfils the help-text contract)
+                        if prop and not prop_hits:
                             timings["prop_path"] = 0
                         result = retrieve(
                             item.question,
@@ -991,7 +993,8 @@ def bench_query_cmd(
                     swap_delta = psutil.swap_memory().used / 1024 / 1024 - swap_before
 
                     full_text = strip_invalid_citations(
-                        full_text, result.fact_hits, result.chunk_hits
+                        full_text, result.fact_hits, result.chunk_hits,
+                        prop_hits=prop_hits if prop_hits else None,
                     )
                     citations = extract_cited_tags(full_text)
                     mechanical = score_mechanical(

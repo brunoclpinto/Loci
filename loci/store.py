@@ -605,6 +605,21 @@ def vec_search_facts(
     return [dict(r) for r in rows]
 
 
+def vec_search_propositions(
+    conn: sqlite3.Connection, *, embedding: list[float], k: int = 20
+) -> list[dict]:
+    """Return top-k propositions by vector similarity. Returns [{prop_id, distance}]."""
+    try:
+        rows = conn.execute(
+            "SELECT prop_id, distance FROM vec_propositions"
+            " WHERE embedding MATCH ? ORDER BY distance LIMIT ?",
+            [_ser(embedding), k],
+        ).fetchall()
+    except Exception:
+        return []
+    return [dict(r) for r in rows]
+
+
 # ---------------------------------------------------------------------------
 # Phase 5: stats, entity merge, pending links, maintenance
 # ---------------------------------------------------------------------------

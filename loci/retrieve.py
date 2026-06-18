@@ -39,16 +39,21 @@ _NOUN_TO_PRED: dict[str, list[str]] = {
     "home":         ["reside_at"],
     "residence":    ["reside_at"],
     "location":     ["located_at", "reside_at"],
-    "name":         ["call", "named_after"],
-    "alias":        ["call"],
+    "name":         ["named_after"],
+    "alias":        ["call", "named_after"],
     "meaning":      ["means"],
     "leader":       ["leader_of"],
-    "killer":       ["murder", "killed_by"],
-    "murderer":     ["murder"],
+    "killer":       ["murder", "kill", "killed_by"],
+    "murderer":     ["murder", "kill", "killed_by"],
     "victim":       ["murder", "killed_by"],
     "relationship": ["relationship_to"],
     "weapon":       ["use"],
 }
+
+# Nouns that only augment predicates_to_try when the question has NO main verb.
+# When a main verb IS present, these nouns describe an attribute of an entity
+# (e.g. "Which X is a murderer?") rather than the question's predicate topic.
+_VERB_CONDITIONAL_NOUNS = frozenset(["killer", "murderer", "victim", "weapon"])
 
 # Maps question verb lemmas → proposition predicates that semantically match.
 # Enables "What is Holmes's profession?" to find "work_as" propositions, etc.
@@ -66,7 +71,7 @@ _VERB_TO_PRED: dict[str, list[str]] = {
     "introduce":    ["introduce"],
     "kill":         ["murder", "killed_by"],
     "die":          ["killed_by", "murder"],
-    "murder":       ["murder"],
+    "murder":       ["murder", "kill", "killed_by"],
     "possess":      ["possess"],
     "own":          ["possess"],
     "call":         ["call"],
@@ -1029,36 +1034,147 @@ def retrieve_propositions(
     question: str,
     conn: sqlite3.Connection,
     nlp: Any = None,
-) -> PropositionHit | None:
-    """Proposition-path retrieval: question → predicate + entities → prop match.
+    embedder: Any = None,
+    k: int = 3,
+) -> list["PropositionHit"]:
+    """Proposition-path retrieval: returns top-k ranked propositions.
 
-    Returns None when no proposition matches the question's predicate + entities.
-    Callers must produce an abstention answer in that case (negative_contract).
+    Gathers candidates from entity-posting, FTS, and (if embedder is given)
+    vector-similarity paths, then ranks by semantic relevance.  Predicate match
+    is a ranking *bonus*, not a hard filter — kill/murder, work_as/be etc. are
+    no longer blocked.  Returns an empty list when no candidates pass the
+    minimum-score threshold.
     """
     from loci.store import (
-        get_props_for_entities_and_predicate,
         get_proposition,
         get_prop_agent_canonical,
         fts_search_propositions,
+        vec_search_propositions,
     )
 
     parse = parse_question(question, nlp=nlp)
     predicate = parse.verb_lemma
 
-    # When spaCy finds no main verb (e.g. "What is X's profession?"), extract
-    # the key noun from the question and map it to a proposition predicate set.
+    # Build the predicate-synonym set (used as a ranking bonus, not a gate).
+    predicates_to_try: set[str] = set()
     if not predicate:
         words = _NONWORD.sub(" ", question.lower()).split()
         for w in words:
             cw = w.strip("?.,!;:'\"")
             if cw in _NOUN_TO_PRED:
-                predicates_to_try = set(_NOUN_TO_PRED[cw])
-                break
-        else:
-            return None
+                predicates_to_try.update(_NOUN_TO_PRED[cw])
     else:
-        # Expand predicate to semantic synonyms so "live" finds "reside_at", etc.
         predicates_to_try = {predicate} | set(_VERB_TO_PRED.get(predicate, []))
+
+    # Also scan question nouns to augment predicates_to_try — handles cases like
+    # "term for profession" where the verb "use/describe" hijacks but the noun
+    # "profession" maps to the correct "work_as" predicate.
+    # Conditional nouns (murderer, killer, etc.) only augment when no verb was
+    # found — when a verb IS present they describe an attribute ("is a murderer")
+    # rather than the predicate topic, and including them fires wrong props.
+    q_words = _NONWORD.sub(" ", question.lower()).split()
+    for w in q_words:
+        cw = w.strip("?.,!;:'\"")
+        if cw in _NOUN_TO_PRED:
+            if cw in _VERB_CONDITIONAL_NOUNS and predicate:
+                continue  # skip when main verb present
+            predicates_to_try.update(_NOUN_TO_PRED[cw])
+
+    # No predicate signal at all → we have no way to select relevant propositions.
+    # Fall back to chunk retrieval (caller gets empty list → falls through to chunks).
+    if not predicates_to_try:
+        return []
+
+    # ── Path 1: entity-posting candidates (NO predicate filter) ──────────────
+    prop_entity_ids = find_prop_entity_ids(conn, question)
+    entity_prop_ids: set[int] = set()
+    if prop_entity_ids:
+        id_ph = ",".join("?" * len(prop_entity_ids))
+        rows = conn.execute(
+            f"SELECT DISTINCT prop_id FROM proposition_entities"
+            f" WHERE prop_entity_id IN ({id_ph})",
+            prop_entity_ids,
+        ).fetchall()
+        entity_prop_ids = {r[0] for r in rows}
+
+    # ── Path 2: FTS candidates (NO predicate filter) ──────────────────────────
+    fts_scores: dict[int, float] = {}
+    words = _NONWORD.sub(" ", question.lower()).split()
+    content = [w for w in words if w and w not in _PROP_FTS_STOPWORDS and len(w) > 2]
+    for pred in predicates_to_try:
+        for pw in pred.replace("_", " ").split():
+            if len(pw) > 2 and pw not in _PROP_FTS_STOPWORDS:
+                content.append(pw)
+    if content:
+        fts_query = " OR ".join(set(content))
+        fts_hits = fts_search_propositions(conn, query=fts_query, k=30)
+        for rank, hit in enumerate(fts_hits):
+            fts_scores[hit["prop_id"]] = max(0.0, 1.0 - rank / max(len(fts_hits), 1))
+
+    # ── Path 3: vector-similarity candidates ─────────────────────────────────
+    vec_scores: dict[int, float] = {}
+    if embedder is not None:
+        try:
+            from loci.models import embed_batch
+            vecs = embed_batch(embedder, [question], normalize=True)
+            if vecs:
+                for hit in vec_search_propositions(conn, embedding=vecs[0], k=30):
+                    # distance is L2 / cosine; smaller = more similar
+                    vec_scores[hit["prop_id"]] = max(0.0, 1.0 - hit["distance"] / 2.0)
+        except Exception:
+            pass
+
+    # ── Union of all candidates ───────────────────────────────────────────────
+    all_prop_ids = entity_prop_ids | set(fts_scores) | set(vec_scores)
+    if not all_prop_ids:
+        return []
+
+    # Batch-load propositions once to avoid repeated DB round-trips.
+    props: dict[int, dict] = {}
+    for pid in all_prop_ids:
+        p = get_proposition(conn, pid)
+        if p:
+            props[pid] = p
+
+    if not props:
+        return []
+
+    # ── Score ─────────────────────────────────────────────────────────────────
+    # Primary: vec similarity (if available), else FTS rank.
+    # Bonuses: predicate in synonym set (+0.25), entity match (+0.10).
+    use_vec = bool(vec_scores)
+
+    def _score(pid: int) -> float:
+        p = props.get(pid)
+        if p is None:
+            return -1.0
+        base = vec_scores.get(pid, 0.0) if use_vec else fts_scores.get(pid, 0.0)
+        pred_bonus = 0.25 if (predicates_to_try and p["predicate"] in predicates_to_try) else 0.0
+        entity_bonus = 0.10 if pid in entity_prop_ids else 0.0
+        return base + pred_bonus + entity_bonus
+
+    scored = sorted(
+        [(pid, _score(pid)) for pid in props],
+        key=lambda x: -x[1],
+    )
+
+    # Predicate-alignment gate: require at least one candidate to match a synonym
+    # predicate, in both vec and non-vec modes.  Without this gate, vec similarity
+    # alone fires the prop path for every question (100/100 in bench), collapsing
+    # fact/paraphrase scores.  Vec improves RANKING within aligned candidates; it
+    # does not replace predicate alignment as the selectivity signal.
+    if predicates_to_try:
+        pred_aligned = [
+            (pid, s) for pid, s in scored
+            if props[pid]["predicate"] in predicates_to_try
+        ]
+        if not pred_aligned:
+            return []
+        scored = pred_aligned
+
+    # Minimum-score gate: keeps the negative bucket safe by rejecting very weak
+    # matches (random FTS noise with no entity or predicate signal).
+    _MIN_SCORE = 0.05
 
     def _make_hit(p: dict) -> "PropositionHit":
         roles = json.loads(p["roles"]) if isinstance(p["roles"], str) else p["roles"]
@@ -1071,30 +1187,10 @@ def retrieve_propositions(
             agent_canonical=get_prop_agent_canonical(conn, p["id"]),
         )
 
-    # Primary path: entity-postings ∩ predicate (tries all synonym predicates)
-    prop_entity_ids = find_prop_entity_ids(conn, question)
-    if prop_entity_ids:
-        for pred in predicates_to_try:
-            matches = get_props_for_entities_and_predicate(
-                conn, predicate=pred, prop_entity_ids=prop_entity_ids
-            )
-            if matches:
-                return _make_hit(matches[0])
+    result: list[PropositionHit] = []
+    for pid, score in scored[:k]:
+        if score < _MIN_SCORE:
+            break
+        result.append(_make_hit(props[pid]))
 
-    # Fallback: FTS on statement (uses narrow prop stopwords so character names pass)
-    # + predicate-synonym filter to avoid semantically wrong hits.
-    words = _NONWORD.sub(" ", question.lower()).split()
-    content = [w for w in words if w and w not in _PROP_FTS_STOPWORDS and len(w) > 2]
-    # Also add the predicate names as FTS terms ("murder" finds "murdered", etc.)
-    for pred in predicates_to_try:
-        for pw in pred.replace("_", " ").split():
-            if len(pw) > 2 and pw not in _PROP_FTS_STOPWORDS:
-                content.append(pw)
-    if content:
-        fts_query = " OR ".join(set(content))
-        for hit in fts_search_propositions(conn, query=fts_query, k=20):
-            prop = get_proposition(conn, hit["prop_id"])
-            if prop and prop["predicate"] in predicates_to_try:
-                return _make_hit(prop)
-
-    return None
+    return result
