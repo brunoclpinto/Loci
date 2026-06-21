@@ -9,8 +9,8 @@ plan file (linked below) with full implementation detail, tests, bench, and succ
 
 > **Reference baseline (old judge):** overall **70.95** — fact 54.3 · para 54.0 · multi 47.0 · neg 96.9 · halluc 1.
 > Log: `/Volumes/SSD1TB001/loci/logs/bench/1781382958_scarlet_v2_100.jsonl`.
-> **M baseline (keyed judge):** overall **64.35** — fact 44.4 · para 47.0 · multi 19.0 · neg 96.8 · halluc 1.
-> Log: `/Volumes/SSD1TB001/loci/logs/bench/1781487152_baseline_v2_judgekey.jsonl`.
+> **M baseline (keyed judge, rerank_v1+prop, scarlet_clean_v1.db):** overall **64.35** — fact 45.6 · para 28.5 · multi 30 · neg 98.75 · halluc 1.
+> Log: `/Volumes/SSD1TB001/loci/logs/bench/1782036965_baseline_judgekey.jsonl`. Run 2 = 63.25 (delta 1.10pt, paraphrase+negative fully stable, residual variance in partial-credit fact/multi Qs).
 > Phase **M** replaces the old ruler; every later compare uses the M baseline (64.35).
 >
 > **Final result:** M baseline (64.35) remains the best. All subsequent phases shipped as F2=off. The binding constraint
