@@ -12,6 +12,9 @@ plan file (linked below) with full implementation detail, tests, bench, and succ
 > **M baseline (keyed judge, rerank_v1+prop, scarlet_clean_v1.db):** overall **64.35** — fact 45.6 · para 28.5 · multi 30 · neg 98.75 · halluc 1.
 > Log: `/Volumes/SSD1TB001/loci/logs/bench/1782036965_baseline_judgekey.jsonl`. Run 2 = 63.25 (delta 1.10pt, paraphrase+negative fully stable, residual variance in partial-credit fact/multi Qs).
 > Phase **M** replaces the old ruler; every later compare uses the M baseline (64.35).
+> **B baseline (keyed judge, rerank_v1+prop+expand, scarlet_clean_v1.db):** overall **~66.2** — fact 48.3 · para 39.0 · multi 23.5 · neg 98.5 · halluc 1. Runs: 65.80 / 66.55.
+> Log r1: `1782046102_b_expand_keyed.jsonl`, r2: `1782037993_baseline_judgekey_v2.jsonl`... (see Phase B entry).
+> Stable gains: q0010/q0027/q0038/q0051/q0054 (0→70–100 each). Stable losses: q0011/q0032/q0047/q0050. F1=expand enabled.
 >
 > **Final result:** M baseline (64.35) remains the best. All subsequent phases shipped as F2=off. The binding constraint
 > is that the 3B model degrades when context includes any noisy [F#] injection; 63 new P1 taxonomy facts are in
@@ -64,7 +67,7 @@ plan file (linked below) with full implementation detail, tests, bench, and succ
 |---|-------|------|--------|-----------|---------------|
 | 0 | P0 fact-FTS (done; regressed → neutralized) | [planP0.md](planP0.md) | `DONE` | — | — |
 | 1 | **M** — judge answer key (measurement) | [planM_judgekey.md](planM_judgekey.md) | `DONE (new baseline=64.35, fact=44.4, para=47.0, multi=19.0, neg=96.8)` | — | yes |
-| 2 | **B** — vec-over-facts (P0.1) | [planB_vecfacts.md](planB_vecfacts.md) | `DONE (F1=off; surface=59.90, expand=61.95, both < M=64.35; facts MISSING not unretrievable)` | M | yes |
+| 2 | **B** — vec-over-facts (P0.1) | [planB_vecfacts.md](planB_vecfacts.md) | `DONE (F1=expand; keyed re-bench on prop system: expand=66.2±0.4 [+1.85 vs M, para +11, fact +3]; surface=61.35 halluc=3 FAIL; fact_vec_mode=expand enabled as default)` | M | yes |
 | 3 | **P1** — semantic fact minting | [planP1_factmint.md](planP1_factmint.md) | `DONE (63 facts minted; fact +1.2 on 100Q; qna_20=70.75; max_facts=0 prevents paraphrase noise)` | B (uses B's missing-fact backlog) | yes |
 | 4 | **C** — rerank, don't pre-truncate (P2) | [planC_rerank.md](planC_rerank.md) | `DONE (F2=off; pool=62.80 -1.55 vs M; wider pool floods RRF with mediocre overlap → para -22)` | — (independent) | yes |
 | 5 | **E** — paraphrase / multi-hop (P3) | [planE_paraphrase.md](planE_paraphrase.md) | `DONE (F2=off; HyDE=62.65 -1.70, halluc 1→3 violates guardrail; hyde_query=false)` | — | yes |
