@@ -55,7 +55,7 @@ class RetrievalConfig:
     fact_fts_top_k: int = 10     # candidate facts pulled from fts_facts per schema
     max_facts_in_context: int = 0  # 0 = baseline (fact-FTS neutralized); >0 re-enables [F#] injection
     fact_vec_top_k: int = 10        # candidate facts from vec_facts per schema
-    fact_vec_mode: str = "expand"   # "off" | "surface" | "expand"
+    fact_vec_mode: str = "off"      # "off" | "surface" | "expand"
     fact_expand_names: int = 2      # expand mode: # of top-fact canonical names injected into chunk query
     rerank_mode: str = "off"        # "off" | "pool" (widen only) | "blend" (pool + re-score)
     rerank_pool: int = 24           # candidate pool size when rerank_mode != "off" (replaces vec/fts_top_k)

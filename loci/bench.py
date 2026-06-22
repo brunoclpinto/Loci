@@ -138,6 +138,7 @@ class QnAItem:
     expected_sources: list[str]
     answerable: bool
     expected_answer: str | None = None  # canonical reference for the judge
+    book: str | None = None             # source book slug, e.g. "a_study_in_scarlet"
 
     @classmethod
     def from_dict(cls, d: dict) -> "QnAItem":
@@ -150,6 +151,7 @@ class QnAItem:
             expected_sources=d.get("expected_sources", []),
             answerable=d.get("answerable", True),
             expected_answer=d.get("expected_answer"),
+            book=d.get("book"),
         )
 
     def to_dict(self) -> dict:

@@ -845,6 +845,16 @@ def bench_query_cmd(
         console.print(f"[red]Cannot open DB:[/red] {exc}")
         raise typer.Exit(1)
 
+    # Build slug → source_id map for per-question source filtering
+    import json as _json
+    _book_source_map: dict[str, list[int]] = {}
+    for _row in conn.execute("SELECT id, meta FROM sources"):
+        _meta = _json.loads(_row[1]) if _row[1] else {}
+        _book_title = _meta.get("book") or ""
+        if _book_title:
+            _slug = _book_title.lower().replace(" ", "_")
+            _book_source_map.setdefault(_slug, []).append(_row[0])
+
     p_schemas = attach_registered_packs(conn, cfg_exp.paths.packs_dir)
 
     try:
@@ -923,11 +933,13 @@ def bench_query_cmd(
                             pass
 
                     # --- Proposition path (--prop flag) ---
+                    _item_source_ids = _book_source_map.get(item.book or "") or None
                     prop_hits: list = []
                     if prop:
                         from loci.retrieve import retrieve_propositions
                         prop_hits = retrieve_propositions(
-                            item.question, conn, nlp=nlp, embedder=embedder
+                            item.question, conn, nlp=nlp, embedder=embedder,
+                            source_ids=_item_source_ids,
                         )
 
                     if prop and prop_hits:
@@ -940,6 +952,7 @@ def bench_query_cmd(
                             conn=conn, cfg=cfg,
                             embedder=embedder, nlp=nlp,
                             pack_schemas=p_schemas, timings=timings,
+                            source_ids=_item_source_ids,
                         )
                         messages = build_proposition_messages(item.question, prop_hits)
                         full_text = ""
@@ -965,6 +978,7 @@ def bench_query_cmd(
                             embedder=embedder, nlp=nlp,
                             pack_schemas=p_schemas, timings=timings,
                             hyde_embedding=hyde_emb,
+                            source_ids=_item_source_ids,
                         )
                         messages = build_messages(item.question, result.context_text, [])
                         full_text = ""

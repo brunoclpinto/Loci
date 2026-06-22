@@ -63,7 +63,7 @@ class TestQnAItem:
         d = {"id": "q1", "type": "negative", "question": "X?",
              "expected_keywords": [], "expected_facts": [],
              "expected_sources": [], "answerable": False,
-             "expected_answer": None}
+             "expected_answer": None, "book": None}
         assert QnAItem.from_dict(d).to_dict() == d
 
     def test_expected_answer_loaded(self):

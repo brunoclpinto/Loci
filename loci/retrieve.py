@@ -804,6 +804,7 @@ def retrieve(
     pack_schemas: list[str] | None = None,
     timings: dict | None = None,
     hyde_embedding: list[float] | None = None,
+    source_ids: list[int] | None = None,
 ) -> RetrievalResult:
     """Full hybrid retrieval pipeline, optionally fanning out across pack schemas.
 
@@ -906,6 +907,19 @@ def retrieve(
                         all_vec_fact_hits.append((fid, dist, schema))
                         seen_fids.add(fid)
 
+            # Source filter: drop vec_fact hits from other sources so expand mode
+            # only injects entity names from the question's own book.
+            if source_ids is not None and all_vec_fact_hits:
+                ph = ",".join("?" * len(source_ids))
+                _valid_fids = {r[0] for r in conn.execute(
+                    f"SELECT f.id FROM facts f JOIN chunks c ON f.chunk_id = c.id"
+                    f" WHERE c.source_id IN ({ph})", source_ids,
+                )}
+                all_vec_fact_hits = [
+                    (fid, dist, s) for fid, dist, s in all_vec_fact_hits
+                    if fid in _valid_fids
+                ]
+
             if cfg.retrieval.fact_vec_mode == "surface":
                 for fid, dist, schema in all_vec_fact_hits:
                     hits = load_fact_hits_by_ids(conn, [fid], schema=schema)
@@ -956,6 +970,15 @@ def retrieve(
             _fts_raw_scores[key] = max(0.0, 1.0 - rank / max(len(fts_ids), 1))
     if timings is not None:
         timings["fts_ms"] = (time.perf_counter() - t0) * 1000
+
+    # Source filter: restrict to chunks from specified sources only
+    if source_ids is not None:
+        ph = ",".join("?" * len(source_ids))
+        _valid_cids = {r[0] for r in conn.execute(
+            f"SELECT id FROM chunks WHERE source_id IN ({ph})", source_ids
+        )}
+        all_vec_keys = [(s, cid) for s, cid in all_vec_keys if cid in _valid_cids]
+        all_fts_keys = [(s, cid) for s, cid in all_fts_keys if cid in _valid_cids]
 
     # 7. RRF fusion + optional blend rerank + context build
     t0 = time.perf_counter()
@@ -1036,6 +1059,7 @@ def retrieve_propositions(
     nlp: Any = None,
     embedder: Any = None,
     k: int = 3,
+    source_ids: list[int] | None = None,
 ) -> list["PropositionHit"]:
     """Proposition-path retrieval: returns top-k ranked propositions.
 
@@ -1128,6 +1152,19 @@ def retrieve_propositions(
     all_prop_ids = entity_prop_ids | set(fts_scores) | set(vec_scores)
     if not all_prop_ids:
         return []
+
+    # Source filter: keep only propositions from the specified source(s)
+    if source_ids is not None and all_prop_ids:
+        ph_s = ",".join("?" * len(source_ids))
+        ph_p = ",".join("?" * len(all_prop_ids))
+        valid_pids = {r[0] for r in conn.execute(
+            f"SELECT p.id FROM propositions p JOIN chunks c ON p.chunk_id = c.id"
+            f" WHERE c.source_id IN ({ph_s}) AND p.id IN ({ph_p})",
+            list(source_ids) + list(all_prop_ids),
+        )}
+        all_prop_ids = valid_pids
+        if not all_prop_ids:
+            return []
 
     # Batch-load propositions once to avoid repeated DB round-trips.
     props: dict[int, dict] = {}
