@@ -104,6 +104,22 @@ _FTS_STOPWORDS = frozenset([
     "name", "called", "used", "ever", "first", "did",
 ])
 
+# Wh-nouns that must NOT be used as mandatory AND terms in FTS.
+# Two categories:
+#   1. Abstract question-format words: describe the *type* of answer expected
+#      ("What TERM does Holmes use?") rather than content that appears in the source.
+#      Making them mandatory AND causes FTS to retrieve chunks about the word's
+#      meaning rather than the answer topic.
+#   2. Parsing artifacts: very short or ambiguous tokens produced by spaCy splitting
+#      hyphenated compounds (e.g. "air" from "air-gun").
+_WH_NOUN_BLOCKLIST = frozenset([
+    "term", "word", "phrase", "title",
+    "work", "book", "text", "story", "novel",
+    "condition", "situation", "method", "way", "reason",
+    "thing", "fact", "case", "detail", "example",
+    "type", "kind", "role", "part", "form",
+])
+
 # Module-level cache: conn id → corpus stopword set (avoids repeated db_meta SELECTs)
 _corpus_stops_cache: dict[int, frozenset] = {}
 
@@ -188,9 +204,10 @@ def _find_predicates_dynamic(
     conn: sqlite3.Connection,
     embedder: Any,
     term: str,
-    k: int = 8,
+    k: int = 5,
+    max_distance: float = 0.35,
 ) -> list[str]:
-    """Embed term and return the k nearest predicates from vec_predicates.
+    """Embed term and return predicates from vec_predicates within max_distance.
 
     Falls back to the static _VERB_TO_PRED / _NOUN_TO_PRED maps when
     vec_predicates is not yet populated (before the first pred-vec pass).
@@ -202,7 +219,7 @@ def _find_predicates_dynamic(
         from loci.models import embed_batch
         from loci.store import search_pred_vec
         emb = embed_batch(embedder, [term], normalize=True)[0]
-        return search_pred_vec(conn, emb, k=k)
+        return search_pred_vec(conn, emb, k=k, max_distance=max_distance)
     except Exception:
         return []
 
@@ -266,14 +283,21 @@ def _parse_spacy(question: str, nlp: Any) -> QuestionParse:
     # in "In which battle…". spaCy's dep tree is unreliable here (the wh-word
     # often attaches to the preposition, not the noun), so positional proximity
     # is more robust.
+    # Hyphenated compounds (e.g. "air-gun") are split by spaCy into [NOUN, "-", NOUN].
+    # The first part of a compound is detected by checking whether the next token is
+    # a hyphen, and skipped so the extraction continues to the next NOUN.
     wh_noun = None
     if wh_type:
         for i, t in enumerate(doc):
             if t.lower_ == wh_type:
                 for t2 in doc[i + 1:]:
                     if t2.pos_ in ("NOUN", "PROPN"):
+                        if t2.i + 1 < len(doc) and doc[t2.i + 1].text == "-":
+                            continue  # first part of hyphenated compound — skip
                         wh_noun = t2.lemma_.lower()
                         break
+                    if t2.text == "-":
+                        continue  # hyphen between compound parts — skip
                     if t2.pos_ not in ("ADP", "DET"):
                         break  # stop at verbs/pronouns — no wh-noun here
                 break
@@ -620,7 +644,9 @@ def fts_search_question(
         return []
     or_clause = " OR ".join(content)
     # Mandatory AND prefix: "battle AND (wounded OR returning OR england)"
-    if wh_noun and wh_noun not in effective_stops and len(wh_noun) > 2:
+    # Blocked for abstract question-format words and spaCy parsing artifacts.
+    if (wh_noun and wh_noun not in effective_stops
+            and wh_noun not in _WH_NOUN_BLOCKLIST and len(wh_noun) > 2):
         query = f"{wh_noun} AND ({or_clause})"
     else:
         query = or_clause

@@ -676,9 +676,12 @@ def rebuild_pred_vec(conn: sqlite3.Connection, embedder: object) -> int:
 
 
 def search_pred_vec(
-    conn: sqlite3.Connection, query_embedding: list[float], k: int = 8
+    conn: sqlite3.Connection,
+    query_embedding: list[float],
+    k: int = 5,
+    max_distance: float = 0.35,
 ) -> list[str]:
-    """Return the k predicates nearest to query_embedding (cosine distance).
+    """Return predicates nearest to query_embedding within max_distance (cosine).
 
     Returns an empty list when vec_predicates is not yet populated.
     """
@@ -690,9 +693,9 @@ def search_pred_vec(
         ).fetchall()
     except Exception:
         return []
-    if not rows:
+    pred_ids = [r[0] for r in rows if r[1] <= max_distance]
+    if not pred_ids:
         return []
-    pred_ids = [r[0] for r in rows]
     ph = ",".join("?" * len(pred_ids))
     return [
         r[0] for r in conn.execute(
@@ -705,29 +708,50 @@ def search_pred_vec(
 # Corpus stopwords — high-frequency terms derived from the ingested corpus
 # ---------------------------------------------------------------------------
 
-def compute_corpus_stopwords(conn: sqlite3.Connection, threshold: float = 0.4) -> set[str]:
+def compute_corpus_stopwords(
+    conn: sqlite3.Connection,
+    threshold: float = 0.4,
+    proper_noun_threshold: float = 0.3,
+) -> set[str]:
     """Compute and persist terms that appear in ≥ threshold fraction of chunks.
 
-    These domain-specific high-frequency terms dilute BM25 signal the same way
-    universal stopwords do, but they can only be known after ingest. The result
-    is stored in db_meta and loaded by the retrieval layer at query time.
+    Proper nouns (words that appear predominantly capitalized in the corpus, e.g.
+    major character names) use proper_noun_threshold instead of threshold — a lower
+    cutoff because a character name appearing in 30%+ of chunks dilutes BM25 signal
+    just as much as a generic word at 40%+, but wouldn't be caught by the higher bar.
+    The result is stored in db_meta and loaded by the retrieval layer at query time.
     """
     import re
     _NONWORD = re.compile(r"[^\w\s]")
+    _CAP_WORD = re.compile(r"\b[A-Z][a-z]{2,}\b")  # capitalised words ≥ 3 chars
     rows = conn.execute("SELECT text FROM chunks").fetchall()
     n_chunks = len(rows)
     if n_chunks == 0:
         return set()
 
     doc_freq: dict[str, int] = {}
+    cap_freq: dict[str, int] = {}
     for row in rows:
         text = row[0] if isinstance(row, tuple) else row["text"]
-        terms = set(_NONWORD.sub(" ", text.lower()).split())
-        for term in terms:
+        lower_terms = set(_NONWORD.sub(" ", text.lower()).split())
+        cap_terms = {t.lower() for t in _CAP_WORD.findall(text)}
+        for term in lower_terms:
             if len(term) > 2:
                 doc_freq[term] = doc_freq.get(term, 0) + 1
+        for term in cap_terms:
+            cap_freq[term] = cap_freq.get(term, 0) + 1
 
-    corpus_stops = {t for t, cnt in doc_freq.items() if cnt / n_chunks >= threshold}
+    corpus_stops: set[str] = set()
+    for t, cnt in doc_freq.items():
+        df = cnt / n_chunks
+        # Words that are predominantly capitalised in the corpus are proper nouns.
+        # They get a lower DF threshold so high-frequency character names are caught
+        # even when below the generic cutoff.
+        cap_ratio = cap_freq.get(t, 0) / cnt
+        effective_threshold = proper_noun_threshold if cap_ratio >= 0.7 else threshold
+        if df >= effective_threshold:
+            corpus_stops.add(t)
+
     conn.execute(
         "INSERT OR REPLACE INTO db_meta(key,value) VALUES ('corpus_stopwords',?)",
         [json.dumps(sorted(corpus_stops))],
