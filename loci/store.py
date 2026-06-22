@@ -99,6 +99,10 @@ _DDL: list[str] = [
       synonym   TEXT,
       PRIMARY KEY (predicate, synonym)
     )""",
+    """CREATE TABLE IF NOT EXISTS predicate_vocab (
+      id        INTEGER PRIMARY KEY,
+      predicate TEXT UNIQUE NOT NULL
+    )""",
     """CREATE TABLE IF NOT EXISTS pending_links (
       id                   INTEGER PRIMARY KEY,
       mention              TEXT NOT NULL UNIQUE,
@@ -213,6 +217,16 @@ def _migrate(conn: sqlite3.Connection, vec_dim: int = 384) -> None:
         conn.execute(
             f"CREATE VIRTUAL TABLE vec_propositions USING vec0("
             f"prop_id INTEGER PRIMARY KEY, embedding FLOAT[{vec_dim}])"
+        )
+
+    # vec_predicates: dynamic predicate embedding index
+    vec_pred_exists = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='vec_predicates'"
+    ).fetchone()
+    if not vec_pred_exists:
+        conn.execute(
+            f"CREATE VIRTUAL TABLE vec_predicates USING vec0("
+            f"pred_id INTEGER PRIMARY KEY, embedding FLOAT[{vec_dim}])"
         )
 
     # vec_facts: created lazily (may not exist in older DBs)
@@ -457,6 +471,7 @@ def fts_search_chunks(
 _FACT_FTS_VERSION = "1"
 _FACT_FTS_LLM_VERSION = "2"
 _FACT_VEC_VERSION = "1"
+_PRED_VEC_VERSION = "1"
 
 # Question-mapped predicates only — keeps fts_facts_llm high-precision.
 # Excludes generic copulas/verbs (be, call, say, have, take, …) that distract
@@ -618,6 +633,141 @@ def vec_search_propositions(
     except Exception:
         return []
     return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Dynamic predicate vocabulary
+# ---------------------------------------------------------------------------
+
+def rebuild_pred_vec(conn: sqlite3.Connection, embedder: object) -> int:
+    """Embed all distinct predicates from facts + propositions into vec_predicates.
+
+    Predicates are embedded as natural-language phrases (underscores → spaces)
+    so that question verbs and wh-nouns match via cosine similarity at query time.
+    Returns the number of predicates embedded.
+    """
+    from loci.models import embed_batch
+
+    fact_preds = {r[0] for r in conn.execute("SELECT DISTINCT predicate FROM facts").fetchall() if r[0]}
+    prop_preds = {r[0] for r in conn.execute("SELECT DISTINCT predicate FROM propositions").fetchall() if r[0]}
+    all_preds = sorted(fact_preds | prop_preds)
+    if not all_preds:
+        return 0
+
+    for pred in all_preds:
+        conn.execute("INSERT OR IGNORE INTO predicate_vocab(predicate) VALUES (?)", [pred])
+    conn.commit()
+
+    id_map = {r["predicate"]: r["id"] for r in conn.execute(
+        "SELECT id, predicate FROM predicate_vocab"
+    ).fetchall()}
+
+    docs = [p.replace("_", " ") for p in all_preds]
+    embs = embed_batch(embedder, docs, normalize=True)
+
+    conn.execute("DELETE FROM vec_predicates")
+    for pred, emb in zip(all_preds, embs):
+        conn.execute(
+            "INSERT INTO vec_predicates(pred_id, embedding) VALUES (?,?)",
+            [id_map[pred], _ser(emb)],
+        )
+    conn.commit()
+    return len(all_preds)
+
+
+def search_pred_vec(
+    conn: sqlite3.Connection,
+    query_embedding: list[float],
+    k: int = 5,
+    max_distance: float = 0.35,
+) -> list[str]:
+    """Return predicates nearest to query_embedding within max_distance (cosine).
+
+    Returns an empty list when vec_predicates is not yet populated.
+    """
+    try:
+        rows = conn.execute(
+            "SELECT pred_id, distance FROM vec_predicates"
+            " WHERE embedding MATCH ? ORDER BY distance LIMIT ?",
+            [_ser(query_embedding), k],
+        ).fetchall()
+    except Exception:
+        return []
+    pred_ids = [r[0] for r in rows if r[1] <= max_distance]
+    if not pred_ids:
+        return []
+    ph = ",".join("?" * len(pred_ids))
+    return [
+        r[0] for r in conn.execute(
+            f"SELECT predicate FROM predicate_vocab WHERE id IN ({ph})", pred_ids
+        ).fetchall()
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Corpus stopwords — high-frequency terms derived from the ingested corpus
+# ---------------------------------------------------------------------------
+
+def compute_corpus_stopwords(
+    conn: sqlite3.Connection,
+    threshold: float = 0.4,
+    proper_noun_threshold: float = 0.3,
+) -> set[str]:
+    """Compute and persist terms that appear in ≥ threshold fraction of chunks.
+
+    Proper nouns (words that appear predominantly capitalized in the corpus, e.g.
+    major character names) use proper_noun_threshold instead of threshold — a lower
+    cutoff because a character name appearing in 30%+ of chunks dilutes BM25 signal
+    just as much as a generic word at 40%+, but wouldn't be caught by the higher bar.
+    The result is stored in db_meta and loaded by the retrieval layer at query time.
+    """
+    import re
+    _NONWORD = re.compile(r"[^\w\s]")
+    _CAP_WORD = re.compile(r"\b[A-Z][a-z]{2,}\b")  # capitalised words ≥ 3 chars
+    rows = conn.execute("SELECT text FROM chunks").fetchall()
+    n_chunks = len(rows)
+    if n_chunks == 0:
+        return set()
+
+    doc_freq: dict[str, int] = {}
+    cap_freq: dict[str, int] = {}
+    for row in rows:
+        text = row[0] if isinstance(row, tuple) else row["text"]
+        lower_terms = set(_NONWORD.sub(" ", text.lower()).split())
+        cap_terms = {t.lower() for t in _CAP_WORD.findall(text)}
+        for term in lower_terms:
+            if len(term) > 2:
+                doc_freq[term] = doc_freq.get(term, 0) + 1
+        for term in cap_terms:
+            cap_freq[term] = cap_freq.get(term, 0) + 1
+
+    corpus_stops: set[str] = set()
+    for t, cnt in doc_freq.items():
+        df = cnt / n_chunks
+        # Words that are predominantly capitalised in the corpus are proper nouns.
+        # They get a lower DF threshold so high-frequency character names are caught
+        # even when below the generic cutoff.
+        cap_ratio = cap_freq.get(t, 0) / cnt
+        effective_threshold = proper_noun_threshold if cap_ratio >= 0.7 else threshold
+        if df >= effective_threshold:
+            corpus_stops.add(t)
+
+    conn.execute(
+        "INSERT OR REPLACE INTO db_meta(key,value) VALUES ('corpus_stopwords',?)",
+        [json.dumps(sorted(corpus_stops))],
+    )
+    conn.commit()
+    return corpus_stops
+
+
+def load_corpus_stopwords(conn: sqlite3.Connection) -> set[str]:
+    """Load corpus stopwords from db_meta. Returns empty set if not yet computed."""
+    row = conn.execute(
+        "SELECT value FROM db_meta WHERE key='corpus_stopwords'"
+    ).fetchone()
+    if row is None:
+        return set()
+    return set(json.loads(row[0] if isinstance(row, tuple) else row["value"]))
 
 
 # ---------------------------------------------------------------------------

@@ -249,9 +249,11 @@ def ingest_cmd(
 
         try:
             from loci.ingest import ingest_file
+            from loci.store import compute_corpus_stopwords
             stats = ingest_file(
                 path, meta=parsed_meta, cfg=cfg, conn=conn, embedder=embedder
             )
+            compute_corpus_stopwords(conn)
         finally:
             if embedder is not None:
                 try:
@@ -1217,7 +1219,7 @@ def _question_template(subject: str, predicate: str, obj: str) -> str:
 def enhance_cmd(
     limit: Optional[int] = typer.Option(None, "--limit", help="Max chunks to process."),
     all_chunks: bool = typer.Option(False, "--all", help="Re-run on ALL chunks (reset extracted_v first). Needed for the P1 taxonomy re-extraction pass."),
-    passes: Optional[str] = typer.Option(None, "--passes", help="Comma-separated passes: entity,implied,prop. Omit for P1 chunk pass."),
+    passes: Optional[str] = typer.Option(None, "--passes", help="Comma-separated passes: entity,implied,prop,pred-vec. Omit for P1 chunk pass."),
     force_prop: bool = typer.Option(False, "--force-prop", help="Re-run prop mint even if already done (clears prop_mint_v guard)."),
     config_path: Optional[Path] = typer.Option(None, "--config", "-c"),
     low_mem: bool = typer.Option(False, "--low-mem"),
@@ -1234,14 +1236,14 @@ def enhance_cmd(
 
     from loci.config import expanded
     from loci.store import open_db, get_unextracted_chunks
-    from loci.enhance import run_enhance, run_entity_pass, run_implied_pass, run_closure_pass, run_prune_pass, run_proposition_mint
+    from loci.enhance import run_enhance, run_entity_pass, run_implied_pass, run_closure_pass, run_prune_pass, run_proposition_mint, run_pred_vec_pass
 
     cfg_exp = expanded(cfg)
 
     requested_passes = {p.strip() for p in passes.split(",")} if passes else set()
-    llm_passes = requested_passes - {"closure", "prune"}
+    llm_passes = requested_passes - {"closure", "prune", "pred-vec"}
 
-    # Prune and closure passes need no LLM — validate model only when LLM passes are requested.
+    # pred-vec, prune, closure need no LLM — validate model only when LLM passes are requested.
     if not requested_passes or llm_passes:
         if not _chat_model_exists(cfg_exp):
             console.print(
@@ -1350,6 +1352,18 @@ def enhance_cmd(
             )
             conn.commit()
             combined_stats.update(stats)
+
+        # pred-vec pass — no LLM required; embeds predicate vocabulary for dynamic matching
+        if "pred-vec" in requested_passes:
+            if embedder is None:
+                console.print("[yellow]pred-vec skipped — embedder not available.[/yellow]")
+            else:
+                console.print("[bold]Predicate vec pass[/bold] — embedding predicate vocabulary…")
+                with measure("enhance_pred_vec", log_dir=cfg_exp.paths.runtime_logs_dir) as counters:
+                    stats = run_pred_vec_pass(conn, embedder)
+                    counters.update(stats)
+                console.print(f"  predicates embedded: {stats.get('predicates_embedded', 0)}")
+                combined_stats.update(stats)
 
         # Closure pass — no LLM required; runs after any LLM passes or standalone
         if "closure" in requested_passes:

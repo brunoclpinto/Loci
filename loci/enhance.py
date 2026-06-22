@@ -1108,4 +1108,26 @@ def run_enhance(
         import warnings
         warnings.warn(f"fts/vec rebuild failed after enhance: {_err}")
 
+    if embedder is not None:
+        run_pred_vec_pass(conn, embedder)
+
     return {"chunks_processed": len(chunks), "facts_added": n_facts}
+
+
+def run_pred_vec_pass(conn: Any, embedder: Any) -> dict:
+    """Embed all distinct predicates from facts + propositions into vec_predicates,
+    and (re)compute corpus stopwords from current chunk contents.
+
+    This enables dynamic predicate matching and domain-specific stopword filtering
+    at query time — both derived from the actual ingested content rather than
+    hardcoded static maps.
+    """
+    from loci.store import rebuild_pred_vec, compute_corpus_stopwords, _PRED_VEC_VERSION
+    n = rebuild_pred_vec(conn, embedder)
+    conn.execute(
+        "INSERT OR REPLACE INTO db_meta(key,value) VALUES ('pred_vec_v',?)",
+        [_PRED_VEC_VERSION],
+    )
+    conn.commit()
+    stops = compute_corpus_stopwords(conn)
+    return {"predicates_embedded": n, "corpus_stopwords": len(stops)}
