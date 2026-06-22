@@ -17,6 +17,8 @@ _AUX_LEMMAS = frozenset(["be", "do", "have", "will", "would", "could", "should",
 
 # For proposition FTS we use a narrower stopword set — character names are kept
 # so FTS can discriminate between Holmes/Watson/Hope propositions.
+# Domain-specific high-frequency terms are added dynamically from db_meta at
+# query time via load_corpus_stopwords() — see _get_corpus_stops().
 _PROP_FTS_STOPWORDS = frozenset([
     "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
     "have", "has", "had", "do", "does", "did", "will", "would", "could",
@@ -88,8 +90,9 @@ _VERB_TO_PRED: dict[str, list[str]] = {
 _CHARS_PER_TOKEN = 4
 _NONWORD = re.compile(r"[^\w\s]")
 
-# Words to strip before building a FTS OR-query — question words, auxiliaries, and
-# common English stopwords that appear in every sentence and dilute BM25 signal.
+# Universal stopwords — language-level, not domain-specific.
+# Domain-specific high-frequency terms are computed from the corpus during ingest
+# and loaded dynamically via _get_corpus_stops(conn) at query time.
 _FTS_STOPWORDS = frozenset([
     "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
     "have", "has", "had", "do", "does", "did", "will", "would", "could",
@@ -99,9 +102,10 @@ _FTS_STOPWORDS = frozenset([
     "he", "she", "his", "her", "we", "our", "you", "your", "i", "my",
     "what", "who", "where", "when", "which", "how", "whom", "whose",
     "name", "called", "used", "ever", "first", "did",
-    # domain: ubiquitous in every chunk — dilute BM25 signal without adding discrimination
-    "holmes", "watson", "sherlock", "john", "said", "replied", "remarked", "cried",
 ])
+
+# Module-level cache: conn id → corpus stopword set (avoids repeated db_meta SELECTs)
+_corpus_stops_cache: dict[int, frozenset] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -114,6 +118,7 @@ class QuestionParse:
     entity_mentions: list[str]   # raw text candidates (resolved later in pipeline)
     verb_lemma: str | None       # main predicate to look up
     raw: str
+    wh_noun: str | None = None   # head noun of wh-phrase, e.g. "battle" in "which battle"
 
 
 @dataclass
@@ -160,6 +165,46 @@ class PropositionHit:
     roles: dict                # {agent: id, theme: [id, ...]}
     chunk_id: int
     agent_canonical: str | None = None   # filled in by retrieve_propositions
+
+
+# ---------------------------------------------------------------------------
+# Dynamic helpers — corpus-derived data loaded from the DB at query time
+# ---------------------------------------------------------------------------
+
+def _get_corpus_stops(conn: sqlite3.Connection) -> frozenset:
+    """Return corpus stopwords merged with the universal baseline.
+
+    Result is cached per connection object so repeated calls within a bench
+    run don't re-read db_meta on every question.
+    """
+    cid = id(conn)
+    if cid not in _corpus_stops_cache:
+        from loci.store import load_corpus_stopwords
+        _corpus_stops_cache[cid] = _FTS_STOPWORDS | frozenset(load_corpus_stopwords(conn))
+    return _corpus_stops_cache[cid]
+
+
+def _find_predicates_dynamic(
+    conn: sqlite3.Connection,
+    embedder: Any,
+    term: str,
+    k: int = 8,
+) -> list[str]:
+    """Embed term and return the k nearest predicates from vec_predicates.
+
+    Falls back to the static _VERB_TO_PRED / _NOUN_TO_PRED maps when
+    vec_predicates is not yet populated (before the first pred-vec pass).
+    Returns an empty list on any failure.
+    """
+    if not term or embedder is None:
+        return []
+    try:
+        from loci.models import embed_batch
+        from loci.store import search_pred_vec
+        emb = embed_batch(embedder, [term], normalize=True)[0]
+        return search_pred_vec(conn, emb, k=k)
+    except Exception:
+        return []
 
 
 # ---------------------------------------------------------------------------
@@ -217,8 +262,24 @@ def _parse_spacy(question: str, nlp: Any) -> QuestionParse:
         if m not in mentions:
             mentions.append(m)
 
+    # wh-noun: first NOUN/PROPN immediately following the wh-word, e.g. "battle"
+    # in "In which battle…". spaCy's dep tree is unreliable here (the wh-word
+    # often attaches to the preposition, not the noun), so positional proximity
+    # is more robust.
+    wh_noun = None
+    if wh_type:
+        for i, t in enumerate(doc):
+            if t.lower_ == wh_type:
+                for t2 in doc[i + 1:]:
+                    if t2.pos_ in ("NOUN", "PROPN"):
+                        wh_noun = t2.lemma_.lower()
+                        break
+                    if t2.pos_ not in ("ADP", "DET"):
+                        break  # stop at verbs/pronouns — no wh-noun here
+                break
+
     return QuestionParse(wh_type=wh_type, entity_mentions=mentions,
-                         verb_lemma=verb_lemma, raw=question)
+                         verb_lemma=verb_lemma, raw=question, wh_noun=wh_noun)
 
 
 def _parse_simple(question: str) -> QuestionParse:
@@ -231,17 +292,23 @@ def _parse_simple(question: str) -> QuestionParse:
                "are", "has", "have", "had", "been", "be", "of", "in", "on",
                "at", "by", "to", "for", "with", "from"}
     verb_lemma = None
+    wh_noun = None
     past_wh = wh_type is None
-    for w in words:
+    for i, w in enumerate(words):
         cw = w.strip("?.,!;:")
         if cw in _WH_WORDS:
             past_wh = True
+            # word immediately after wh-word is likely the wh-noun (e.g. "battle")
+            if i + 1 < len(words):
+                nw = words[i + 1].strip("?.,!;:")
+                if nw.isalpha() and nw not in _STOPS and nw not in _WH_WORDS:
+                    wh_noun = nw
             continue
         if past_wh and cw.isalpha() and cw not in _STOPS:
             verb_lemma = cw
             break
     return QuestionParse(wh_type=wh_type, entity_mentions=[],
-                         verb_lemma=verb_lemma, raw=question)
+                         verb_lemma=verb_lemma, raw=question, wh_noun=wh_noun)
 
 
 # ---------------------------------------------------------------------------
@@ -387,11 +454,13 @@ def fact_lookup(
     source_filter: set[str] | None = None,
 ) -> list[FactHit]:
     """Indexed SQL lookup: (subject_id IN ...) AND (predicate IN ...)."""
-    if not entity_ids or not predicate:
+    if not entity_ids or (not predicate and not synonyms):
         return []
 
     sp = f"{schema}." if schema != "main" else ""
-    all_predicates = [predicate] + sorted(synonyms)
+    all_predicates = ([predicate] if predicate else []) + sorted(synonyms)
+    # Score expression: exact match on primary predicate scores 1.0, synonyms 0.8
+    _score_pred = predicate or (sorted(synonyms)[0] if synonyms else "")
     id_ph = ",".join("?" * len(entity_ids))
     pred_ph = ",".join("?" * len(all_predicates))
     src_clause = ""
@@ -410,6 +479,7 @@ def fact_lookup(
             oe.canonical_name AS object_entity_name,
             s.title, s.path,
             CASE WHEN f.predicate=? THEN 1.0 ELSE 0.8 END AS score
+        -- ^ score param: primary predicate for exact-match bonus
         FROM {sp}facts f
         JOIN {sp}entities e ON f.subject_id = e.id
         LEFT JOIN {sp}entities oe ON f.object_id = oe.id
@@ -424,7 +494,7 @@ def fact_lookup(
           {src_clause}
         ORDER BY score DESC, f.id
         """,
-        [predicate] + entity_ids + all_predicates + src_params,
+        [_score_pred] + entity_ids + all_predicates + src_params,
     ).fetchall()
 
     hits = []
@@ -531,16 +601,29 @@ def canonical_names_for_facts(
 # ---------------------------------------------------------------------------
 
 def fts_search_question(
-    conn: sqlite3.Connection, question: str, k: int, schema: str = "main"
+    conn: sqlite3.Connection, question: str, k: int, schema: str = "main",
+    wh_noun: str | None = None,
+    extra_stopwords: frozenset | None = None,
 ) -> list[int]:
-    """BM25 full-text search: strip stopwords, OR remaining content words."""
+    """BM25 full-text search: strip stopwords, OR remaining content words.
+
+    extra_stopwords is merged with _FTS_STOPWORDS at call time (used to pass
+    corpus-derived high-frequency terms without modifying the module constant).
+    If wh_noun is supplied (e.g. "battle" from "which battle"), it is prepended
+    as a mandatory AND term so only chunks mentioning that noun rank at all.
+    """
     from loci.store import fts_search_chunks
+    effective_stops = _FTS_STOPWORDS | (extra_stopwords or frozenset())
     words = _NONWORD.sub(" ", question.lower()).split()
-    content = [w for w in words if w and w not in _FTS_STOPWORDS and len(w) > 2]
+    content = [w for w in words if w and w not in effective_stops and len(w) > 2]
     if not content:
         return []
-    # FTS5 OR query: any chunk matching any content word ranks above zero
-    query = " OR ".join(content)
+    or_clause = " OR ".join(content)
+    # Mandatory AND prefix: "battle AND (wounded OR returning OR england)"
+    if wh_noun and wh_noun not in effective_stops and len(wh_noun) > 2:
+        query = f"{wh_noun} AND ({or_clause})"
+    else:
+        query = or_clause
     try:
         results = fts_search_chunks(conn, query=query, k=k, schema=schema)
         return [r["chunk_id"] for r in results]
@@ -750,6 +833,7 @@ def build_explain(
 ) -> str:
     lines: list[str] = ["=== Question Parse ==="]
     lines.append(f"  wh-type : {parse.wh_type or '(none)'}")
+    lines.append(f"  wh-noun : {parse.wh_noun or '(none)'}")
     lines.append(f"  predicate: {parse.verb_lemma or '(none)'}")
     if synonyms:
         lines.append(f"  synonyms : {', '.join(sorted(synonyms))}")
@@ -825,10 +909,23 @@ def retrieve(
     main_entity_ids: list[int] = []
     main_synonyms: set[str] = set()
 
+    # Dynamic predicate discovery: embed verb + wh_noun → nearest DB predicates.
+    # Falls back to static maps when vec_predicates is not yet populated.
+    _dynamic_preds: set[str] = set()
+    _terms_to_embed = [t for t in [parse.verb_lemma, parse.wh_noun] if t]
+    for term in _terms_to_embed:
+        _dynamic_preds.update(_find_predicates_dynamic(conn, embedder, term))
+    # Static map fallback: used when vec_predicates is empty (new DB, pre-pred-vec pass)
+    _static_preds: set[str] = set(_VERB_TO_PRED.get(parse.verb_lemma or "", []))
+    if parse.wh_noun:
+        _static_preds.update(_NOUN_TO_PRED.get(parse.wh_noun, []))
+    _extra_preds = _dynamic_preds or _static_preds  # prefer dynamic; fall back to static
+
     t0 = time.perf_counter()
     for schema in schemas:
         s_eids = find_mentioned_entity_ids(conn, question, schema=schema)
         s_syns = get_synonyms(conn, parse.verb_lemma, schema=schema) if parse.verb_lemma else set()
+        s_syns |= _extra_preds
         if schema == "main":
             main_entity_ids = s_eids
             main_synonyms = s_syns
@@ -962,8 +1059,10 @@ def retrieve(
     if expand_terms:
         fts_question = question + " " + " ".join(expand_terms)
     _fts_pool_k = cfg.retrieval.rerank_pool if _rerank_on else cfg.retrieval.fts_top_k
+    _corpus_stops = _get_corpus_stops(conn)
     for schema in schemas:
-        fts_ids = fts_search_question(conn, fts_question, _fts_pool_k, schema=schema)
+        fts_ids = fts_search_question(conn, fts_question, _fts_pool_k, schema=schema,
+                                      wh_noun=parse.wh_noun, extra_stopwords=_corpus_stops)
         for rank, cid in enumerate(fts_ids):
             key = (schema, cid)
             all_fts_keys.append(key)
