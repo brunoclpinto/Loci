@@ -904,6 +904,15 @@ def bench_query_cmd(
                     swap_before = psutil.swap_memory().used / 1024 / 1024
                     stop_ev = threading.Event()
 
+                    # Reset MLX Metal peak counter if available (MLX allocates in
+                    # unified memory invisible to psutil RSS).
+                    try:
+                        import mlx.core as _mx
+                        _mx.metal.reset_peak_memory()
+                        _has_mlx_metal = True
+                    except Exception:
+                        _has_mlx_metal = False
+
                     def _sample(ev=stop_ev, samples=rss_samples):
                         while not ev.is_set():
                             try:
@@ -1006,6 +1015,12 @@ def bench_query_cmd(
                     timings["tokens"] = len(full_text.split())
 
                     peak_rss = max(rss_samples, default=psutil.Process().memory_info().rss / 1024 / 1024)
+                    if _has_mlx_metal:
+                        try:
+                            metal_peak_mb = _mx.metal.get_peak_memory() / 1024 / 1024
+                            peak_rss = max(peak_rss, metal_peak_mb)
+                        except Exception:
+                            pass
                     swap_delta = psutil.swap_memory().used / 1024 / 1024 - swap_before
 
                     full_text = strip_invalid_citations(
@@ -1606,6 +1621,8 @@ def _embedder_model_exists(cfg) -> bool:
 
 
 def _chat_model_exists(cfg) -> bool:
+    if not cfg.models.chat.endswith(".gguf"):
+        return True  # HF repo ID — mlx-lm handles download/cache
     return (cfg.paths.models_dir / cfg.models.chat).exists()
 
 
