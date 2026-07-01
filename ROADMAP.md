@@ -21,6 +21,10 @@ plan file (linked below) with full implementation detail, tests, bench, and succ
 > scarlet_v2.db (1676→1739) and help specific questions, but enabling injection always hurts paraphrase more.
 > Infrastructure in place: vec_facts, taxonomy enhance, rerank config, HyDE flag — all ready for a stronger base model.
 >
+> **MLX hybrid experiment (2026-07-01):** 4-bit MLX=43.90 halluc=27 neg=55.0 (RAM≈1.7 GB, same speed);
+> 8-bit MLX≈66.6 halluc=1 neg=90.0 (RAM=3.5 GB, 87% slower). Neither beats llama-cpp Q4_K_M baseline.
+> Regression is entirely on negative questions — discipline failure, not capability → motivates L1.
+>
 > **Phase Q (2026-06-15):** Added `source` provenance column (svo/coref/llm), `fact_sources` quarantine knob, relevance
 > gate, and 4× FTS over-pull. Deep ablation bench (5 arms × qna_20 runs=3, 2 arms × qna_scarlet runs=3):
 > minted-only injection showed qna_20 improvement (73.75, +10.0 vs M-20) but regressed on 100-Q (minted-4=62.05,
@@ -75,6 +79,8 @@ plan file (linked below) with full implementation detail, tests, bench, and succ
 | 7 | **N** — base model selection | [planN_modelbench.md](planN_modelbench.md) | `DONE (🛑 no winner; Qwen2.5-3B stays incumbent; all candidates failed: Llama-3.2-3B=63.55 halluc=3, Qwen3.5-2B=52.55 halluc=5, Qwen3-1.7B=46.30 over-refuses, Gemma3-1B=41.0 halluc=18, Phi-4-mini=53.15 multi=0 RSS=3.6GB)` | Q | yes |
 | 8 | **P2** — multi-pass ingest | [planP2_multipass.md](planP2_multipass.md) | `DONE (🛑 FAIL on injection; ran ahead of N; entity+implied passes minted 285 new llm facts (380→665, 1739→2024 total); RACHE+Hope cab driver now correct; but minted-4 runs=3=61.70 −2.65 vs M, halluc=2 — same 3B bound as Q; injection off; data in DB ready for N winner)` | N (needs winning model first) | yes |
 | 9 | **F** — fact graph closure + LLM-only FTS + prune | [jaunty-honking-hare.md](../.claude/plans/jaunty-honking-hare.md) | `DONE (🛑 FAIL; closure=62.45 then prune+closure=60.15, both < M=64.35; 3B bound immutable; DB restored; infra ready for stronger model)` | P2 | no (🛑 gate) |
+| 10 | **L1** — single grounding/abstention LoRA adapter | [planL1_lora_single.md](planL1_lora_single.md) | `TODO` | F | no (G-PROMOTE before swap) |
+| 11 | **L2** — multi-adapter LoRA router | [planL2_lora_router.md](planL2_lora_router.md) | `TODO` | L1 PASS | no |
 
 > **Keep this table current.** When a phase finishes, set its `Status` to `DONE (overall=NN.N, fact=NN.N)`
 > and move to the next `TODO` row.
@@ -134,3 +140,11 @@ Pause and ask the user **only** when one of these is hit; otherwise keep going:
   1800-tok cut. Retrieval-only; stacks on anything.
 - **E** — paraphrase (0.10) + multi_hop (0.05) buckets = 15% of score. Query expansion / HyDE-lite +
   sub-question decomposition. Lowest weighted headroom; last.
+- **L1** — the 3B bound is a discipline problem, not a capability one. Every phase Q/P2/F regressed because
+  the model draws on training knowledge when injected facts are imperfect or absent. A single QLoRA
+  "grounding + abstention" adapter trains it to follow the system prompt's context-only rule. Lowest-risk
+  intervention: no DB changes, no retrieval changes.
+- **L2** — factual, multi-hop, and abstention tasks need different generation strategies. A retrieval-signal
+  router (post-retrieve, pre-generate) picks the right specialised adapter per question — no extra LLM call,
+  selection reads metadata already computed by retrieve(). Depends on L1 validating that fine-tuning works
+  at all on this use case.
