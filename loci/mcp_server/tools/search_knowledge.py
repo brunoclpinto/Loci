@@ -32,6 +32,7 @@ def run_search(
     include_descendants: bool = False,
     entity_types: list[str] | None = None,
     top_k: int = 10,
+    include_metadata_chunks: bool = False,
     embedding_client: EmbeddingClient | None = None,
     vector_store: VectorStore | None = None,
 ) -> SearchResult:
@@ -40,18 +41,27 @@ def run_search(
     harness (loci/bench/answer.py), so bench results reflect the real
     product's retrieval, not a parallel reimplementation. Callers that will
     issue many queries should build their own EmbeddingClient/VectorStore
-    once and pass them in rather than let this construct fresh ones per call."""
+    once and pass them in rather than let this construct fresh ones per call.
+
+    Non-narrative chunks (title pages, tables of contents, license text —
+    see loci/ingest/structure.py) are excluded by default so document
+    metadata doesn't compete with real content in results; pass
+    include_metadata_chunks=True to see them anyway."""
     embedding_client = embedding_client or EmbeddingClient(settings.ollama)
     vector_store = vector_store or VectorStore(settings.qdrant)
 
     context_ids = resolve_context_ids(session, context_names, include_descendants)
+    segment_types = None if include_metadata_chunks else ["narrative"]
 
     query_vector = embedding_client.embed_one(query)
-    points = vector_store.search(settings.ollama.embedding_model, query_vector, top_k, context_ids=context_ids)
+    points = vector_store.search(
+        settings.ollama.embedding_model, query_vector, top_k, context_ids=context_ids, segment_types=segment_types
+    )
     chunk_hits = [_chunk_hit_from_point(session, p) for p in points]
 
     entity_stmt = select(Entity).where(
-        or_(func.similarity(Entity.canonical_name, query) > 0.2, Entity.canonical_name.ilike(f"%{query}%"))
+        or_(func.similarity(Entity.canonical_name, query) > 0.2, Entity.canonical_name.ilike(f"%{query}%")),
+        Entity.merged_into.is_(None),
     )
     if entity_types:
         entity_stmt = entity_stmt.where(Entity.type.in_(entity_types))
@@ -73,12 +83,15 @@ def make_search_knowledge(settings: LociSettings):
         include_descendants: bool = False,
         entity_types: list[str] | None = None,
         top_k: int = 10,
+        include_metadata_chunks: bool = False,
     ) -> SearchResult:
         """Search the knowledge base by natural-language query. Returns both
         semantic chunk hits (from the vector layer) and structured entity
         matches (by name), each carrying a citation back to its source and
         context. Restrict `context_names` to scope results to specific
-        contexts (e.g. a particular book or a "real_world" context)."""
+        contexts (e.g. a particular book or a "real_world" context).
+        Document metadata (title pages, tables of contents, license text) is
+        excluded by default — set include_metadata_chunks=True to see it."""
         with session_scope(settings) as session:
             return run_search(
                 settings,
@@ -87,6 +100,7 @@ def make_search_knowledge(settings: LociSettings):
                 context_names=context_names,
                 include_descendants=include_descendants,
                 entity_types=entity_types,
+                include_metadata_chunks=include_metadata_chunks,
                 top_k=top_k,
                 embedding_client=embedding_client,
                 vector_store=vector_store,

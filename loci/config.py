@@ -63,6 +63,12 @@ class IngestSettings(BaseModel):
     extraction_window_tokens: int = 2500
     embed_batch: int = 16
     extraction_json_retries: int = 5
+    # Segment classification and coreference resolution are simple
+    # classification/matching tasks, not full extraction — no reason to pay
+    # a heavy reasoning model's latency for them regardless of which model
+    # is doing extraction for a given run.
+    segment_classifier_model: str = "qwen2.5:7b-instruct"
+    coreference_model: str = "qwen2.5:7b-instruct"
 
 
 class LoggingSettings(BaseModel):

@@ -22,6 +22,7 @@ class ExtractedEntity:
     aliases: list[str] = field(default_factory=list)
     attributes: dict = field(default_factory=dict)
     scope: str = "context_local"
+    identity_status: str = "named"
     confidence: float | None = None
 
 

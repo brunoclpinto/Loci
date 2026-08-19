@@ -11,6 +11,9 @@ from loci.config import LociSettings
 from loci.db.engine import session_scope
 from loci.db.models import Context, Entity, IngestionRun, Relationship
 from loci.ingest.base import ExtractedChunk, ExtractionBatch, SourceAdapter, SourceDescriptor
+from loci.ingest.coreference import resolve_unresolved_entities
+from loci.ingest.relationships import relationship_exists
+from loci.ingest.type_consolidation import resolve_type_inconsistencies
 from loci.normalize.resolver import EntityResolver
 from loci.normalize.versioning import RESOLVER_VERSION
 from loci.normalize.vocabulary import VocabularyError, validate_predicate_usage
@@ -53,6 +56,23 @@ class IngestionPipeline:
                 registry = SchemaRegistry.load(session)
                 for batch in adapter.extract(source):
                     self._process_batch(session, registry, adapter.name, batch, stats)
+                # Whole-document coreference pass: identities revealed only
+                # later than their first mention (see loci/ingest/
+                # coreference.py) can only be resolved once every window has
+                # been extracted. A no-op for adapters that never produce
+                # identity_status='unresolved' entities (e.g. structured
+                # files).
+                context = self._get_or_create_context(session, source.context_name)
+                merged = resolve_unresolved_entities(session, context.id, self.settings)
+                if merged:
+                    logger.info("coreference resolution merged %d entities in %r", merged, source.context_name)
+                # Same idea, different axis: the same entity sometimes gets
+                # tagged with different types in different windows (e.g.
+                # "Jefferson Hope" as both Person and Location), which the
+                # resolver can't catch since it only matches within a type.
+                type_merged = resolve_type_inconsistencies(session, context.id, self.settings, registry)
+                if type_merged:
+                    logger.info("type consolidation merged %d entities in %r", type_merged, source.context_name)
             self._finish_run(run_id, "succeeded", stats)
         except Exception as exc:
             self._finish_run(run_id, "failed", stats, error=str(exc))
@@ -83,6 +103,7 @@ class IngestionPipeline:
                     context_id=context.id,
                     scope=ee.scope,
                     canonical_name=ee.canonical_name,
+                    identity_status=ee.identity_status,
                     aliases=sorted(set(ee.aliases)),
                     attributes=ee.attributes,
                     attribute_schema_version=schema_version,
@@ -117,7 +138,7 @@ class IngestionPipeline:
                 stats.relationships_skipped_invalid += 1
                 continue
 
-            if self._relationship_exists(session, subject_id, er.predicate, object_id, er.object_literal, context.id):
+            if relationship_exists(session, subject_id, er.predicate, object_id, er.object_literal, context.id):
                 stats.relationships_matched += 1
                 continue
 
@@ -143,26 +164,6 @@ class IngestionPipeline:
             )
 
         session.flush()
-
-    def _relationship_exists(
-        self,
-        session: Session,
-        subject_id: uuid.UUID,
-        predicate: str,
-        object_id: uuid.UUID | None,
-        object_literal: dict | None,
-        context_id: uuid.UUID,
-    ) -> bool:
-        stmt = select(Relationship.id).where(
-            Relationship.subject_id == subject_id,
-            Relationship.predicate == predicate,
-            Relationship.context_id == context_id,
-        )
-        if object_id is not None:
-            stmt = stmt.where(Relationship.object_id == object_id)
-        else:
-            stmt = stmt.where(Relationship.object_id.is_(None), Relationship.object_literal == object_literal)
-        return session.scalars(stmt.limit(1)).first() is not None
 
     def _get_or_create_context(self, session: Session, name: str) -> Context:
         context = session.scalars(select(Context).where(Context.name == name)).first()

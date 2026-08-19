@@ -17,7 +17,8 @@ from loci.ingest.base import (
     SourceAdapter,
     SourceDescriptor,
 )
-from loci.llm.client import ExtractionLLMClient
+from loci.ingest.structure import segment_document
+from loci.llm.client import ExtractionLLMClient, classify_segment
 from loci.normalize.vocabulary import VocabularyError, validate_predicate_usage
 from loci.schema_registry.loader import SchemaRegistry
 from loci.schema_registry.validator import AttributeValidationError, validate_attributes
@@ -37,13 +38,20 @@ class UnstructuredTextAdapter(SourceAdapter):
     passive voice) by prompting a local model constrained to the live
     entity-type/predicate vocabulary, validated and retried on schema
     failure. Chunk embedding proceeds independently of extraction success —
-    semantic search isn't blocked by extraction quality."""
+    semantic search isn't blocked by extraction quality.
+
+    Raw text is first split into typed segments (see loci/ingest/structure.py)
+    so document metadata (title pages, tables of contents, license text)
+    doesn't get extracted as if it were narrative content. Only `narrative`
+    segments feed the extraction-window loop; every segment (narrative or
+    not) is still chunked and embedded, tagged with its segment type."""
 
     name = "unstructured_text"
 
     def __init__(self, settings: LociSettings):
         self.settings = settings
         self.llm_client = ExtractionLLMClient(settings.ollama, _PROMPT_PATH.read_text())
+        self._known_entities: list[dict] = []
 
     def can_handle(self, source: SourceDescriptor) -> bool:
         if source.forced_adapter:
@@ -58,22 +66,58 @@ class UnstructuredTextAdapter(SourceAdapter):
         predicates = sorted(registry.predicates)
 
         text = self._load_text(source.path)
-        windows = split_text(text, self.settings.ingest.extraction_window_tokens, overlap_tokens=0)
 
-        for window in windows:
-            entities, relationships = self._extract_window(window.text, registry, entity_types, predicates)
+        def _classify(block_text: str) -> str:
+            return classify_segment(self.settings.ollama, self.settings.ingest.segment_classifier_model, block_text)
 
+        segments = segment_document(text, classify_fn=_classify)
+        self._known_entities = []
+
+        for segment in segments:
             embed_chunks = split_text(
-                window.text, self.settings.ingest.chunk_tokens, self.settings.ingest.chunk_overlap_tokens
+                segment.text, self.settings.ingest.chunk_tokens, self.settings.ingest.chunk_overlap_tokens
             )
+            chunks = [
+                ExtractedChunk(text=c.text, token_count=c.token_count, metadata={"segment_type": segment.type})
+                for c in embed_chunks
+            ]
 
-            yield ExtractionBatch(
-                context_name=source.context_name,
-                entities=entities,
-                relationships=relationships,
-                chunks=[ExtractedChunk(text=c.text, token_count=c.token_count) for c in embed_chunks],
-                source_ref=str(source.path),
+            if segment.type != "narrative":
+                # Document metadata isn't a source of story facts — still
+                # indexed for retrieval (nothing is discarded), just not
+                # fed to entity/relationship extraction.
+                yield ExtractionBatch(
+                    context_name=source.context_name, chunks=chunks, source_ref=str(source.path)
+                )
+                continue
+
+            windows = split_text(segment.text, self.settings.ingest.extraction_window_tokens, overlap_tokens=0)
+            for window in windows:
+                entities, relationships = self._extract_window(window.text, registry, entity_types, predicates)
+                self._remember_entities(entities)
+                yield ExtractionBatch(
+                    context_name=source.context_name,
+                    entities=entities,
+                    relationships=relationships,
+                    chunks=chunks,
+                    source_ref=str(source.path),
+                )
+                chunks = []  # only attach each window's chunks to its own batch once
+
+    def _remember_entities(self, entities: list[ExtractedEntity]) -> None:
+        known_names = {e["canonical_name"] for e in self._known_entities}
+        for entity in entities:
+            if entity.canonical_name in known_names:
+                continue
+            self._known_entities.append(
+                {
+                    "local_id": entity.local_id,
+                    "type": entity.type,
+                    "canonical_name": entity.canonical_name,
+                    "aliases": entity.aliases,
+                }
             )
+            known_names.add(entity.canonical_name)
 
     def _extract_window(
         self, window_text: str, registry: SchemaRegistry, entity_types: list[str], predicates: list[str]
@@ -91,7 +135,9 @@ class UnstructuredTextAdapter(SourceAdapter):
         try:
             for attempt in retryer:
                 with attempt:
-                    raw = self.llm_client.extract(window_text, entity_types, predicates)
+                    raw = self.llm_client.extract(
+                        window_text, entity_types, predicates, known_entities=self._known_entities or None
+                    )
                     return self._validate_and_convert(raw, registry)
         except (ExtractionValidationError, httpx.HTTPError, json.JSONDecodeError) as exc:
             logger.warning("extraction failed after retries for window (len=%d chars): %s", len(window_text), exc)
@@ -124,6 +170,7 @@ class UnstructuredTextAdapter(SourceAdapter):
                     aliases=e.get("aliases") or [],
                     attributes=attributes,
                     scope=e.get("scope") or "context_local",
+                    identity_status=e.get("identity_status") or "named",
                 )
             )
             type_by_local_id[e["local_id"]] = e["type"]

@@ -101,6 +101,8 @@ class Entity(Base):
     context_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("contexts.id"), nullable=False)
     scope: Mapped[str] = mapped_column(Text, nullable=False, server_default="context_local")
     canonical_name: Mapped[str] = mapped_column(Text, nullable=False)
+    identity_status: Mapped[str] = mapped_column(Text, nullable=False, server_default="named")
+    merged_into: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("entities.id"))
     aliases: Mapped[list[str]] = mapped_column(ARRAY(Text), nullable=False, server_default="{}")
     attributes: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
     attribute_schema_version: Mapped[int] = mapped_column(Integer, nullable=False)
@@ -113,12 +115,14 @@ class Entity(Base):
 
     __table_args__ = (
         CheckConstraint("scope IN ('context_local','cross_context')", name="ck_entities_scope"),
+        CheckConstraint("identity_status IN ('named','unresolved')", name="ck_entities_identity_status"),
         ForeignKeyConstraint(
             ["type", "attribute_schema_version"],
             ["entity_type_schema_versions.entity_type", "entity_type_schema_versions.version"],
         ),
         Index("idx_entities_type_context", "type", "context_id"),
         Index("idx_entities_scope", "scope"),
+        Index("idx_entities_identity_status", "identity_status"),
         Index("idx_entities_name_trgm", "canonical_name", postgresql_using="gin", postgresql_ops={"canonical_name": "gin_trgm_ops"}),
         Index("idx_entities_attributes", "attributes", postgresql_using="gin", postgresql_ops={"attributes": "jsonb_path_ops"}),
     )

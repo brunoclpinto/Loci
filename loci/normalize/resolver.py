@@ -23,16 +23,20 @@ class EntityResolver:
             select(Entity).where(
                 Entity.type == type_name,
                 scope_filter,
+                Entity.merged_into.is_(None),
                 func.lower(Entity.canonical_name) == canonical_name.lower(),
             )
         ).first()
         if exact is not None:
             return exact
 
-        similarity = func.similarity(Entity.canonical_name, canonical_name)
+        # Case-insensitive: pg_trgm similarity() is computed on the literal
+        # character sequence, so "Sherlock Holmes" vs "SHERLOCK HOLMES"
+        # would otherwise score lower purely from casing, not meaning.
+        similarity = func.similarity(func.lower(Entity.canonical_name), canonical_name.lower())
         row = session.execute(
             select(Entity, similarity.label("sim"))
-            .where(Entity.type == type_name, scope_filter, similarity >= self.name_similarity_threshold)
+            .where(Entity.type == type_name, scope_filter, Entity.merged_into.is_(None), similarity >= self.name_similarity_threshold)
             .order_by(similarity.desc())
             .limit(1)
         ).first()
@@ -49,8 +53,10 @@ class EntityResolver:
         """Ranked fuzzy-name candidates, for disambiguation callers (e.g. the
         MCP resolve_entity tool) rather than the create-or-match ingestion
         path. context_id may be None to search across all contexts."""
-        similarity = func.similarity(Entity.canonical_name, canonical_name)
-        stmt = select(Entity, similarity.label("sim")).where(similarity >= self.name_similarity_threshold)
+        similarity = func.similarity(func.lower(Entity.canonical_name), canonical_name.lower())
+        stmt = select(Entity, similarity.label("sim")).where(
+            similarity >= self.name_similarity_threshold, Entity.merged_into.is_(None)
+        )
         if type_name is not None:
             stmt = stmt.where(Entity.type == type_name)
         if context_id is not None:

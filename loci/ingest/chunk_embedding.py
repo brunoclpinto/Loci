@@ -57,6 +57,7 @@ class QdrantChunkEmbedder:
                         "source_adapter": source_adapter,
                         "source_ref": source_ref,
                         "text": chunk.text,
+                        "segment_type": chunk.metadata.get("segment_type", "narrative"),
                     },
                 )
             )

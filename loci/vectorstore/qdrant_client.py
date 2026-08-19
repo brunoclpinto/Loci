@@ -50,17 +50,19 @@ class VectorStore:
         query_vector: list[float],
         top_k: int,
         context_ids: list[uuid.UUID] | None = None,
+        segment_types: list[str] | None = None,
     ) -> list[qmodels.ScoredPoint]:
         name = collection_name_for_model(embedding_model_version)
         if not self._client.collection_exists(name):
             return []
         if context_ids is not None and len(context_ids) == 0:
             return []
-        query_filter = None
+        must: list[qmodels.FieldCondition] = []
         if context_ids is not None:
-            query_filter = qmodels.Filter(
-                must=[qmodels.FieldCondition(key="context_id", match=qmodels.MatchAny(any=[str(c) for c in context_ids]))]
-            )
+            must.append(qmodels.FieldCondition(key="context_id", match=qmodels.MatchAny(any=[str(c) for c in context_ids])))
+        if segment_types is not None:
+            must.append(qmodels.FieldCondition(key="segment_type", match=qmodels.MatchAny(any=segment_types)))
+        query_filter = qmodels.Filter(must=must) if must else None
         result = self._client.query_points(
             collection_name=name, query=query_vector, limit=top_k, query_filter=query_filter, with_payload=True
         )

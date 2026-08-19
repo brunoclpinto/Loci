@@ -43,6 +43,8 @@ chunk_overlap_tokens      = 64
 extraction_window_tokens  = 2500   # larger window given to the LLM for entity/relationship extraction
 embed_batch               = 16
 extraction_json_retries   = 5
+segment_classifier_model  = "qwen2.5:7b-instruct"  # fast model for front/back-matter classification, independent of the extraction model
+coreference_model         = "qwen2.5:7b-instruct"  # fast model for the deferred unresolved-entity resolution pass
 
 [logging]
 level = "INFO"
