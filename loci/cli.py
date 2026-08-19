@@ -21,6 +21,8 @@ from loci.normalize.resolver import EntityResolver
 app = typer.Typer(help="Loci — a strictly-organized, mixed-source knowledge base for LLMs.")
 registry_app = typer.Typer(help="Inspect the entity-type / predicate schema registry.")
 app.add_typer(registry_app, name="registry")
+bench_app = typer.Typer(help="Multi-model bench harness (see benchWork/ for corpus/QnA data, gitignored).")
+app.add_typer(bench_app, name="bench")
 
 console = Console()
 
@@ -142,6 +144,114 @@ def ingest(
     pipeline = IngestionPipeline(settings, resolver, chunk_embedder=chunk_embedder)
     stats = pipeline.ingest(adapter_impl, descriptor)
     console.print(f"[green]Ingested[/green]: {stats}")
+
+
+@bench_app.command("ingest")
+def bench_ingest(
+    extraction_model: str = typer.Option(None, "--extraction-model", help="Ollama tag; defaults to [bench].default_extraction_model."),
+    qna: str = typer.Option(None, "--qna", help="QnA filename under [bench].qna_dir; defaults to [bench].qna_file."),
+) -> None:
+    """Ingest the book(s) referenced by a QnA set using the given extraction model, into a context namespaced by (book, model)."""
+    from loci.bench.ids import ingest_run_id
+    from loci.bench.ingest_phase import run_ingest_phase
+    from loci.bench.logs import run_dir, write_json
+
+    settings = load_settings()
+    extraction_model = extraction_model or settings.bench.default_extraction_model
+    qna = qna or settings.bench.qna_file
+
+    result = run_ingest_phase(settings, extraction_model, qna)
+
+    rid = ingest_run_id(qna, extraction_model)
+    log_dir = run_dir(Path(settings.bench.log_dir), rid)
+    write_json(log_dir / "ingest.json", result)
+    console.print(f"[green]Ingest phase complete[/green] ({rid}): {result['duration_s']:.1f}s, books={result['books']}")
+
+
+@bench_app.command("qa")
+def bench_qa(
+    extraction_model: str = typer.Option(None, "--extraction-model", help="Which ingested context to retrieve from."),
+    answer_model: str = typer.Option(None, "--answer-model", help="Ollama tag; defaults to [bench].default_answer_model."),
+    qna: str = typer.Option(None, "--qna", help="QnA filename under [bench].qna_dir."),
+) -> None:
+    """Answer every question in a QnA set, retrieving from the context(s) already ingested for the given extraction model."""
+    from loci.bench.ids import run_id as compute_run_id
+    from loci.bench.logs import run_dir, write_jsonl
+    from loci.bench.qa_phase import run_qa_phase
+
+    settings = load_settings()
+    extraction_model = extraction_model or settings.bench.default_extraction_model
+    answer_model = answer_model or settings.bench.default_answer_model
+    qna = qna or settings.bench.qna_file
+
+    result = run_qa_phase(settings, extraction_model, answer_model, qna)
+
+    rid = compute_run_id(qna, extraction_model, answer_model)
+    log_dir = run_dir(Path(settings.bench.log_dir), rid)
+    write_jsonl(log_dir / "retrieval_generation.jsonl", result["rows"])
+    console.print(f"[green]QA phase complete[/green] ({rid}): {len(result['rows'])} questions in {result['duration_s']:.1f}s")
+
+
+@bench_app.command("grade")
+def bench_grade(
+    extraction_model: str = typer.Option(None, "--extraction-model"),
+    answer_model: str = typer.Option(None, "--answer-model"),
+    qna: str = typer.Option(None, "--qna"),
+) -> None:
+    """Grade a completed QA phase's answers against ground truth via a single Claude Code CLI call (0-100 per question)."""
+    from loci.bench.grading import grade_qa_rows
+    from loci.bench.ids import run_id as compute_run_id
+    from loci.bench.logs import read_jsonl, run_dir, write_json
+
+    settings = load_settings()
+    extraction_model = extraction_model or settings.bench.default_extraction_model
+    answer_model = answer_model or settings.bench.default_answer_model
+    qna = qna or settings.bench.qna_file
+
+    rid = compute_run_id(qna, extraction_model, answer_model)
+    log_dir = run_dir(Path(settings.bench.log_dir), rid)
+    qa_rows = read_jsonl(log_dir / "retrieval_generation.jsonl")
+    if not qa_rows:
+        console.print(f"[red]No QA rows found for run {rid} — run `loci bench qa` first.[/red]")
+        raise typer.Exit(code=1)
+
+    result = grade_qa_rows(qa_rows)
+    write_json(log_dir / "grading.json", result)
+    console.print(f"[green]Grading complete[/green] ({rid}): mean score {result['mean_score']:.1f}")
+
+
+@bench_app.command("report")
+def bench_report(
+    extraction_model: str = typer.Option(None, "--extraction-model"),
+    answer_model: str = typer.Option(None, "--answer-model"),
+    qna: str = typer.Option(None, "--qna"),
+) -> None:
+    """Build this run's summary.json from its ingest/qa/grading logs, then print the leaderboard across all runs."""
+    from loci.bench.ids import ingest_run_id
+    from loci.bench.ids import run_id as compute_run_id
+    from loci.bench.logs import read_json, read_jsonl, run_dir, write_json
+    from loci.bench.report import build_summary, load_leaderboard, render_table
+
+    settings = load_settings()
+    extraction_model = extraction_model or settings.bench.default_extraction_model
+    answer_model = answer_model or settings.bench.default_answer_model
+    qna = qna or settings.bench.qna_file
+
+    rid = compute_run_id(qna, extraction_model, answer_model)
+    log_dir = run_dir(Path(settings.bench.log_dir), rid)
+    ingest_dir = run_dir(Path(settings.bench.log_dir), ingest_run_id(qna, extraction_model))
+
+    ingest_result = read_json(ingest_dir / "ingest.json")
+    qa_rows = read_jsonl(log_dir / "retrieval_generation.jsonl")
+    grading_result = read_json(log_dir / "grading.json")
+
+    summary = build_summary(
+        settings, rid, extraction_model, answer_model, qna, ingest_result, {"rows": qa_rows}, grading_result
+    )
+    write_json(log_dir / "summary.json", summary)
+
+    leaderboard = load_leaderboard(settings)
+    console.print(render_table(leaderboard))
 
 
 @app.command()

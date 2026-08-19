@@ -70,6 +70,30 @@ class LoggingSettings(BaseModel):
     jsonl: bool = True
 
 
+class BenchWeights(BaseModel):
+    """Composite-score weights. Kept config-driven (not hardcoded) since the
+    right balance between answer quality and resource cost is a judgment
+    call that will change as models get trimmed down."""
+
+    answer_quality: float = 0.6
+    ingest_time: float = 0.1
+    retrieval_time: float = 0.1
+    knowledge_space: float = 0.05
+    ram: float = 0.075
+    vram: float = 0.075
+
+
+class BenchSettings(BaseModel):
+    corpus_dir: str = "benchWork/raw"
+    qna_dir: str = "benchWork/bench"
+    qna_file: str = "qna_scarlet.json"
+    log_dir: str = "benchWork/logs"
+    default_extraction_model: str = "deepseek-r1:32b"
+    default_answer_model: str = "phi4-mini"
+    sample_interval_s: float = 5.0
+    weights: BenchWeights = BenchWeights()
+
+
 def _config_file_path() -> Path | None:
     env_path = os.environ.get("LOCI_CONFIG_FILE")
     if env_path:
@@ -93,6 +117,7 @@ class LociSettings(BaseSettings):
     resolver: ResolverSettings = ResolverSettings()
     ingest: IngestSettings = IngestSettings()
     logging: LoggingSettings = LoggingSettings()
+    bench: BenchSettings = BenchSettings()
 
     @classmethod
     def settings_customise_sources(

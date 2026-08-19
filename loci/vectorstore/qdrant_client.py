@@ -38,6 +38,12 @@ class VectorStore:
             ],
         )
 
+    def collection_info(self, embedding_model_version: str) -> qmodels.CollectionInfo | None:
+        name = collection_name_for_model(embedding_model_version)
+        if not self._client.collection_exists(name):
+            return None
+        return self._client.get_collection(name)
+
     def search(
         self,
         embedding_model_version: str,

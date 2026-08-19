@@ -24,6 +24,45 @@ def _chunk_hit_from_point(session: Session, point: qmodels.ScoredPoint) -> Chunk
     )
 
 
+def run_search(
+    settings: LociSettings,
+    session: Session,
+    query: str,
+    context_names: list[str] | None = None,
+    include_descendants: bool = False,
+    entity_types: list[str] | None = None,
+    top_k: int = 10,
+    embedding_client: EmbeddingClient | None = None,
+    vector_store: VectorStore | None = None,
+) -> SearchResult:
+    """The actual retrieval logic, as a plain function over an existing
+    session — reused by both the search_knowledge MCP tool and the bench
+    harness (loci/bench/answer.py), so bench results reflect the real
+    product's retrieval, not a parallel reimplementation. Callers that will
+    issue many queries should build their own EmbeddingClient/VectorStore
+    once and pass them in rather than let this construct fresh ones per call."""
+    embedding_client = embedding_client or EmbeddingClient(settings.ollama)
+    vector_store = vector_store or VectorStore(settings.qdrant)
+
+    context_ids = resolve_context_ids(session, context_names, include_descendants)
+
+    query_vector = embedding_client.embed_one(query)
+    points = vector_store.search(settings.ollama.embedding_model, query_vector, top_k, context_ids=context_ids)
+    chunk_hits = [_chunk_hit_from_point(session, p) for p in points]
+
+    entity_stmt = select(Entity).where(
+        or_(func.similarity(Entity.canonical_name, query) > 0.2, Entity.canonical_name.ilike(f"%{query}%"))
+    )
+    if entity_types:
+        entity_stmt = entity_stmt.where(Entity.type.in_(entity_types))
+    if context_ids is not None:
+        entity_stmt = entity_stmt.where(or_(Entity.context_id.in_(context_ids), Entity.scope == "cross_context"))
+    entity_stmt = entity_stmt.limit(top_k)
+    entity_hits: list[EntitySummary] = [to_entity_summary(session, e) for e in session.scalars(entity_stmt)]
+
+    return SearchResult(chunk_hits=chunk_hits, entity_hits=entity_hits)
+
+
 def make_search_knowledge(settings: LociSettings):
     embedding_client = EmbeddingClient(settings.ollama)
     vector_store = VectorStore(settings.qdrant)
@@ -41,24 +80,16 @@ def make_search_knowledge(settings: LociSettings):
         context. Restrict `context_names` to scope results to specific
         contexts (e.g. a particular book or a "real_world" context)."""
         with session_scope(settings) as session:
-            context_ids = resolve_context_ids(session, context_names, include_descendants)
-
-            query_vector = embedding_client.embed_one(query)
-            points = vector_store.search(settings.ollama.embedding_model, query_vector, top_k, context_ids=context_ids)
-            chunk_hits = [_chunk_hit_from_point(session, p) for p in points]
-
-            entity_stmt = select(Entity).where(
-                or_(func.similarity(Entity.canonical_name, query) > 0.2, Entity.canonical_name.ilike(f"%{query}%"))
+            return run_search(
+                settings,
+                session,
+                query,
+                context_names=context_names,
+                include_descendants=include_descendants,
+                entity_types=entity_types,
+                top_k=top_k,
+                embedding_client=embedding_client,
+                vector_store=vector_store,
             )
-            if entity_types:
-                entity_stmt = entity_stmt.where(Entity.type.in_(entity_types))
-            if context_ids is not None:
-                entity_stmt = entity_stmt.where(
-                    or_(Entity.context_id.in_(context_ids), Entity.scope == "cross_context")
-                )
-            entity_stmt = entity_stmt.limit(top_k)
-            entity_hits: list[EntitySummary] = [to_entity_summary(session, e) for e in session.scalars(entity_stmt)]
-
-            return SearchResult(chunk_hits=chunk_hits, entity_hits=entity_hits)
 
     return search_knowledge

@@ -216,3 +216,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Loci bench R&D — raw corpus, QnA sets, and bench run logs/results stay local
+benchWork/

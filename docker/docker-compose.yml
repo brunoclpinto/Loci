@@ -84,6 +84,11 @@ services:
       LOCI_OLLAMA__PORT: 11434
       LOCI_MCP__HOST: 0.0.0.0
       LOCI_MCP__PORT: 8000
+      LOCI_BENCH__CORPUS_DIR: /benchWork/raw
+      LOCI_BENCH__QNA_DIR: /benchWork/bench
+      LOCI_BENCH__LOG_DIR: /benchWork/logs
+    volumes:
+      - ../benchWork:/benchWork
     command: ["serve"]
     ports:
       - "8000:8000"

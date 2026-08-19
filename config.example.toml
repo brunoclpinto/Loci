@@ -47,3 +47,21 @@ extraction_json_retries   = 5
 [logging]
 level = "INFO"
 jsonl = true
+
+[bench]
+corpus_dir                = "benchWork/raw"    # raw books, gitignored R&D-only material
+qna_dir                   = "benchWork/bench"  # ground-truth QnA sets
+qna_file                  = "qna_scarlet.json" # default QnA set for a bench run
+log_dir                   = "benchWork/logs"   # per-run JSONL logs + summary.json
+default_extraction_model  = "deepseek-r1:32b"  # overridable per run with --extraction-model
+default_answer_model      = "phi4-mini"        # overridable per run with --answer-model
+sample_interval_s         = 5.0                # docker stats / nvidia-smi polling interval
+
+[bench.weights]
+# Composite-score weights — must not need to sum to 1, report.py normalizes.
+answer_quality  = 0.6
+ingest_time     = 0.1
+retrieval_time  = 0.1
+knowledge_space = 0.05
+ram             = 0.075
+vram            = 0.075
