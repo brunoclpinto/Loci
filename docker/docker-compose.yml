@@ -1,0 +1,94 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: ${LOCI_DATABASE__DBNAME:-loci}
+      POSTGRES_USER: ${LOCI_DATABASE__USER:-loci}
+      POSTGRES_PASSWORD: ${LOCI_DATABASE__PASSWORD:?set LOCI_DATABASE__PASSWORD in .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${LOCI_DATABASE__USER:-loci}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    volumes:
+      - qdrantdata:/qdrant/storage
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/localhost/6333'"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  ollama:
+    image: ollama/ollama:latest
+    volumes:
+      - ollamadata:/root/.ollama
+    ports:
+      - "11434:11434"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/localhost/11434'"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  ollama-init:
+    image: ollama/ollama:latest
+    depends_on:
+      ollama:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        ollama pull ${LOCI_OLLAMA__CHAT_MODEL:-qwen2.5:7b-instruct} &&
+        ollama pull ${LOCI_OLLAMA__EMBEDDING_MODEL:-nomic-embed-text}
+    environment:
+      OLLAMA_HOST: ollama:11434
+    restart: "no"
+
+  app:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+      ollama-init:
+        condition: service_completed_successfully
+    environment:
+      LOCI_DATABASE__HOST: postgres
+      LOCI_DATABASE__PORT: 5432
+      LOCI_DATABASE__USER: ${LOCI_DATABASE__USER:-loci}
+      LOCI_DATABASE__PASSWORD: ${LOCI_DATABASE__PASSWORD:?set LOCI_DATABASE__PASSWORD in .env}
+      LOCI_DATABASE__DBNAME: ${LOCI_DATABASE__DBNAME:-loci}
+      LOCI_QDRANT__HOST: qdrant
+      LOCI_QDRANT__PORT: 6333
+      LOCI_OLLAMA__HOST: ollama
+      LOCI_OLLAMA__PORT: 11434
+      LOCI_MCP__HOST: 0.0.0.0
+      LOCI_MCP__PORT: 8000
+    command: ["serve"]
+    ports:
+      - "8000:8000"
+
+volumes:
+  pgdata: {}
+  qdrantdata: {}
+  ollamadata: {}

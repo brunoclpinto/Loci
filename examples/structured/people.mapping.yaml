@@ -1,0 +1,10 @@
+entity_type: Person
+canonical_name_column: full_name
+attributes:
+  birth_year: {column: born, type: integer}
+  occupation: {column: role, type: string}
+relationships:
+  - predicate: works_for
+    target_type: Organization
+    target_column: employer
+context: real_world

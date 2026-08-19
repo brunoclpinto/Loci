@@ -1,0 +1,13 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Organization.attributes.v1",
+  "type": "object",
+  "properties": {
+    "founded_date": {"type": "string"},
+    "dissolved_date": {"type": "string"},
+    "industry": {"type": "string"},
+    "headquarters": {"type": "string"},
+    "description": {"type": "string"}
+  },
+  "additionalProperties": true
+}
