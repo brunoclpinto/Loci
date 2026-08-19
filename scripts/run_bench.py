@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
 """Host-side bench orchestrator — stdlib only, no project install required.
 
-Sequences the four `loci bench <phase>` commands via `docker compose run`
-(so the real, fully-dependency-installed pipeline runs containerized as
-always) while polling `docker stats` (per-container RAM) and `nvidia-smi`
-(VRAM) from the host in parallel, since neither is easily available from
-inside a container without extra plumbing (Docker socket passthrough, GPU
-device access on a second service). Samples are written to
+Sequences ingest -> qa -> grade -> report via `docker compose run` (so the
+real, fully-dependency-installed pipeline runs containerized as always)
+while polling `docker stats` (per-container RAM) and `nvidia-smi` (VRAM)
+from the host in parallel, since neither is easily available from inside a
+container without extra plumbing (Docker socket passthrough, GPU device
+access on a second service). Samples are written to
 benchWork/logs/<run_id>/resources.jsonl, which `loci bench report` (running
 in-container) reads back to compute peak RAM/VRAM for the summary.
 
-NOT executed as part of building this harness — verify by hand once
-reviewed. Any (--extraction-model, --answer-model) pair is valid; nothing
-here hardcodes a pairing.
+Grading is the one phase that runs on the HOST, not in-container — it needs
+the `claude` CLI, which isn't installed in the app image. benchWork/logs is
+a real host directory (bind-mounted into the container), so this reads the
+qa phase's JSONL and writes grading.json directly.
+
+Any (--extraction-model, --answer-model) pair is valid; nothing here
+hardcodes a pairing.
 
 Usage:
     python3 scripts/run_bench.py --extraction-model deepseek-r1:32b \\
@@ -31,6 +35,14 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DOCKER_DIR = REPO_ROOT / "docker"
 BENCH_WORK = REPO_ROOT / "benchWork"
+
+# loci/bench/grading.py and loci/bench/logs.py are pure-stdlib (no
+# sqlalchemy/pydantic/etc.), so they're safely importable here even though
+# nothing else in the loci package is installed on the host — this reuses
+# the exact same grading logic rather than duplicating it.
+sys.path.insert(0, str(REPO_ROOT))
+from loci.bench.grading import grade_qa_rows  # noqa: E402
+from loci.bench.logs import read_jsonl, write_json  # noqa: E402
 
 SERVICES = ["postgres", "qdrant", "ollama", "app"]
 
@@ -149,11 +161,27 @@ def main() -> None:
     try:
         run_phase("ingest", "--extraction-model", args.extraction_model, "--qna", args.qna)
         run_phase("qa", "--extraction-model", args.extraction_model, "--answer-model", args.answer_model, "--qna", args.qna)
-        run_phase("grade", "--extraction-model", args.extraction_model, "--answer-model", args.answer_model, "--qna", args.qna)
+        grade_on_host(rid)
         run_phase("report", "--extraction-model", args.extraction_model, "--answer-model", args.answer_model, "--qna", args.qna)
     finally:
         stop_event.set()
         sampler.join(timeout=args.sample_interval + 5)
+
+
+def grade_on_host(rid: str) -> None:
+    """Grading needs the `claude` CLI, which lives on the host, not in the
+    app container's image — running it via `docker compose run` (like the
+    other phases) fails with FileNotFoundError. benchWork/logs is a real
+    host directory (bind-mounted into the container), so we can read the
+    qa phase's JSONL and write grading.json directly here instead."""
+    run_dir = BENCH_WORK / "logs" / rid
+    qa_rows = read_jsonl(run_dir / "retrieval_generation.jsonl")
+    if not qa_rows:
+        raise SystemExit(f"No QA rows found at {run_dir / 'retrieval_generation.jsonl'} — did the qa phase run?")
+    print(f"Grading {len(qa_rows)} answers via `claude -p` (single call)...", flush=True)
+    result = grade_qa_rows(qa_rows)
+    write_json(run_dir / "grading.json", result)
+    print(f"Grading complete: mean score {result['mean_score']:.1f}", flush=True)
 
     print(f"\nDone. Run id: {rid}")
     print(f"Logs: {BENCH_WORK / 'logs' / rid}")

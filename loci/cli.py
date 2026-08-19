@@ -198,7 +198,11 @@ def bench_grade(
     answer_model: str = typer.Option(None, "--answer-model"),
     qna: str = typer.Option(None, "--qna"),
 ) -> None:
-    """Grade a completed QA phase's answers against ground truth via a single Claude Code CLI call (0-100 per question)."""
+    """Grade a completed QA phase's answers against ground truth via a single Claude Code CLI call (0-100 per question).
+
+    Note: this needs the `claude` binary, which isn't installed in the app
+    image — scripts/run_bench.py grades on the HOST instead. This command
+    is here for completeness (e.g. if `claude` is ever added to the image)."""
     from loci.bench.grading import grade_qa_rows
     from loci.bench.ids import run_id as compute_run_id
     from loci.bench.logs import read_jsonl, run_dir, write_json

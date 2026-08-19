@@ -1,7 +1,9 @@
+import json
 import logging
 from collections.abc import Iterable
 from pathlib import Path
 
+import httpx
 import tenacity
 
 from loci.chunking.splitter import split_text
@@ -83,7 +85,7 @@ class UnstructuredTextAdapter(SourceAdapter):
         # discarding an entire window's worth of otherwise-good extraction.
         retryer = tenacity.Retrying(
             stop=tenacity.stop_after_attempt(self.settings.ingest.extraction_json_retries),
-            retry=tenacity.retry_if_exception_type(ExtractionValidationError),
+            retry=tenacity.retry_if_exception_type((ExtractionValidationError, httpx.HTTPError, json.JSONDecodeError)),
             reraise=True,
         )
         try:
@@ -91,7 +93,7 @@ class UnstructuredTextAdapter(SourceAdapter):
                 with attempt:
                     raw = self.llm_client.extract(window_text, entity_types, predicates)
                     return self._validate_and_convert(raw, registry)
-        except ExtractionValidationError as exc:
+        except (ExtractionValidationError, httpx.HTTPError, json.JSONDecodeError) as exc:
             logger.warning("extraction failed after retries for window (len=%d chars): %s", len(window_text), exc)
             return [], []
         return [], []

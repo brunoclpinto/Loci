@@ -69,7 +69,16 @@ class ExtractionLLMClient:
                     {"role": "user", "content": user_content},
                 ],
                 "format": _extraction_response_schema(entity_types, predicates),
-                "options": {"temperature": 0, "repeat_penalty": 1.3, "num_predict": 1024},
+                # num_predict is a runaway-generation safety net, not a token
+                # budget — this is local inference, so there's no per-token
+                # cost to economize. It must be generous enough that
+                # reasoning models (which spend real tokens on <think>
+                # before ever reaching `content`) can actually finish: 1024
+                # was cutting deepseek-r1:32b off mid-thought with empty
+                # content every time. 16384 leaves headroom while still
+                # bounding truly pathological loops (the failure mode this
+                # guards against, first hit with qwen2.5:7b-instruct).
+                "options": {"temperature": 0, "repeat_penalty": 1.3, "num_predict": 16384, "num_ctx": 32768},
             },
             timeout=self.settings.request_timeout_s,
         )

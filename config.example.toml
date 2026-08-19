@@ -23,7 +23,7 @@ host             = "localhost"
 port             = 11434
 chat_model       = "qwen2.5:7b-instruct"   # used for entity/relationship extraction
 embedding_model  = "nomic-embed-text"      # used for chunk + resolver embeddings
-request_timeout_s = 120
+request_timeout_s = 900   # generous — heavy/CPU-offloaded bench models (e.g. deepseek-r1:32b) can be slow
 
 [mcp]
 host      = "0.0.0.0"

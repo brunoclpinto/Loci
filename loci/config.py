@@ -35,7 +35,7 @@ class OllamaSettings(BaseModel):
     port: int = 11434
     chat_model: str = "qwen2.5:7b-instruct"
     embedding_model: str = "nomic-embed-text"
-    request_timeout_s: int = 120
+    request_timeout_s: int = 900
 
     @property
     def base_url(self) -> str:
