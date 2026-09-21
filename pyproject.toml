@@ -1,22 +1,23 @@
 [project]
 name = "loci"
 version = "0.1.0"
-description = "Low-RAM Local RAG with Structured Knowledge on SSD"
+description = "A strictly-organized, mixed-source knowledge base that supplies structured knowledge to LLMs over MCP"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "typer[all]>=0.12",
     "rich>=13",
-    "sqlite-vec>=0.1",
-    "psutil>=5.9",
-    "spacy>=3.7",
-    # llama-cpp-python requires cmake and compiles from source on macOS.
-    # Install separately once cmake is available:
-    #   brew install cmake
-    #   CMAKE_ARGS="-DGGML_METAL=on" uv add llama-cpp-python
-    # Kept out of the standard dependency list to avoid blocking uv sync.
-    "click>=8.4.1",
-    "llama-cpp-python>=0.3.28",
+    "sqlalchemy>=2",
+    "psycopg[binary]>=3",
+    "alembic>=1.13",
+    "qdrant-client>=1.9",
+    "pydantic>=2",
+    "pydantic-settings>=2",
+    "jsonschema>=4.21",
+    "httpx>=0.27",
+    "tenacity>=8.2",
+    "mcp>=1.0",
+    "pyyaml>=6.0",
 ]
 
 [project.scripts]
@@ -30,8 +31,7 @@ build-backend = "hatchling.build"
 testpaths = ["tests"]
 
 [project.optional-dependencies]
-pdf  = ["pypdf>=4.0"]
-epub = ["ebooklib>=0.18"]
+pdf = ["pypdf>=4.0"]
 
 [dependency-groups]
 dev = [

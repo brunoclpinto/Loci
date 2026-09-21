@@ -1,0 +1,4 @@
+Ada Lovelace was a mathematician. She worked with Charles Babbage on the
+Analytical Engine, a mechanical general-purpose computer. Babbage designed
+the machine, and Lovelace wrote what is considered the first algorithm
+intended to be carried out by it.
