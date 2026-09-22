@@ -99,10 +99,13 @@ class BenchSettings(BaseModel):
     qna_dir: str = "benchWork/bench"
     qna_file: str = "qna_scarlet.json"
     log_dir: str = "benchWork/logs"
-    # deepseek-r1:14b: ~2.5-4x faster to ingest than 32b on this hardware
-    # (32b CPU-offloads, ~4.7 tok/s vs 14b's ~36-40 tok/s), and the two-pass
-    # extraction fix closed the quality gap that used to favor 32b.
-    default_extraction_model: str = "deepseek-r1:14b"
+    # qwen2.5:14b-instruct beat deepseek-r1:14b outright as an extraction
+    # model too: a full 2x2 matrix against every answer-model pairing showed
+    # it winning independently in both roles (85.0 vs 59.5 quality on the
+    # same-model pairing), while ingesting ~26x faster (505s vs 13347s) with
+    # a comparable relationship yield (256 vs 279) and zero stale-id
+    # warnings on either model.
+    default_extraction_model: str = "qwen2.5:14b-instruct"
     # qwen2.5:14b-instruct beat gemma4:26b outright on this hardware (higher
     # quality score, zero empty answers vs 5/100, ~5x faster) — gemma4:26b
     # was too large to share this GPU's VRAM with the embedding model
