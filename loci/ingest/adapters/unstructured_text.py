@@ -6,6 +6,7 @@ from pathlib import Path
 import httpx
 import tenacity
 
+from loci.chunking.paragraph_grouping import group_paragraphs
 from loci.chunking.splitter import split_text
 from loci.config import LociSettings
 from loci.db.engine import session_scope
@@ -17,19 +18,15 @@ from loci.ingest.base import (
     SourceAdapter,
     SourceDescriptor,
 )
-from loci.ingest.structure import segment_document
-from loci.llm.client import ExtractionLLMClient, classify_segment
+from loci.ingest.entity_reference import build_name_lookup, resolve_relationship_endpoint
+from loci.ingest.entity_registry import EntityRegistry
+from loci.ingest.structure import Segment, segment_document
+from loci.llm.client import classify_segment, discover_entities, extract_relationships
 from loci.normalize.vocabulary import VocabularyError, validate_predicate_usage
 from loci.schema_registry.loader import SchemaRegistry
 from loci.schema_registry.validator import AttributeValidationError, validate_attributes
 
 logger = logging.getLogger(__name__)
-
-_PROMPT_PATH = Path(__file__).resolve().parents[2] / "llm" / "prompts" / "extract_entities_relationships.md"
-
-
-class ExtractionValidationError(ValueError):
-    pass
 
 
 class UnstructuredTextAdapter(SourceAdapter):
@@ -43,15 +40,33 @@ class UnstructuredTextAdapter(SourceAdapter):
     Raw text is first split into typed segments (see loci/ingest/structure.py)
     so document metadata (title pages, tables of contents, license text)
     doesn't get extracted as if it were narrative content. Only `narrative`
-    segments feed the extraction-window loop; every segment (narrative or
-    not) is still chunked and embedded, tagged with its segment type."""
+    segments feed extraction; every segment (narrative or not) is still
+    chunked and embedded, tagged with its segment type.
+
+    Extraction is two full sequential passes over the document rather than
+    one combined pass per window:
+
+    1. Entity discovery, at window granularity (~2500 words), building one
+       complete, permanently-id'd EntityRegistry as it walks every narrative
+       segment in order.
+    2. Relationship extraction, at finer paragraph-grouped granularity, over
+       the same narrative segments, referencing only the now-frozen
+       registry. subject_id/object_id are JSON-schema enum-constrained to
+       the live registry, and resolve_relationship_endpoint (also used by
+       any endpoint that still slips through slightly malformed) resolves
+       the rest.
+
+    This structurally prevents the single-pass design's stale-local_id
+    relationship drops (a relationship could reference a known entity's
+    hint id from an earlier window, which had no guaranteed relationship to
+    the *current* window's own id namespace): relationships are now never
+    extracted before every entity they could reference already has a
+    permanent id, so there's no separate id namespace to go stale against."""
 
     name = "unstructured_text"
 
     def __init__(self, settings: LociSettings):
         self.settings = settings
-        self.llm_client = ExtractionLLMClient(settings.ollama, _PROMPT_PATH.read_text())
-        self._known_entities: list[dict] = []
 
     def can_handle(self, source: SourceDescriptor) -> bool:
         if source.forced_adapter:
@@ -71,8 +86,13 @@ class UnstructuredTextAdapter(SourceAdapter):
             return classify_segment(self.settings.ollama, self.settings.ingest.segment_classifier_model, block_text)
 
         segments = segment_document(text, classify_fn=_classify)
-        self._known_entities = []
 
+        entity_registry = EntityRegistry()
+        narrative_segments: list[Segment] = []
+
+        # Pass 1: entity discovery. Non-narrative segments are chunked and
+        # embedded here (unchanged from the old single-pass design) but
+        # never fed to extraction at all.
         for segment in segments:
             embed_chunks = split_text(
                 segment.text, self.settings.ingest.chunk_tokens, self.settings.ingest.chunk_overlap_tokens
@@ -83,78 +103,70 @@ class UnstructuredTextAdapter(SourceAdapter):
             ]
 
             if segment.type != "narrative":
-                # Document metadata isn't a source of story facts — still
-                # indexed for retrieval (nothing is discarded), just not
-                # fed to entity/relationship extraction.
-                yield ExtractionBatch(
-                    context_name=source.context_name, chunks=chunks, source_ref=str(source.path)
-                )
+                yield ExtractionBatch(context_name=source.context_name, chunks=chunks, source_ref=str(source.path))
                 continue
 
+            narrative_segments.append(segment)
             windows = split_text(segment.text, self.settings.ingest.extraction_window_tokens, overlap_tokens=0)
             for window in windows:
-                entities, relationships = self._extract_window(window.text, registry, entity_types, predicates)
-                self._remember_entities(entities)
+                new_entities = self._discover_window(window.text, registry, entity_types, entity_registry)
                 yield ExtractionBatch(
                     context_name=source.context_name,
-                    entities=entities,
-                    relationships=relationships,
+                    entities=new_entities,
                     chunks=chunks,
                     source_ref=str(source.path),
                 )
                 chunks = []  # only attach each window's chunks to its own batch once
 
-    def _remember_entities(self, entities: list[ExtractedEntity]) -> None:
-        known_names = {e["canonical_name"] for e in self._known_entities}
-        for entity in entities:
-            if entity.canonical_name in known_names:
-                continue
-            self._known_entities.append(
-                {
-                    "local_id": entity.local_id,
-                    "type": entity.type,
-                    "canonical_name": entity.canonical_name,
-                    "aliases": entity.aliases,
-                }
-            )
-            known_names.add(entity.canonical_name)
+        # Pass 2: relationship extraction, now that every entity the
+        # document contains already has a permanent registry id. Skipped
+        # entirely if discovery found nothing to relate.
+        if not entity_registry.as_hint_list():
+            return
 
-    def _extract_window(
-        self, window_text: str, registry: SchemaRegistry, entity_types: list[str], predicates: list[str]
-    ) -> tuple[list[ExtractedEntity], list[ExtractedRelationship]]:
-        # Retries only cover genuinely broken responses (bad JSON, HTTP
-        # errors) — an LLM extraction is inherently imperfect, so individual
-        # bad items (a dangling relationship reference, an invalid
-        # attribute) are skipped in _validate_and_convert rather than
-        # discarding an entire window's worth of otherwise-good extraction.
+        for segment in narrative_segments:
+            units = group_paragraphs(segment.paragraphs, self.settings.ingest.relationship_unit_tokens)
+            for unit in units:
+                relationships, referenced_entities = self._extract_relationships_unit(
+                    unit.text, registry, predicates, entity_registry
+                )
+                if not relationships:
+                    continue
+                yield ExtractionBatch(
+                    context_name=source.context_name,
+                    entities=referenced_entities,
+                    relationships=relationships,
+                    source_ref=str(source.path),
+                )
+
+    def _discover_window(
+        self, window_text: str, registry: SchemaRegistry, entity_types: list[str], entity_registry: EntityRegistry
+    ) -> list[ExtractedEntity]:
         retryer = tenacity.Retrying(
             stop=tenacity.stop_after_attempt(self.settings.ingest.extraction_json_retries),
-            retry=tenacity.retry_if_exception_type((ExtractionValidationError, httpx.HTTPError, json.JSONDecodeError)),
+            retry=tenacity.retry_if_exception_type((httpx.HTTPError, json.JSONDecodeError)),
             reraise=True,
         )
         try:
             for attempt in retryer:
                 with attempt:
-                    raw = self.llm_client.extract(
-                        window_text, entity_types, predicates, known_entities=self._known_entities or None
+                    raw_entities = discover_entities(
+                        self.settings.ollama,
+                        self.settings.ollama.chat_model,
+                        window_text,
+                        entity_types,
+                        known_entities=entity_registry.as_hint_list() or None,
                     )
-                    return self._validate_and_convert(raw, registry)
-        except (ExtractionValidationError, httpx.HTTPError, json.JSONDecodeError) as exc:
-            logger.warning("extraction failed after retries for window (len=%d chars): %s", len(window_text), exc)
-            return [], []
-        return [], []
+                    return self._register_discovered(raw_entities, registry, entity_registry)
+        except (httpx.HTTPError, json.JSONDecodeError) as exc:
+            logger.warning("entity discovery failed after retries for window (len=%d chars): %s", len(window_text), exc)
+            return []
+        return []
 
-    def _validate_and_convert(
-        self, raw: dict, registry: SchemaRegistry
-    ) -> tuple[list[ExtractedEntity], list[ExtractedRelationship]]:
-        raw_entities = raw.get("entities", [])
-        raw_relationships = raw.get("relationships", [])
-        if not raw_entities and not raw_relationships:
-            raise ExtractionValidationError("response had no entities and no relationships")
-        local_ids = {e["local_id"] for e in raw_entities}
-
-        entities: list[ExtractedEntity] = []
-        type_by_local_id: dict[str, str] = {}
+    def _register_discovered(
+        self, raw_entities: list[dict], registry: SchemaRegistry, entity_registry: EntityRegistry
+    ) -> list[ExtractedEntity]:
+        validated: list[dict] = []
         for e in raw_entities:
             attributes = e.get("attributes") or {}
             try:
@@ -162,51 +174,113 @@ class UnstructuredTextAdapter(SourceAdapter):
             except AttributeValidationError as exc:
                 logger.warning("dropping invalid attributes for entity %r: %s", e.get("canonical_name"), exc)
                 attributes = {}
-            entities.append(
-                ExtractedEntity(
-                    local_id=e["local_id"],
-                    type=e["type"],
-                    canonical_name=e["canonical_name"],
-                    aliases=e.get("aliases") or [],
-                    attributes=attributes,
-                    scope=e.get("scope") or "context_local",
-                    identity_status=e.get("identity_status") or "named",
-                )
+            validated.append({**e, "attributes": attributes})
+
+        new_entities = entity_registry.merge(validated)
+        return [
+            ExtractedEntity(
+                local_id=e.id,
+                type=e.type,
+                canonical_name=e.canonical_name,
+                aliases=e.aliases,
+                attributes=e.attributes,
+                scope=e.scope,
+                identity_status=e.identity_status,
             )
-            type_by_local_id[e["local_id"]] = e["type"]
+            for e in new_entities
+        ]
+
+    def _extract_relationships_unit(
+        self, unit_text: str, registry: SchemaRegistry, predicates: list[str], entity_registry: EntityRegistry
+    ) -> tuple[list[ExtractedRelationship], list[ExtractedEntity]]:
+        registry_hint = entity_registry.as_hint_list()
+
+        retryer = tenacity.Retrying(
+            stop=tenacity.stop_after_attempt(self.settings.ingest.extraction_json_retries),
+            retry=tenacity.retry_if_exception_type((httpx.HTTPError, json.JSONDecodeError)),
+            reraise=True,
+        )
+        try:
+            for attempt in retryer:
+                with attempt:
+                    raw_relationships = extract_relationships(
+                        self.settings.ollama, self.settings.ollama.chat_model, unit_text, predicates, registry_hint
+                    )
+                    return self._resolve_relationships(raw_relationships, registry, registry_hint)
+        except (httpx.HTTPError, json.JSONDecodeError) as exc:
+            logger.warning(
+                "relationship extraction failed after retries for unit (len=%d chars): %s", len(unit_text), exc
+            )
+            return [], []
+        return [], []
+
+    def _resolve_relationships(
+        self, raw_relationships: list[dict], registry: SchemaRegistry, registry_hint: list[dict]
+    ) -> tuple[list[ExtractedRelationship], list[ExtractedEntity]]:
+        # Pass 2 never introduces brand-new entities — every subject_id/
+        # object_id the model emits is schema-enum-constrained to
+        # registry_hint's own ids, so `local_ids` (the "this response's own
+        # namespace" precedence tier) is deliberately always empty here;
+        # resolve_relationship_endpoint's known-id/known-name tiers do all
+        # the work, exactly as they do for a known-entity reference in Part
+        # 1's fix (see entity_reference.py).
+        known_by_id = {e["local_id"]: e for e in registry_hint}
+        known_by_name = build_name_lookup(registry_hint)
+        type_by_local_id: dict[str, str] = {}
+        referenced: list[ExtractedEntity] = []
+        synthesized: set[str] = set()
+
+        def _resolve(raw_id: str, label: str) -> str | None:
+            resolved_id, known_entity = resolve_relationship_endpoint(raw_id, set(), known_by_id, known_by_name)
+            if resolved_id is None:
+                logger.warning("skipping relationship with unknown %s %r", label, raw_id)
+                return None
+            if resolved_id not in synthesized:
+                entity = known_entity if known_entity is not None else known_by_id[resolved_id]
+                referenced.append(
+                    ExtractedEntity(
+                        local_id=resolved_id,
+                        type=entity["type"],
+                        canonical_name=entity["canonical_name"],
+                        aliases=entity.get("aliases", []),
+                    )
+                )
+                type_by_local_id[resolved_id] = entity["type"]
+                synthesized.add(resolved_id)
+            return resolved_id
 
         relationships: list[ExtractedRelationship] = []
         for r in raw_relationships:
-            object_local_id = r.get("object_local_id")
-            if r["subject_local_id"] not in local_ids:
-                logger.warning("skipping relationship with unknown subject_local_id %r", r["subject_local_id"])
+            subject_id = _resolve(r["subject_id"], "subject_id")
+            if subject_id is None:
                 continue
-            if object_local_id and object_local_id not in local_ids:
-                logger.warning("skipping relationship with unknown object_local_id %r", object_local_id)
+            raw_object_id = r.get("object_id")
+            object_id = _resolve(raw_object_id, "object_id") if raw_object_id else None
+            if raw_object_id and object_id is None:
                 continue
-            if not object_local_id and not r.get("object_literal"):
-                logger.warning("skipping relationship with neither object_local_id nor object_literal: %r", r)
+            if not object_id and not r.get("object_literal"):
+                logger.warning("skipping relationship with neither object_id nor object_literal: %r", r)
                 continue
             try:
                 validate_predicate_usage(
                     registry,
                     r["predicate"],
-                    type_by_local_id[r["subject_local_id"]],
-                    type_by_local_id.get(object_local_id) if object_local_id else None,
+                    type_by_local_id[subject_id],
+                    type_by_local_id.get(object_id) if object_id else None,
                 )
             except VocabularyError as exc:
                 logger.warning("skipping relationship failing vocabulary check: %s", exc)
                 continue
             relationships.append(
                 ExtractedRelationship(
-                    subject_local_id=r["subject_local_id"],
+                    subject_local_id=subject_id,
                     predicate=r["predicate"],
-                    object_local_id=object_local_id,
+                    object_local_id=object_id,
                     object_literal=r.get("object_literal"),
                 )
             )
 
-        return entities, relationships
+        return relationships, referenced
 
     def _load_text(self, path: Path) -> str:
         if path.suffix.lower() == ".pdf":

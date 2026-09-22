@@ -1,11 +1,18 @@
 import json
+from pathlib import Path
 
 import httpx
 
 from loci.config import OllamaSettings
 
+_PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
 
-def _extraction_response_schema(entity_types: list[str], predicates: list[str]) -> dict:
+
+_DISCOVERY_SYSTEM_PROMPT = (_PROMPTS_DIR / "discover_entities.md").read_text()
+_RELATIONSHIP_SYSTEM_PROMPT = (_PROMPTS_DIR / "extract_relationships.md").read_text()
+
+
+def _discovery_response_schema(entity_types: list[str]) -> dict:
     return {
         "type": "object",
         "properties": {
@@ -15,7 +22,6 @@ def _extraction_response_schema(entity_types: list[str], predicates: list[str]) 
                 "items": {
                     "type": "object",
                     "properties": {
-                        "local_id": {"type": "string"},
                         "type": {"type": "string", "enum": entity_types},
                         "canonical_name": {"type": "string"},
                         "aliases": {"type": "array", "maxItems": 5, "items": {"type": "string"}},
@@ -23,89 +29,114 @@ def _extraction_response_schema(entity_types: list[str], predicates: list[str]) 
                         "scope": {"type": "string", "enum": ["context_local", "cross_context"]},
                         "identity_status": {"type": "string", "enum": ["named", "unresolved"]},
                     },
-                    "required": ["local_id", "type", "canonical_name"],
+                    "required": ["type", "canonical_name"],
                 },
             },
+        },
+        "required": ["entities"],
+    }
+
+
+def discover_entities(
+    settings: OllamaSettings,
+    model: str,
+    text: str,
+    entity_types: list[str],
+    known_entities: list[dict] | None = None,
+) -> list[dict]:
+    """Pass 1 of the two-pass extraction redesign: entity discovery only, no
+    relationships. Deliberately doesn't ask the model for a local_id at all
+    — the caller's EntityRegistry assigns a permanent id on merge, so
+    there's nothing here for a later pass to go stale against (see
+    loci/ingest/entity_registry.py)."""
+    user_content = text
+    if known_entities:
+        known_block = json.dumps(known_entities, ensure_ascii=False)
+        user_content = (
+            f"Entities already established elsewhere in this document:\n{known_block}\n\n"
+            f"If anything below refers to one of these, reuse its exact canonical_name rather than "
+            f"creating a new entity.\n\n---\n\n{user_content}"
+        )
+    response = httpx.post(
+        f"{settings.base_url}/api/chat",
+        json={
+            "model": model,
+            "stream": False,
+            "messages": [
+                {"role": "system", "content": _DISCOVERY_SYSTEM_PROMPT},
+                {"role": "user", "content": user_content},
+            ],
+            "format": _discovery_response_schema(entity_types),
+            "options": {"temperature": 0, "repeat_penalty": 1.3, "num_predict": 16384, "num_ctx": 32768},
+        },
+        timeout=settings.request_timeout_s,
+    )
+    response.raise_for_status()
+    content = response.json()["message"]["content"]
+    return json.loads(content)["entities"]
+
+
+def _relationship_response_schema(predicates: list[str], registry_ids: list[str]) -> dict:
+    return {
+        "type": "object",
+        "properties": {
             "relationships": {
                 "type": "array",
                 "maxItems": 30,
                 "items": {
                     "type": "object",
                     "properties": {
-                        "subject_local_id": {"type": "string"},
+                        "subject_id": {"type": "string", "enum": registry_ids},
                         "predicate": {"type": "string", "enum": predicates},
-                        "object_local_id": {"type": "string"},
+                        "object_id": {"type": "string", "enum": registry_ids},
                         "object_literal": {"type": "object"},
                     },
-                    "required": ["subject_local_id", "predicate"],
+                    "required": ["subject_id", "predicate"],
                 },
             },
         },
-        "required": ["entities", "relationships"],
+        "required": ["relationships"],
     }
 
 
-class ExtractionLLMClient:
-    """Wraps Ollama /api/chat for entity/relationship extraction. The
-    response `format` is a JSON Schema whose `type`/`predicate` fields are
-    constrained (via `enum`) to the live vocabulary passed in — this is what
-    keeps the model from inventing types/predicates outside the shared
-    schema, on top of the downstream hard validation."""
-
-    def __init__(self, settings: OllamaSettings, system_prompt: str):
-        self.settings = settings
-        self.system_prompt = system_prompt
-
-    def extract(
-        self,
-        text: str,
-        entity_types: list[str],
-        predicates: list[str],
-        retry_note: str | None = None,
-        known_entities: list[dict] | None = None,
-    ) -> dict:
-        user_content = text
-        if known_entities:
-            # Cross-window continuity: if this window's content refers to
-            # one of these — by name, alias, title, or a clear pronoun/role
-            # reference — reuse its exact canonical_name rather than
-            # inventing a new entity. This is what lets "Dr. Watson" in
-            # window 1 and "the narrator" in window 5 resolve to one entity
-            # instead of two.
-            known_block = json.dumps(known_entities, ensure_ascii=False)
-            user_content = (
-                f"Entities already established elsewhere in this document:\n{known_block}\n\n"
-                f"If anything below refers to one of these, reuse its exact canonical_name.\n\n"
-                f"---\n\n{user_content}"
-            )
-        if retry_note is not None:
-            user_content = f"{user_content}\n\n---\nYour previous attempt was invalid: {retry_note}\nTry again."
-        response = httpx.post(
-            f"{self.settings.base_url}/api/chat",
-            json={
-                "model": self.settings.chat_model,
-                "stream": False,
-                "messages": [
-                    {"role": "system", "content": self.system_prompt},
-                    {"role": "user", "content": user_content},
-                ],
-                "format": _extraction_response_schema(entity_types, predicates),
-                # num_predict is a runaway-generation safety net, not a token
-                # budget — this is local inference, so there's no per-token
-                # cost to economize. It must be generous enough that
-                # reasoning models (which spend real tokens on <think>
-                # before ever reaching `content`) can actually finish: 1024
-                # was cutting deepseek-r1:32b off mid-thought with empty
-                # content every time. 16384 leaves headroom while still
-                # bounding truly pathological loops (the failure mode this
-                # guards against, first hit with qwen2.5:7b-instruct).
-                "options": {"temperature": 0, "repeat_penalty": 1.3, "num_predict": 16384, "num_ctx": 32768},
-            },
-            timeout=self.settings.request_timeout_s,
-        )
-        response.raise_for_status()
-        content = response.json()["message"]["content"]
-        return json.loads(content)
+def extract_relationships(
+    settings: OllamaSettings,
+    model: str,
+    text: str,
+    predicates: list[str],
+    registry_hint: list[dict],
+) -> list[dict]:
+    """Pass 2 of the two-pass extraction redesign: relationships only, over
+    a paragraph-grouped unit, referencing entities already discovered in
+    pass 1. `subject_id`/`object_id` are JSON-schema enum-constrained to the
+    live registry's ids — the strongest structural guarantee available that
+    the model can't invent a new entity here, on top of (not instead of)
+    resolve_relationship_endpoint's fallback matching downstream. Caller
+    must not call this with an empty registry_hint (an empty enum is
+    meaningless to the schema)."""
+    registry_ids = [e["local_id"] for e in registry_hint]
+    registry_block = json.dumps(registry_hint, ensure_ascii=False)
+    user_content = (
+        f"Entities already established in this document (only reference these by id; "
+        f"never invent a new entity or id here):\n{registry_block}\n\n---\n\n{text}"
+    )
+    response = httpx.post(
+        f"{settings.base_url}/api/chat",
+        json={
+            "model": model,
+            "stream": False,
+            "messages": [
+                {"role": "system", "content": _RELATIONSHIP_SYSTEM_PROMPT},
+                {"role": "user", "content": user_content},
+            ],
+            "format": _relationship_response_schema(predicates, registry_ids),
+            "options": {"temperature": 0, "repeat_penalty": 1.3, "num_predict": 16384, "num_ctx": 32768},
+        },
+        timeout=settings.request_timeout_s,
+    )
+    response.raise_for_status()
+    content = response.json()["message"]["content"]
+    return json.loads(content)["relationships"]
 
 
 _SEGMENT_CLASSIFICATION_SYSTEM_PROMPT = """Classify the given block of text as exactly one of:

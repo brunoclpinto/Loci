@@ -61,6 +61,11 @@ class IngestSettings(BaseModel):
     chunk_tokens: int = 512
     chunk_overlap_tokens: int = 64
     extraction_window_tokens: int = 2500
+    # Two-pass extraction's relationship pass groups paragraphs up to this
+    # size (never splitting a paragraph across units) instead of reusing
+    # extraction_window_tokens, since relationship extraction benefits from
+    # a tighter span for precise pronoun/reference resolution.
+    relationship_unit_tokens: int = 400
     embed_batch: int = 16
     extraction_json_retries: int = 5
     # Segment classification and coreference resolution are simple
@@ -94,8 +99,15 @@ class BenchSettings(BaseModel):
     qna_dir: str = "benchWork/bench"
     qna_file: str = "qna_scarlet.json"
     log_dir: str = "benchWork/logs"
-    default_extraction_model: str = "deepseek-r1:32b"
-    default_answer_model: str = "phi4-mini"
+    # deepseek-r1:14b: ~2.5-4x faster to ingest than 32b on this hardware
+    # (32b CPU-offloads, ~4.7 tok/s vs 14b's ~36-40 tok/s), and the two-pass
+    # extraction fix closed the quality gap that used to favor 32b.
+    default_extraction_model: str = "deepseek-r1:14b"
+    # qwen2.5:14b-instruct beat gemma4:26b outright on this hardware (higher
+    # quality score, zero empty answers vs 5/100, ~5x faster) — gemma4:26b
+    # was too large to share this GPU's VRAM with the embedding model
+    # without contention, silently truncating some answers to empty.
+    default_answer_model: str = "qwen2.5:14b-instruct"
     sample_interval_s: float = 5.0
     weights: BenchWeights = BenchWeights()
 

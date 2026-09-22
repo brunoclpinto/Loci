@@ -1,6 +1,6 @@
 import re
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 
 SegmentType = Literal["narrative", "front_matter", "back_matter"]
@@ -39,6 +39,10 @@ _HEADING_RE = re.compile(r"^(chapter|part|book)\s+[ivxlcdm\d]+\.?\s*[a-z ,'\"\-]
 class Segment:
     type: SegmentType
     text: str
+    # Preserved separately from `text` (which re-joins paragraphs into one
+    # block for embedding-chunk splitting) so the relationship-extraction
+    # pass can group on paragraph boundaries instead of raw word count.
+    paragraphs: list[str] = field(default_factory=list)
 
 
 def _split_paragraphs(text: str) -> list[str]:
@@ -115,15 +119,16 @@ def _extract_internal_heading_runs(paragraphs: list[str]) -> list[Segment]:
             run_len = run_end - i
             if run_len >= _MIN_HEADING_RUN:
                 if buffer:
-                    segments.append(Segment(type="narrative", text="\n\n".join(buffer)))
+                    segments.append(Segment(type="narrative", text="\n\n".join(buffer), paragraphs=buffer))
                     buffer = []
-                segments.append(Segment(type="front_matter", text="\n\n".join(paragraphs[i:run_end])))
+                heading_run = paragraphs[i:run_end]
+                segments.append(Segment(type="front_matter", text="\n\n".join(heading_run), paragraphs=heading_run))
                 i = run_end
                 continue
         buffer.append(paragraphs[i])
         i += 1
     if buffer:
-        segments.append(Segment(type="narrative", text="\n\n".join(buffer)))
+        segments.append(Segment(type="narrative", text="\n\n".join(buffer), paragraphs=buffer))
     return segments
 
 
@@ -169,13 +174,21 @@ def segment_document(text: str, classify_fn: Callable[[str], SegmentType] | None
 
         if leading:
             segments.append(
-                Segment(type=_classify_block(leading, "front_matter", classify_fn), text="\n\n".join(leading))
+                Segment(
+                    type=_classify_block(leading, "front_matter", classify_fn),
+                    text="\n\n".join(leading),
+                    paragraphs=leading,
+                )
             )
         if middle:
             segments.extend(_extract_internal_heading_runs(middle))
         if trailing:
             segments.append(
-                Segment(type=_classify_block(trailing, "back_matter", classify_fn), text="\n\n".join(trailing))
+                Segment(
+                    type=_classify_block(trailing, "back_matter", classify_fn),
+                    text="\n\n".join(trailing),
+                    paragraphs=trailing,
+                )
             )
 
     if post.strip():

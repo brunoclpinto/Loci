@@ -75,7 +75,18 @@ def answer_question(
                 {"role": "system", "content": ANSWER_SYSTEM_PROMPT},
                 {"role": "user", "content": f"Knowledge:\n{context_block}\n\nQuestion: {question}"},
             ],
-            "options": {"temperature": 0},
+            # num_ctx was previously unset (Ollama's small model default),
+            # which silently truncated the prompt to empty output for some
+            # questions' retrieved context (15/100 answers came back
+            # empty). 16384 cut that to 5/100 — the best of the values
+            # tried; going bigger (32768) made it worse (7/100), not
+            # better, which means the remaining failures are VRAM
+            # contention (a 26B model's KV cache at a large context size
+            # competing with the embedding model for this GPU's ~16GB),
+            # not pure prompt truncation. Not fully eliminable with this
+            # setting alone — see loci-bench-harness memory for the full
+            # investigation before tuning this further.
+            "options": {"temperature": 0, "num_predict": 2048, "num_ctx": 16384},
         },
         timeout=settings.ollama.request_timeout_s,
     )
