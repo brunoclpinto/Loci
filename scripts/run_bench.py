@@ -36,12 +36,13 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 DOCKER_DIR = REPO_ROOT / "docker"
 BENCH_WORK = REPO_ROOT / "benchWork"
 
-# loci/bench/grading.py and loci/bench/logs.py are pure-stdlib (no
+# loci/bench/grading.py, logs.py, and debug.py are pure-stdlib (no
 # sqlalchemy/pydantic/etc.), so they're safely importable here even though
 # nothing else in the loci package is installed on the host — this reuses
 # the exact same grading logic rather than duplicating it.
 sys.path.insert(0, str(REPO_ROOT))
-from loci.bench.grading import grade_qa_rows  # noqa: E402
+from loci.bench.debug import debug_run_dir, merge_qa_scores  # noqa: E402
+from loci.bench.grading import grade_qa_rows_batched  # noqa: E402
 from loci.bench.logs import read_jsonl, write_json  # noqa: E402
 
 SERVICES = ["postgres", "qdrant", "ollama", "app"]
@@ -153,22 +154,40 @@ def main() -> None:
 
     rid = run_id(args.qna, args.extraction_model, args.answer_model)
     resources_path = BENCH_WORK / "logs" / rid / "resources.jsonl"
+    # Deterministic (qna, extraction_model) id — matches loci/cli.py's
+    # `bench ingest`/`bench qa` defaults, so this script's debug output lands
+    # in the same folder as a manual `bench ingest`/`bench qa` call for the
+    # same pair, instead of a fresh timestamped folder every invocation.
+    debug_run_id = ingest_run_id(args.qna, args.extraction_model)
+    # Pre-create the debug dir as the host user (mirrors resources_path's
+    # mkdir below) — otherwise the containerized ingest/qa phases create it
+    # fresh as root on first write, and the later host-side grade_on_host
+    # merge step (also host user) can't write into a root-owned directory.
+    debug_run_dir(BENCH_WORK / "debug", debug_run_id)
 
     stop_event = threading.Event()
     sampler = threading.Thread(target=_sampler_loop, args=(stop_event, resources_path, args.sample_interval), daemon=True)
     sampler.start()
 
     try:
-        run_phase("ingest", "--extraction-model", args.extraction_model, "--qna", args.qna)
-        run_phase("qa", "--extraction-model", args.extraction_model, "--answer-model", args.answer_model, "--qna", args.qna)
-        grade_on_host(rid)
+        run_phase(
+            "ingest", "--extraction-model", args.extraction_model, "--qna", args.qna, "--debug-run-id", debug_run_id
+        )
+        run_phase(
+            "qa",
+            "--extraction-model", args.extraction_model,
+            "--answer-model", args.answer_model,
+            "--qna", args.qna,
+            "--debug-run-id", debug_run_id,
+        )
+        grade_on_host(rid, debug_run_id, args.answer_model)
         run_phase("report", "--extraction-model", args.extraction_model, "--answer-model", args.answer_model, "--qna", args.qna)
     finally:
         stop_event.set()
         sampler.join(timeout=args.sample_interval + 5)
 
 
-def grade_on_host(rid: str) -> None:
+def grade_on_host(rid: str, debug_run_id: str | None = None, answer_model: str | None = None) -> None:
     """Grading needs the `claude` CLI, which lives on the host, not in the
     app container's image — running it via `docker compose run` (like the
     other phases) fails with FileNotFoundError. benchWork/logs is a real
@@ -178,10 +197,16 @@ def grade_on_host(rid: str) -> None:
     qa_rows = read_jsonl(run_dir / "retrieval_generation.jsonl")
     if not qa_rows:
         raise SystemExit(f"No QA rows found at {run_dir / 'retrieval_generation.jsonl'} — did the qa phase run?")
-    print(f"Grading {len(qa_rows)} answers via `claude -p` (single call)...", flush=True)
-    result = grade_qa_rows(qa_rows)
+    print(f"Grading {len(qa_rows)} answers via `claude -p` (batches of 100)...", flush=True)
+    result = grade_qa_rows_batched(qa_rows)
     write_json(run_dir / "grading.json", result)
     print(f"Grading complete: mean score {result['mean_score']:.1f}", flush=True)
+
+    debug_run_id = debug_run_id or qa_rows[0].get("debug_run_id")
+    answer_model = answer_model or qa_rows[0].get("answer_model")
+    if debug_run_id and answer_model:
+        merge_qa_scores(debug_run_dir(BENCH_WORK / "debug", debug_run_id), result["scores"], answer_model)
+        print(f"Debug output: {BENCH_WORK / 'debug' / debug_run_id}")
 
     print(f"\nDone. Run id: {rid}")
     print(f"Logs: {BENCH_WORK / 'logs' / rid}")

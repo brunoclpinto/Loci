@@ -24,6 +24,8 @@ class AnswerResult:
     retrieval_time_s: float
     generation_time_s: float
     search_result: SearchResult
+    system_prompt: str
+    user_message: str
 
 
 def _format_context(result: SearchResult) -> str:
@@ -65,6 +67,7 @@ def answer_question(
     retrieval_time_s = time.monotonic() - t0
 
     context_block = _format_context(result)
+    user_message = f"Knowledge:\n{context_block}\n\nQuestion: {question}"
     t1 = time.monotonic()
     response = httpx.post(
         f"{settings.ollama.base_url}/api/chat",
@@ -73,7 +76,7 @@ def answer_question(
             "stream": False,
             "messages": [
                 {"role": "system", "content": ANSWER_SYSTEM_PROMPT},
-                {"role": "user", "content": f"Knowledge:\n{context_block}\n\nQuestion: {question}"},
+                {"role": "user", "content": user_message},
             ],
             # num_ctx was previously unset (Ollama's small model default),
             # which silently truncated the prompt to empty output for some
@@ -99,4 +102,6 @@ def answer_question(
         retrieval_time_s=retrieval_time_s,
         generation_time_s=generation_time_s,
         search_result=result,
+        system_prompt=ANSWER_SYSTEM_PROMPT,
+        user_message=user_message,
     )

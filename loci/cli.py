@@ -150,8 +150,16 @@ def ingest(
 def bench_ingest(
     extraction_model: str = typer.Option(None, "--extraction-model", help="Ollama tag; defaults to [bench].default_extraction_model."),
     qna: str = typer.Option(None, "--qna", help="QnA filename under [bench].qna_dir; defaults to [bench].qna_file."),
+    debug_run_id: str = typer.Option(
+        None,
+        "--debug-run-id",
+        help="Debug-folder name; defaults to the deterministic ingest run id "
+        "(qna+extraction_model) so a later `bench qa` for the same pair lands "
+        "in the same folder without needing this flag.",
+    ),
 ) -> None:
     """Ingest the book(s) referenced by a QnA set using the given extraction model, into a context namespaced by (book, model)."""
+    from loci.bench.debug import debug_run_dir
     from loci.bench.ids import ingest_run_id
     from loci.bench.ingest_phase import run_ingest_phase
     from loci.bench.logs import run_dir, write_json
@@ -159,13 +167,15 @@ def bench_ingest(
     settings = load_settings()
     extraction_model = extraction_model or settings.bench.default_extraction_model
     qna = qna or settings.bench.qna_file
-
-    result = run_ingest_phase(settings, extraction_model, qna)
-
     rid = ingest_run_id(qna, extraction_model)
+    debug_dir = debug_run_dir(Path(settings.bench.debug_dir), debug_run_id or rid)
+
+    result = run_ingest_phase(settings, extraction_model, qna, debug_dir)
+
     log_dir = run_dir(Path(settings.bench.log_dir), rid)
     write_json(log_dir / "ingest.json", result)
     console.print(f"[green]Ingest phase complete[/green] ({rid}): {result['duration_s']:.1f}s, books={result['books']}")
+    console.print(f"[green]Debug output[/green]: {debug_dir}")
 
 
 @bench_app.command("qa")
@@ -173,8 +183,18 @@ def bench_qa(
     extraction_model: str = typer.Option(None, "--extraction-model", help="Which ingested context to retrieve from."),
     answer_model: str = typer.Option(None, "--answer-model", help="Ollama tag; defaults to [bench].default_answer_model."),
     qna: str = typer.Option(None, "--qna", help="QnA filename under [bench].qna_dir."),
+    debug_run_id: str = typer.Option(
+        None,
+        "--debug-run-id",
+        help="Debug-folder name; a bench qa run with no ingest in the same "
+        "request is its own bench work, so this defaults to its own "
+        "deterministic id (qna+extraction_model+answer_model), not the "
+        "ingest's folder. Pass the ingest's --debug-run-id explicitly to "
+        "land the answers alongside that ingest's debug output instead.",
+    ),
 ) -> None:
     """Answer every question in a QnA set, retrieving from the context(s) already ingested for the given extraction model."""
+    from loci.bench.debug import debug_run_dir
     from loci.bench.ids import run_id as compute_run_id
     from loci.bench.logs import run_dir, write_jsonl
     from loci.bench.qa_phase import run_qa_phase
@@ -183,13 +203,15 @@ def bench_qa(
     extraction_model = extraction_model or settings.bench.default_extraction_model
     answer_model = answer_model or settings.bench.default_answer_model
     qna = qna or settings.bench.qna_file
-
-    result = run_qa_phase(settings, extraction_model, answer_model, qna)
-
     rid = compute_run_id(qna, extraction_model, answer_model)
+    debug_dir = debug_run_dir(Path(settings.bench.debug_dir), debug_run_id or rid)
+
+    result = run_qa_phase(settings, extraction_model, answer_model, qna, debug_dir)
+
     log_dir = run_dir(Path(settings.bench.log_dir), rid)
     write_jsonl(log_dir / "retrieval_generation.jsonl", result["rows"])
     console.print(f"[green]QA phase complete[/green] ({rid}): {len(result['rows'])} questions in {result['duration_s']:.1f}s")
+    console.print(f"[green]Debug output[/green]: {debug_dir}")
 
 
 @bench_app.command("grade")
@@ -203,6 +225,7 @@ def bench_grade(
     Note: this needs the `claude` binary, which isn't installed in the app
     image — scripts/run_bench.py grades on the HOST instead. This command
     is here for completeness (e.g. if `claude` is ever added to the image)."""
+    from loci.bench.debug import debug_run_dir, merge_qa_scores
     from loci.bench.grading import grade_qa_rows
     from loci.bench.ids import run_id as compute_run_id
     from loci.bench.logs import read_jsonl, run_dir, write_json
@@ -222,6 +245,12 @@ def bench_grade(
     result = grade_qa_rows(qa_rows)
     write_json(log_dir / "grading.json", result)
     console.print(f"[green]Grading complete[/green] ({rid}): mean score {result['mean_score']:.1f}")
+
+    debug_run_id = qa_rows[0].get("debug_run_id")
+    if debug_run_id:
+        merge_qa_scores(debug_run_dir(Path(settings.bench.debug_dir), debug_run_id), result["scores"], answer_model)
+    else:
+        console.print("[yellow]No debug_run_id on QA rows (pre-dates debug output) — skipping score merge.[/yellow]")
 
 
 @bench_app.command("report")

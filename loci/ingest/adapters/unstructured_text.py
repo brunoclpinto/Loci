@@ -23,7 +23,7 @@ from loci.ingest.entity_registry import EntityRegistry
 from loci.ingest.structure import Segment, segment_document
 from loci.llm.client import classify_segment, discover_entities, extract_relationships
 from loci.normalize.vocabulary import VocabularyError, validate_predicate_usage
-from loci.schema_registry.loader import SchemaRegistry
+from loci.schema_registry.loader import EntityTypeSchema, EnumValueDefinition, PredicateDefinition, SchemaRegistry
 from loci.schema_registry.validator import AttributeValidationError, validate_attributes
 
 logger = logging.getLogger(__name__)
@@ -77,13 +77,18 @@ class UnstructuredTextAdapter(SourceAdapter):
         with session_scope(self.settings) as session:
             registry = SchemaRegistry.load(session)
 
-        entity_types = sorted(registry.entity_types)
-        predicates = sorted(registry.predicates)
+        entity_types = [registry.entity_types[name] for name in sorted(registry.entity_types)]
+        predicates = [registry.predicates[name] for name in sorted(registry.predicates)]
+        scope_values = registry.enum_values("entity_scope")
+        identity_status_values = registry.enum_values("entity_identity_status")
+        segment_type_values = registry.enum_values("segment_type")
 
         text = self._load_text(source.path)
 
         def _classify(block_text: str) -> str:
-            return classify_segment(self.settings.ollama, self.settings.ingest.segment_classifier_model, block_text)
+            return classify_segment(
+                self.settings.ollama, self.settings.ingest.segment_classifier_model, block_text, segment_type_values
+            )
 
         segments = segment_document(text, classify_fn=_classify)
 
@@ -103,18 +108,32 @@ class UnstructuredTextAdapter(SourceAdapter):
             ]
 
             if segment.type != "narrative":
-                yield ExtractionBatch(context_name=source.context_name, chunks=chunks, source_ref=str(source.path))
+                yield ExtractionBatch(
+                    context_name=source.context_name,
+                    chunks=chunks,
+                    source_ref=str(source.path),
+                    debug={"phase": "segment", "segment_type": segment.type},
+                )
                 continue
 
             narrative_segments.append(segment)
             windows = split_text(segment.text, self.settings.ingest.extraction_window_tokens, overlap_tokens=0)
             for window in windows:
-                new_entities = self._discover_window(window.text, registry, entity_types, entity_registry)
+                known_entities_before = entity_registry.as_hint_list()
+                new_entities, call_debug = self._discover_window(
+                    window.text, registry, entity_types, scope_values, identity_status_values, entity_registry
+                )
                 yield ExtractionBatch(
                     context_name=source.context_name,
                     entities=new_entities,
                     chunks=chunks,
                     source_ref=str(source.path),
+                    debug={
+                        "phase": "discovery",
+                        "segment_type": segment.type,
+                        "known_entities_before": known_entities_before or None,
+                        **call_debug,
+                    },
                 )
                 chunks = []  # only attach each window's chunks to its own batch once
 
@@ -127,7 +146,7 @@ class UnstructuredTextAdapter(SourceAdapter):
         for segment in narrative_segments:
             units = group_paragraphs(segment.paragraphs, self.settings.ingest.relationship_unit_tokens)
             for unit in units:
-                relationships, referenced_entities = self._extract_relationships_unit(
+                relationships, referenced_entities, call_debug = self._extract_relationships_unit(
                     unit.text, registry, predicates, entity_registry
                 )
                 if not relationships:
@@ -137,16 +156,24 @@ class UnstructuredTextAdapter(SourceAdapter):
                     entities=referenced_entities,
                     relationships=relationships,
                     source_ref=str(source.path),
+                    debug={"phase": "relationship", "segment_type": segment.type, **call_debug},
                 )
 
     def _discover_window(
-        self, window_text: str, registry: SchemaRegistry, entity_types: list[str], entity_registry: EntityRegistry
-    ) -> list[ExtractedEntity]:
+        self,
+        window_text: str,
+        registry: SchemaRegistry,
+        entity_types: list[EntityTypeSchema],
+        scope_values: list[EnumValueDefinition],
+        identity_status_values: list[EnumValueDefinition],
+        entity_registry: EntityRegistry,
+    ) -> tuple[list[ExtractedEntity], dict]:
         retryer = tenacity.Retrying(
             stop=tenacity.stop_after_attempt(self.settings.ingest.extraction_json_retries),
             retry=tenacity.retry_if_exception_type((httpx.HTTPError, json.JSONDecodeError)),
             reraise=True,
         )
+        call_debug: dict = {}
         try:
             for attempt in retryer:
                 with attempt:
@@ -155,13 +182,16 @@ class UnstructuredTextAdapter(SourceAdapter):
                         self.settings.ollama.chat_model,
                         window_text,
                         entity_types,
+                        scope_values,
+                        identity_status_values,
                         known_entities=entity_registry.as_hint_list() or None,
+                        debug_sink=call_debug.update,
                     )
-                    return self._register_discovered(raw_entities, registry, entity_registry)
+                    return self._register_discovered(raw_entities, registry, entity_registry), call_debug
         except (httpx.HTTPError, json.JSONDecodeError) as exc:
             logger.warning("entity discovery failed after retries for window (len=%d chars): %s", len(window_text), exc)
-            return []
-        return []
+            return [], call_debug
+        return [], call_debug
 
     def _register_discovered(
         self, raw_entities: list[dict], registry: SchemaRegistry, entity_registry: EntityRegistry
@@ -191,8 +221,8 @@ class UnstructuredTextAdapter(SourceAdapter):
         ]
 
     def _extract_relationships_unit(
-        self, unit_text: str, registry: SchemaRegistry, predicates: list[str], entity_registry: EntityRegistry
-    ) -> tuple[list[ExtractedRelationship], list[ExtractedEntity]]:
+        self, unit_text: str, registry: SchemaRegistry, predicates: list[PredicateDefinition], entity_registry: EntityRegistry
+    ) -> tuple[list[ExtractedRelationship], list[ExtractedEntity], dict]:
         registry_hint = entity_registry.as_hint_list()
 
         retryer = tenacity.Retrying(
@@ -200,19 +230,26 @@ class UnstructuredTextAdapter(SourceAdapter):
             retry=tenacity.retry_if_exception_type((httpx.HTTPError, json.JSONDecodeError)),
             reraise=True,
         )
+        call_debug: dict = {}
         try:
             for attempt in retryer:
                 with attempt:
                     raw_relationships = extract_relationships(
-                        self.settings.ollama, self.settings.ollama.chat_model, unit_text, predicates, registry_hint
+                        self.settings.ollama,
+                        self.settings.ollama.chat_model,
+                        unit_text,
+                        predicates,
+                        registry_hint,
+                        debug_sink=call_debug.update,
                     )
-                    return self._resolve_relationships(raw_relationships, registry, registry_hint)
+                    relationships, referenced = self._resolve_relationships(raw_relationships, registry, registry_hint)
+                    return relationships, referenced, call_debug
         except (httpx.HTTPError, json.JSONDecodeError) as exc:
             logger.warning(
                 "relationship extraction failed after retries for unit (len=%d chars): %s", len(unit_text), exc
             )
-            return [], []
-        return [], []
+            return [], [], call_debug
+        return [], [], call_debug
 
     def _resolve_relationships(
         self, raw_relationships: list[dict], registry: SchemaRegistry, registry_hint: list[dict]
@@ -269,8 +306,26 @@ class UnstructuredTextAdapter(SourceAdapter):
                     type_by_local_id.get(object_id) if object_id else None,
                 )
             except VocabularyError as exc:
-                logger.warning("skipping relationship failing vocabulary check: %s", exc)
-                continue
+                # The model sometimes gets the relation direction backwards
+                # (e.g. emits "Organization works_for Person" instead of
+                # "Person works_for Organization") — a deterministic,
+                # zero-cost check: if swapping subject/object satisfies the
+                # predicate's type constraint, use the swap instead of
+                # discarding a fact the model otherwise extracted correctly.
+                # Only applicable when both endpoints are entities — an
+                # object_literal has no type to swap into subject position.
+                if object_id is None:
+                    logger.warning("skipping relationship failing vocabulary check: %s", exc)
+                    continue
+                try:
+                    validate_predicate_usage(
+                        registry, r["predicate"], type_by_local_id[object_id], type_by_local_id[subject_id]
+                    )
+                except VocabularyError:
+                    logger.warning("skipping relationship failing vocabulary check: %s", exc)
+                    continue
+                logger.info("swapped reversed subject/object for predicate %r to satisfy vocabulary", r["predicate"])
+                subject_id, object_id = object_id, subject_id
             relationships.append(
                 ExtractedRelationship(
                     subject_local_id=subject_id,

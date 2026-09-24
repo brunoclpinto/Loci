@@ -66,6 +66,37 @@ def grade_qa_rows(qa_rows: list[dict], claude_cmd: str = "claude") -> dict:
     }
 
 
+def grade_qa_rows_batched(qa_rows: list[dict], batch_size: int = 100, claude_cmd: str = "claude") -> dict:
+    """Chunks qa_rows into batch_size-sized groups and grades each with a
+    separate grade_qa_rows call, merging the results. grade_qa_rows's
+    single-call design (one prompt covering every row) is proven reliable
+    at 100 rows but untested and risky beyond that (output-length/timeout
+    exposure in a single non-interactive `claude -p` call) — chunking
+    keeps every individual call at the size that's actually been verified,
+    regardless of how large qa_rows is."""
+    if not qa_rows:
+        raise ValueError("no QA rows to grade")
+
+    scores: dict[str, int] = {}
+    raw_outputs: list[str] = []
+    started_at = datetime.now(timezone.utc).isoformat()
+    for i in range(0, len(qa_rows), batch_size):
+        batch_result = grade_qa_rows(qa_rows[i : i + batch_size], claude_cmd=claude_cmd)
+        scores.update(batch_result["scores"])
+        raw_outputs.append(batch_result["raw_output"])
+    completed_at = datetime.now(timezone.utc).isoformat()
+
+    mean_score = sum(scores.values()) / len(scores) if scores else 0.0
+
+    return {
+        "started_at": started_at,
+        "completed_at": completed_at,
+        "scores": scores,
+        "mean_score": mean_score,
+        "raw_output": raw_outputs,
+    }
+
+
 def _parse_scores(raw_output: str) -> dict[str, int]:
     text = raw_output.strip()
     start = text.find("[")

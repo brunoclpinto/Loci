@@ -43,10 +43,17 @@ class IngestionPipeline:
     embedder, or Postgres directly, which is what structurally enforces the
     shared-normalization invariant rather than leaving it to convention."""
 
-    def __init__(self, settings: LociSettings, resolver: EntityResolver, chunk_embedder: ChunkEmbedder | None = None):
+    def __init__(
+        self,
+        settings: LociSettings,
+        resolver: EntityResolver,
+        chunk_embedder: ChunkEmbedder | None = None,
+        on_chunk_debug: Callable[[ExtractionBatch, dict, IngestionStats], None] | None = None,
+    ):
         self.settings = settings
         self.resolver = resolver
         self.chunk_embedder = chunk_embedder
+        self.on_chunk_debug = on_chunk_debug
 
     def ingest(self, adapter: SourceAdapter, source: SourceDescriptor) -> IngestionStats:
         run_id = self._start_run(adapter.name, str(source.path))
@@ -55,7 +62,9 @@ class IngestionPipeline:
             with session_scope(self.settings) as session:
                 registry = SchemaRegistry.load(session)
                 for batch in adapter.extract(source):
-                    self._process_batch(session, registry, adapter.name, batch, stats)
+                    step_detail = self._process_batch(session, registry, adapter.name, batch, stats)
+                    if self.on_chunk_debug is not None:
+                        self.on_chunk_debug(batch, step_detail, stats)
                 # Whole-document coreference pass: identities revealed only
                 # later than their first mention (see loci/ingest/
                 # coreference.py) can only be resolved once every window has
@@ -81,9 +90,16 @@ class IngestionPipeline:
 
     def _process_batch(
         self, session: Session, registry: SchemaRegistry, adapter_name: str, batch: ExtractionBatch, stats: IngestionStats
-    ) -> None:
+    ) -> dict:
         context = self._get_or_create_context(session, batch.context_name)
         local_id_map: dict[str, uuid.UUID] = {}
+        step_detail: dict = {
+            "entities_created": [],
+            "entities_matched": [],
+            "relationships_created": [],
+            "relationships_matched": [],
+            "relationships_skipped_invalid": [],
+        }
 
         for ee in batch.entities:
             schema_version = validate_attributes(registry, ee.type, ee.attributes)
@@ -97,6 +113,9 @@ class IngestionPipeline:
                     candidate.aliases = merged_aliases
                 local_id_map[ee.local_id] = candidate.id
                 stats.entities_matched += 1
+                step_detail["entities_matched"].append(
+                    {"local_id": ee.local_id, "id": str(candidate.id), "type": ee.type, "canonical_name": ee.canonical_name}
+                )
             else:
                 entity = Entity(
                     type=ee.type,
@@ -115,6 +134,9 @@ class IngestionPipeline:
                 session.flush()
                 local_id_map[ee.local_id] = entity.id
                 stats.entities_created += 1
+                step_detail["entities_created"].append(
+                    {"local_id": ee.local_id, "id": str(entity.id), "type": ee.type, "canonical_name": ee.canonical_name}
+                )
 
         for er in batch.relationships:
             subject_id = local_id_map.get(er.subject_local_id)
@@ -136,10 +158,16 @@ class IngestionPipeline:
                 # and relationships — skip it and keep going.
                 logger.warning("skipping invalid relationship in %s batch: %s", adapter_name, exc)
                 stats.relationships_skipped_invalid += 1
+                step_detail["relationships_skipped_invalid"].append(
+                    {"predicate": er.predicate, "subject_local_id": er.subject_local_id, "reason": str(exc)}
+                )
                 continue
 
             if relationship_exists(session, subject_id, er.predicate, object_id, er.object_literal, context.id):
                 stats.relationships_matched += 1
+                step_detail["relationships_matched"].append(
+                    {"predicate": er.predicate, "subject_id": str(subject_id), "object_id": str(object_id) if object_id else None}
+                )
                 continue
 
             session.add(
@@ -157,6 +185,9 @@ class IngestionPipeline:
                 )
             )
             stats.relationships_created += 1
+            step_detail["relationships_created"].append(
+                {"predicate": er.predicate, "subject_id": str(subject_id), "object_id": str(object_id) if object_id else None}
+            )
 
         if batch.chunks and self.chunk_embedder is not None:
             stats.chunks_embedded += self.chunk_embedder(
@@ -164,6 +195,7 @@ class IngestionPipeline:
             )
 
         session.flush()
+        return step_detail
 
     def _get_or_create_context(self, session: Session, name: str) -> Context:
         context = session.scalars(select(Context).where(Context.name == name)).first()

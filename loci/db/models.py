@@ -62,6 +62,12 @@ class EntityTypeSchemaVersion(Base):
     entity_type: Mapped[str] = mapped_column(ForeignKey("entity_types.name", ondelete="CASCADE"), primary_key=True)
     version: Mapped[int] = mapped_column(Integer, primary_key=True)
     json_schema: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    # Semantic definitions for extraction prompts — versioned alongside the
+    # attribute schema so refining "what this type means" (e.g. to fix a
+    # discovered ambiguity) follows the same evolve-with-changelog path as
+    # refining its attributes, rather than being a separate, untracked field.
+    short_description: Mapped[str | None] = mapped_column(Text)
+    long_description: Mapped[str | None] = mapped_column(Text)
     changelog: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
@@ -70,9 +76,29 @@ class PredicateVocabulary(Base):
     __tablename__ = "predicate_vocabulary"
 
     name: Mapped[str] = mapped_column(Text, primary_key=True)
-    description: Mapped[str | None] = mapped_column(Text)
     domain_entity_types: Mapped[list[str]] = mapped_column(ARRAY(Text), nullable=False, server_default="{}")
     range_entity_types: Mapped[list[str]] = mapped_column(ARRAY(Text), nullable=False, server_default="{}")
+    # Unversioned (unlike entity types) — a predicate's definition is
+    # simple enough to just overwrite in place rather than needing a
+    # changelog history.
+    short_description: Mapped[str | None] = mapped_column(Text)
+    long_description: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class EnumVocabulary(Base):
+    """Shared table for every other LLM-facing enum field (entity scope,
+    identity_status, segment_type, and any future one) — unlike entity
+    types and predicates, these have no other structure (attribute schema,
+    domain/range) to hang descriptions off, so one small generic table
+    covers all of them without a bespoke migration per concept."""
+
+    __tablename__ = "enum_vocabulary"
+
+    domain: Mapped[str] = mapped_column(Text, primary_key=True)
+    value: Mapped[str] = mapped_column(Text, primary_key=True)
+    short_description: Mapped[str | None] = mapped_column(Text)
+    long_description: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 

@@ -50,6 +50,10 @@ class ExtractionBatch:
     relationships: list[ExtractedRelationship] = field(default_factory=list)
     chunks: list[ExtractedChunk] = field(default_factory=list)
     source_ref: str = ""
+    # Optional debug metadata (phase, prompts/response, continuity hint) —
+    # populated by adapters that support it (see unstructured_text.py);
+    # None for adapters that don't, e.g. StructuredFileAdapter.
+    debug: dict | None = None
 
 
 class SourceAdapter(ABC):

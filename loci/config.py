@@ -99,6 +99,7 @@ class BenchSettings(BaseModel):
     qna_dir: str = "benchWork/bench"
     qna_file: str = "qna_scarlet.json"
     log_dir: str = "benchWork/logs"
+    debug_dir: str = "benchWork/debug"
     # qwen2.5:14b-instruct beat deepseek-r1:14b outright as an extraction
     # model too: a full 2x2 matrix against every answer-model pairing showed
     # it winning independently in both roles (85.0 vs 59.5 quality on the

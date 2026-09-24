@@ -87,6 +87,7 @@ services:
       LOCI_BENCH__CORPUS_DIR: /benchWork/raw
       LOCI_BENCH__QNA_DIR: /benchWork/bench
       LOCI_BENCH__LOG_DIR: /benchWork/logs
+      LOCI_BENCH__DEBUG_DIR: /benchWork/debug
     volumes:
       - ../benchWork:/benchWork
     command: ["serve"]

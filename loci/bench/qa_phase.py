@@ -4,6 +4,7 @@ from pathlib import Path
 
 from loci.bench.answer import answer_question
 from loci.bench.books import BOOK_FILES
+from loci.bench.debug import write_config_snapshot, write_qa_debug
 from loci.bench.ids import bench_context_name
 from loci.bench.qna import load_qna
 from loci.config import LociSettings
@@ -12,7 +13,9 @@ from loci.embeddings.client import EmbeddingClient
 from loci.vectorstore.qdrant_client import VectorStore
 
 
-def run_qa_phase(settings: LociSettings, extraction_model: str, answer_model: str, qna_file: str) -> dict:
+def run_qa_phase(
+    settings: LociSettings, extraction_model: str, answer_model: str, qna_file: str, debug_dir: Path
+) -> dict:
     """Answer every question in qna_file, retrieving from the context(s)
     ingested for (book, extraction_model) — computed directly via
     bench_context_name, no dependency on where/whether an ingest phase
@@ -23,6 +26,20 @@ def run_qa_phase(settings: LociSettings, extraction_model: str, answer_model: st
 
     embedding_client = EmbeddingClient(settings.ollama)
     vector_store = VectorStore(settings.qdrant)
+
+    debug_run_id = Path(debug_dir).name
+    write_config_snapshot(
+        debug_dir,
+        "qa",
+        answer_model,
+        {
+            "extraction_model": extraction_model,
+            "answer_model": answer_model,
+            "qna_file": qna_file,
+            "qna_dir": settings.bench.qna_dir,
+            "top_k": 8,  # matches answer_question()'s hardcoded run_search top_k
+        },
+    )
 
     rows: list[dict] = []
     started_at = datetime.now(timezone.utc).isoformat()
@@ -45,6 +62,36 @@ def run_qa_phase(settings: LociSettings, extraction_model: str, answer_model: st
                 embedding_client=embedding_client,
                 vector_store=vector_store,
             )
+            write_qa_debug(
+                debug_dir,
+                item["id"],
+                answer_model,
+                {
+                    "id": item["id"],
+                    "book": book,
+                    "type": item["type"],
+                    "question": item["question"],
+                    "expected_keywords": item.get("expected_keywords", []),
+                    "answerable": item.get("answerable", True),
+                    "steps": {
+                        "retrieval": {
+                            "context_names": context_names,
+                            "top_k": 8,
+                            "retrieval_time_s": result.retrieval_time_s,
+                            "chunk_hits": [h.model_dump() for h in result.search_result.chunk_hits],
+                            "entity_hits": [h.model_dump() for h in result.search_result.entity_hits],
+                        },
+                        "generation": {
+                            "system_prompt": result.system_prompt,
+                            "user_message": result.user_message,
+                            "generation_time_s": result.generation_time_s,
+                            "answer": result.answer,
+                        },
+                    },
+                    "final_answer": result.answer,
+                    "score": None,
+                },
+            )
             rows.append(
                 {
                     "id": item["id"],
@@ -58,6 +105,8 @@ def run_qa_phase(settings: LociSettings, extraction_model: str, answer_model: st
                     "generation_time_s": result.generation_time_s,
                     "chunk_hits": len(result.search_result.chunk_hits),
                     "entity_hits": len(result.search_result.entity_hits),
+                    "debug_run_id": debug_run_id,
+                    "answer_model": answer_model,
                 }
             )
 

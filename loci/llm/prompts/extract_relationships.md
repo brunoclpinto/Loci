@@ -6,9 +6,15 @@ entities here, only the relationships between the ones you're given.
 Rules:
 - Be concise: extract only what the passage explicitly states. Do not pad
   the output with speculative or redundant relationships.
-- Use ONLY the predicates listed in the response schema's enum. Never
-  invent a new predicate — if nothing fits, use the `related_to` predicate
-  rather than making one up.
+- Use ONLY the predicates listed in the response schema's enum, and read
+  the "Predicate definitions" block in the user message before choosing
+  one — pay special attention to each predicate's stated *direction*
+  (which entity is always the subject vs. always the object). Getting the
+  direction backwards is a common, easy-to-avoid mistake (e.g. an event
+  cannot "participate in" something — a person/organization participates
+  in an event, never the reverse). Never invent a new predicate — if
+  nothing fits after checking every definition, use the `related_to`
+  predicate rather than making one up.
 - Resolve pronouns and implicit references to the full entity they refer to
   (e.g. "He took the bottle" — if "He" is Sherlock Holmes earlier in the
   passage, the subject is Sherlock Holmes' id, not a new entity for "He").

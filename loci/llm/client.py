@@ -1,9 +1,11 @@
 import json
+from collections.abc import Callable
 from pathlib import Path
 
 import httpx
 
 from loci.config import OllamaSettings
+from loci.schema_registry.loader import EntityTypeSchema, EnumValueDefinition, PredicateDefinition
 
 _PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
 
@@ -37,19 +39,60 @@ def _discovery_response_schema(entity_types: list[str]) -> dict:
     }
 
 
+def _entity_type_definitions_block(entity_types: list[EntityTypeSchema]) -> str:
+    lines = []
+    for et in entity_types:
+        short = et.short_description or ""
+        long = et.long_description or ""
+        detail = " ".join(p for p in (short, long) if p)
+        lines.append(f"- {et.name}: {detail}" if detail else f"- {et.name}")
+    return "\n".join(lines)
+
+
+def _enum_definitions_block(values: list[EnumValueDefinition]) -> str:
+    """Generic rendering for any small LLM-facing enum (entity scope,
+    identity_status, segment_type, ...) — one shared helper instead of a
+    near-duplicate per concept, since they all share the same shape (a
+    value name plus a short/long description) and live in the same
+    enum_vocabulary table."""
+    lines = []
+    for v in values:
+        short = v.short_description or ""
+        long = v.long_description or ""
+        detail = " ".join(p for p in (short, long) if p)
+        lines.append(f"- {v.value}: {detail}" if detail else f"- {v.value}")
+    return "\n".join(lines)
+
+
 def discover_entities(
     settings: OllamaSettings,
     model: str,
     text: str,
-    entity_types: list[str],
+    entity_types: list[EntityTypeSchema],
+    scope_values: list[EnumValueDefinition],
+    identity_status_values: list[EnumValueDefinition],
     known_entities: list[dict] | None = None,
+    debug_sink: Callable[[dict], None] | None = None,
 ) -> list[dict]:
     """Pass 1 of the two-pass extraction redesign: entity discovery only, no
     relationships. Deliberately doesn't ask the model for a local_id at all
     — the caller's EntityRegistry assigns a permanent id on merge, so
     there's nothing here for a later pass to go stale against (see
-    loci/ingest/entity_registry.py)."""
-    user_content = text
+    loci/ingest/entity_registry.py).
+
+    Type/scope/identity_status definitions are read live from the DB
+    (SchemaRegistry) and injected per-call rather than hardcoded in the
+    prompt file — this is what lets the vocabulary grow and get refined
+    over time (new types, sharper disambiguation) without a code change,
+    matching how the same registry already drives the predicate
+    vocabulary."""
+    type_names = [et.name for et in entity_types]
+    user_content = (
+        f"Entity type definitions:\n{_entity_type_definitions_block(entity_types)}\n\n"
+        f"scope definitions:\n{_enum_definitions_block(scope_values)}\n\n"
+        f"identity_status definitions:\n{_enum_definitions_block(identity_status_values)}\n\n"
+        f"---\n\n{text}"
+    )
     if known_entities:
         known_block = json.dumps(known_entities, ensure_ascii=False)
         user_content = (
@@ -66,14 +109,29 @@ def discover_entities(
                 {"role": "system", "content": _DISCOVERY_SYSTEM_PROMPT},
                 {"role": "user", "content": user_content},
             ],
-            "format": _discovery_response_schema(entity_types),
+            "format": _discovery_response_schema(type_names),
             "options": {"temperature": 0, "repeat_penalty": 1.3, "num_predict": 16384, "num_ctx": 32768},
         },
         timeout=settings.request_timeout_s,
     )
     response.raise_for_status()
     content = response.json()["message"]["content"]
+    if debug_sink is not None:
+        debug_sink({"system_prompt": _DISCOVERY_SYSTEM_PROMPT, "user_content": user_content, "raw_response": content})
     return json.loads(content)["entities"]
+
+
+def _predicate_definitions_block(predicates: list[PredicateDefinition]) -> str:
+    lines = []
+    for p in predicates:
+        short = p.short_description or ""
+        long = p.long_description or ""
+        detail = " ".join(part for part in (short, long) if part)
+        subj = ", ".join(p.domain_entity_types) or "any type"
+        obj = ", ".join(p.range_entity_types) or "any type"
+        suffix = f" (subject: {subj}; object: {obj})"
+        lines.append(f"- {p.name}: {detail}{suffix}" if detail else f"- {p.name}{suffix}")
+    return "\n".join(lines)
 
 
 def _relationship_response_schema(predicates: list[str], registry_ids: list[str]) -> dict:
@@ -103,8 +161,9 @@ def extract_relationships(
     settings: OllamaSettings,
     model: str,
     text: str,
-    predicates: list[str],
+    predicates: list[PredicateDefinition],
     registry_hint: list[dict],
+    debug_sink: Callable[[dict], None] | None = None,
 ) -> list[dict]:
     """Pass 2 of the two-pass extraction redesign: relationships only, over
     a paragraph-grouped unit, referencing entities already discovered in
@@ -113,10 +172,19 @@ def extract_relationships(
     the model can't invent a new entity here, on top of (not instead of)
     resolve_relationship_endpoint's fallback matching downstream. Caller
     must not call this with an empty registry_hint (an empty enum is
-    meaningless to the schema)."""
+    meaningless to the schema).
+
+    Predicate definitions (domain/range + short/long description) are read
+    live from the DB and injected per-call, same rationale and pattern as
+    discover_entities's type definitions — most predicates now have a wide
+    domain/range (widened from bench-observed failures), so the injected
+    description is the main thing steering correct subject/object choice
+    and direction, not the schema-level type constraint alone."""
+    predicate_names = [p.name for p in predicates]
     registry_ids = [e["local_id"] for e in registry_hint]
     registry_block = json.dumps(registry_hint, ensure_ascii=False)
     user_content = (
+        f"Predicate definitions:\n{_predicate_definitions_block(predicates)}\n\n"
         f"Entities already established in this document (only reference these by id; "
         f"never invent a new entity or id here):\n{registry_block}\n\n---\n\n{text}"
     )
@@ -129,29 +197,33 @@ def extract_relationships(
                 {"role": "system", "content": _RELATIONSHIP_SYSTEM_PROMPT},
                 {"role": "user", "content": user_content},
             ],
-            "format": _relationship_response_schema(predicates, registry_ids),
+            "format": _relationship_response_schema(predicate_names, registry_ids),
             "options": {"temperature": 0, "repeat_penalty": 1.3, "num_predict": 16384, "num_ctx": 32768},
         },
         timeout=settings.request_timeout_s,
     )
     response.raise_for_status()
     content = response.json()["message"]["content"]
+    if debug_sink is not None:
+        debug_sink({"system_prompt": _RELATIONSHIP_SYSTEM_PROMPT, "user_content": user_content, "raw_response": content})
     return json.loads(content)["relationships"]
 
 
-_SEGMENT_CLASSIFICATION_SYSTEM_PROMPT = """Classify the given block of text as exactly one of:
-- narrative: actual content — the substance of the document (a story, article, report, etc.).
-- front_matter: information about the document/artifact itself that precedes its real content — a title page, table of contents, author byline, publisher/edition info.
-- back_matter: information about the document/artifact itself that follows its real content — a colophon, license text, appendix, index.
-Respond with only the classification."""
+_SEGMENT_CLASSIFICATION_SYSTEM_PROMPT = """Classify the given block of text as exactly one of the segment
+types defined in the user message. Respond with only the classification."""
 
 
-def classify_segment(settings: OllamaSettings, model: str, text: str) -> str:
+def classify_segment(
+    settings: OllamaSettings, model: str, text: str, segment_type_values: list[EnumValueDefinition]
+) -> str:
     """A cheap classification call — deliberately separate from `extract()`
     so it can run on a fast model regardless of which model is doing
     extraction for a given run. Used by loci/ingest/structure.py as the
     fallback for leading/trailing blocks the structural heuristics aren't
-    confident about."""
+    confident about. Segment type definitions are read live from the DB,
+    same dynamic-injection pattern as discover_entities/extract_relationships."""
+    segment_types = [v.value for v in segment_type_values]
+    user_content = f"Segment type definitions:\n{_enum_definitions_block(segment_type_values)}\n\n---\n\n{text}"
     response = httpx.post(
         f"{settings.base_url}/api/chat",
         json={
@@ -159,11 +231,11 @@ def classify_segment(settings: OllamaSettings, model: str, text: str) -> str:
             "stream": False,
             "messages": [
                 {"role": "system", "content": _SEGMENT_CLASSIFICATION_SYSTEM_PROMPT},
-                {"role": "user", "content": text},
+                {"role": "user", "content": user_content},
             ],
             "format": {
                 "type": "object",
-                "properties": {"segment_type": {"type": "string", "enum": ["narrative", "front_matter", "back_matter"]}},
+                "properties": {"segment_type": {"type": "string", "enum": segment_types}},
                 "required": ["segment_type"],
             },
             "options": {"temperature": 0, "num_predict": 2048, "num_ctx": 8192},
